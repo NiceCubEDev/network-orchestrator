@@ -2922,7 +2922,7 @@ dependencies = [
 
 [[package]]
 name = "net-manager-macos-bridge"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "base64 0.22.1",
  "ipnet",
@@ -3038,7 +3038,7 @@ dependencies = [
 
 [[package]]
 name = "network-orchestrator-macos-helper"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "base64 0.22.1",
  "boringtun",
