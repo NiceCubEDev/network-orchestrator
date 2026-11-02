@@ -1,5 +1,37 @@
 # E2E testing
 
+## Linux multinode routing and recovery
+
+```bash
+cargo build -p network-orchestrator-daemon -p net-manager-cli
+python3 e2e/linux/multinode_scenarios.py
+```
+
+Requires Docker, `/dev/net/tun`, the existing `netorch-e2e-client` image
+(`docker build -t netorch-e2e-client e2e/linux`) and the pinned Xray package
+staged under `target/release/xray-package/v26.10.31`.
+The script creates and removes a disposable container with `--network none`;
+route mutations never run on the host. It starts real local VLESS peers and
+HTTPS marker servers with a temporary CA trusted only inside the container.
+It verifies primary preference, ordered backups, automatic primary return,
+independent pinned routing, fail-closed pins/all-down, owned QUIC rejection,
+unchanged-DHCP stream preservation, gateway/source/interface migration,
+offline crash deferral and recovery of a `SIGSTOP`-stalled child.
+Real unprivileged CLI commands import a synthetic subscription, rebuild
+verified/name-only pools, reject advertised-country mismatches and apply a
+policy without changing its source. Local HTTPS country fixtures are reached
+through each candidate; no real subscription or public connectivity service
+is used.
+
+DNS A/AAAA/HTTPS queries exercise the pinned backend's rewrite policy. An
+injected DNS outage must clear without restarting a healthy HTTPS path.
+Foreign UDP sockets must not count as the child's sockets, and an application
+connection storm must remain diagnostic. The final scenarios create actual
+owned UDP transports and simulate a daemon crash plus a deleted old package
+executable, checking recovery/cleanup without killing unrelated Xray peers.
+The container has an explicit file-descriptor limit for these resource tests.
+
+
 ## Debian/Ubuntu installers and updates
 
 ```bash
