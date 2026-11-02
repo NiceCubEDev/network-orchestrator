@@ -10,3 +10,13 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-11-02
+
+Core 0.12.0.
+
+### Changed
+
+- Update shared profile models, canonical settings preservation and localization
+  data for Core 0.12.0. The service-availability UI and background diagnostics
+  remain Linux-only.
+
