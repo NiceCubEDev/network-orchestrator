@@ -10,6 +10,10 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-11-02
+
+Core 0.12.0.
+
 ### Added
 
 - `netorch checks list|add|remove|background|run` and a per-profile service
