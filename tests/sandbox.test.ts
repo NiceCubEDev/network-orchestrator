@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { SandboxBackend } from "../src/sandbox/backend.ts";
-import type { BackendAvailability, Profile, RouteEntry, RouteLookupResult, TunnelStatus } from "../src/types.ts";
+import type { BackendAvailability, Profile, RouteEntry, RouteLookupResult, ServiceCheck, ServiceCheckResult, TunnelStatus } from "../src/types.ts";
 
 test("share-link import derives a name and keeps networking unchanged", () => {
   const backend = new SandboxBackend();
@@ -87,4 +87,37 @@ test("OpenVPN credential flow is simulated without launching a process", () => {
   assert.throws(() => backend.invoke("connect_profile", { id: "ovpn" }), (error) => error === "OpenVPN credentials required");
   const status = backend.invoke("connect_openvpn_with_credentials", { id: "ovpn", username: "qa", password: "synthetic" }) as TunnelStatus;
   assert.equal(status.state, "running");
+});
+
+test("service results cannot be attributed to a URL changed during a manual check", async () => {
+  const backend = new SandboxBackend();
+  const p = (backend.invoke("get_profiles") as Profile[]).find((p) => p.subscription)!;
+  const check: ServiceCheck = {
+    id: "service-race", name: "Synthetic service", url: "https://service.example/first",
+    endpointKey: p.pinnedPolicies![0].endpointKey, background: false,
+  };
+  backend.invoke("set_xray_service_checks", { profileId: p.id, checks: [check] });
+  const initial = await backend.invoke("run_xray_service_checks", { profileId: p.id }) as ServiceCheckResult[];
+  assert.equal(initial[0].outcome, "http");
+
+  const pending = backend.invoke("run_xray_service_checks", { profileId: p.id }) as Promise<ServiceCheckResult[]>;
+  backend.invoke("set_xray_service_checks", {
+    profileId: p.id, checks: [{ ...check, url: "https://service.example/changed" }],
+  });
+  await assert.rejects(pending);
+});
+
+test("a stale ordinary profile edit preserves newer dedicated service settings", () => {
+  const backend = new SandboxBackend();
+  const stale = (backend.invoke("get_profiles") as Profile[]).find((p) => p.subscription)!;
+  const check: ServiceCheck = {
+    id: "service-preserved", name: "Synthetic service", url: "https://service.example/health",
+    endpointKey: stale.pinnedPolicies![0].endpointKey, background: false,
+  };
+  backend.invoke("set_xray_service_checks", { profileId: stale.id, checks: [check] });
+  stale.name = "Edited ordinary name";
+  backend.invoke("save_profile", { profile: stale });
+  const saved = (backend.invoke("get_profiles") as Profile[]).find((p) => p.id === stale.id)!;
+  assert.equal(saved.name, "Edited ordinary name");
+  assert.deepEqual(saved.xrayServiceChecks, [check]);
 });

@@ -31,6 +31,69 @@ owned UDP transports and simulate a daemon crash plus a deleted old package
 executable, checking recovery/cleanup without killing unrelated Xray peers.
 The container has an explicit file-descriptor limit for these resource tests.
 
+## Linux pinned service availability
+
+```bash
+cargo build -p network-orchestrator-daemon -p net-manager-cli
+python3 e2e/linux/multinode_scenarios.py --service-checks
+# Shorter focused pass for CLI configuration, live unpin and failed persistence:
+python3 e2e/linux/multinode_scenarios.py --service-checks-client
+```
+
+The same disposable Docker contract applies. Synthetic HTTPS services verify
+HEAD-only requests, HTTP 403/302 transport responses without redirect following,
+no cookie/auth reuse, typed TLS failures, child reaping and refresh preservation.
+The service-only outage keeps ordinary tunnel traffic healthy: three timeouts
+must degrade only that check, fresh HTTP must reset it, and PID/pins/default
+selection must remain unchanged. Disabling the checks must stop subsequent
+requests. Real unprivileged CLI operations also exercise live unpin cancellation
+and a failed atomic configuration write; an unsaved worker must not keep probing.
+
+### Configuration and interpretation
+
+In a Linux Xray subscription profile, use **Service availability**, or:
+
+```bash
+netorch checks list PROFILE
+netorch checks add PROFILE --via NODE --name 'API connectivity' --url 'https://service.example/health'
+netorch checks run PROFILE --id CHECK_ID
+netorch checks background PROFILE CHECK_ID on
+netorch checks background PROFILE CHECK_ID off
+netorch checks remove PROFILE CHECK_ID
+```
+
+Replace `PROFILE`, `NODE`, `CHECK_ID` and the example URL with your own choices.
+`NODE` is a stable endpoint key, current subscription number or unambiguous name,
+and must already be explicitly pinned by domain or fixed-DNS policy. Merely being
+the primary, backup or a pool member does not qualify. Missing/unbound pins are
+unavailable: no alternate node or direct connection is attempted.
+
+The initial list is empty; background is off. Manual checks work while
+disconnected and in SOCKS mode through a temporary unprivileged single-node
+Xray. Background preferences run only during an active TUN connection, starting
+60 seconds after enabling/connecting. Background changes require acknowledgment
+from the daemon; a transient socket failure is not treated as proof of opt-out.
+Ordinary profile editing and subscription refresh retain the settings.
+
+Each HTTPS HEAD request has a five-second limit. There are at most 16 checks;
+manual workers use up to four endpoints concurrently and serialize checks of
+the same endpoint. No cookies, authentication headers, user headers, response
+body reads or redirects are used. Do not supply passwords, query tokens, secret
+URLs or side-effect/webhook endpoints. Queries are allowed, not secret storage.
+Use non-secret names: they are diagnostic labels and may appear in logs.
+URLs remain in protected profile configuration/editor data, not results,
+transition logs or the ownership journal. CLI URLs can also enter shell history.
+
+Every HTTP status, including 403, 405 and 5xx, proves only an HTTP transport
+response; it does not prove API authorization or application correctness.
+Timeout/TLS/transport failures increment the background streak and mark
+degradation at three. HTTP or unavailable resets the streak. Remote SOCKS DNS
+failures are reported as transport errors when they cannot be distinguished
+reliably. Service results never request recovery, route changes, tunnel restart,
+country/IP changes or direct fallback. Existing global tunnel and failover
+health checks remain separate.
+
+
 
 ## Debian/Ubuntu installers and updates
 

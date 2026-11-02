@@ -26,7 +26,7 @@ def run(*args, **kwargs):
     return subprocess.run(args, check=True, text=True, capture_output=True, **kwargs).stdout.strip()
 
 
-def driver():
+def driver(service_checks_only=False):
     root = Path(__file__).resolve().parents[2]
     binary = root / "target/debug/network-orchestrator-daemon"
     cli = root / "target/debug/netorch"
@@ -50,8 +50,9 @@ def driver():
         run("docker", "cp", str(Path(__file__).resolve()), name + ":/tmp/multinode_scenarios.py")
         run("docker", "cp", str(root / "packaging/linux/com.netmanager.app.policy"),
             name + ":/usr/share/polkit-1/actions/com.netmanager.app.policy")
-        result = subprocess.run(["docker", "exec", "--env", "NETORCH_MULTINODE_E2E=1", name,
-            "python3", "-u", "/tmp/multinode_scenarios.py", "--inside"], text=True, timeout=300)
+        result = subprocess.run(["docker", "exec", "--env", "NETORCH_MULTINODE_E2E=1",
+            "--env", f"NETORCH_SERVICE_CHECKS_E2E={int(service_checks_only)}", name,
+            "python3", "-u", "/tmp/multinode_scenarios.py", "--inside"], text=True, timeout=600)
         if result.returncode:
             raise SystemExit(result.returncode)
     finally:
@@ -79,7 +80,7 @@ def inside():
             "-keyout", str(key), "-out", str(csr))
         extension = directory / "extensions"
         extension.write_text(chr(10).join([
-            "subjectAltName=DNS:localhost,DNS:default.test,DNS:pinned.test,DNS:api.country.is,DNS:ipinfo.io",
+            "subjectAltName=DNS:localhost,DNS:default.test,DNS:pinned.test,DNS:api.country.is,DNS:ipinfo.io,IP:198.51.100.50",
             "basicConstraints=CA:FALSE", "extendedKeyUsage=serverAuth",
             "keyUsage=digitalSignature,keyEncipherment", "",
         ]))
@@ -90,6 +91,7 @@ def inside():
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(cert, key)
         records = {}
+        records["serviceRequests"] = []
         socket_path = "/run/network-orchestrator/daemon.sock"
         managed_logs = []
         log_capture_stop = threading.Event()
@@ -197,6 +199,24 @@ def inside():
                 class Handler(BaseHTTPRequestHandler):
                     marker = name
                     protocol_version = "HTTP/1.1"
+                    def do_HEAD(self):
+                        records["serviceRequests"].append({
+                            "node": self.marker, "path": self.path,
+                            "authorization": self.headers.get("Authorization"),
+                            "cookie": self.headers.get("Cookie"),
+                        })
+                        if self.path.startswith("/blocked-service") and records.get("serviceFailure"):
+                            time.sleep(6)
+                            self.close_connection = True
+                            return
+                        status = 403 if self.path.startswith("/denied-service") else (
+                            302 if self.path.startswith("/redirect-service") else 200)
+                        self.send_response(status)
+                        if status == 302:
+                            self.send_header("Location", "/unexpected-redirect-follow")
+                        self.send_header("Set-Cookie", "fixture=must-not-be-reused")
+                        self.send_header("Content-Length", "0")
+                        self.end_headers()
                     def do_GET(self):
                         host = self.headers.get("Host", "").split(":")[0]
                         if self.path == "/subscription":
@@ -258,6 +278,13 @@ def inside():
             run("dbus-daemon", "--system", "--fork")
             polkit = next(path for path in ("/usr/lib/polkit-1/polkitd", "/usr/libexec/polkitd")
                 if Path(path).exists())
+            if os.environ.get("NETORCH_SERVICE_CHECKS_E2E") in ("1", "2"):
+                rules = Path("/etc/polkit-1/rules.d")
+                rules.mkdir(parents=True, exist_ok=True)
+                (rules / "99-netorch-e2e.rules").write_text(
+                    'polkit.addRule(function(action, subject) {'
+                    ' if (subject.user === "nobody" && action.id.indexOf("com.netmanager.app.") === 0)'
+                    ' return polkit.Result.YES; });')
             start("polkit", [polkit, "--no-debug"])
             until(lambda: subprocess.run(["pkcheck", "--action-id", "com.netmanager.app.connect-profile",
                 "--process", str(os.getpid())], capture_output=True).returncode == 0, "isolated polkit authorizes root")
@@ -269,10 +296,16 @@ def inside():
             cli_data = directory / "cli-data"
             cli_data.mkdir(mode=0o700)
             os.chown(cli_data, 65534, 65534)
-            def cli(*args):
-                result = subprocess.run(["/tmp/netorch", "--data-dir", str(cli_data), "--json", *args],
-                    check=False, text=True, capture_output=True, env=env, user=65534, group=65534,
+            runtime_dir = directory / "user-runtime"
+            runtime_dir.mkdir(mode=0o700)
+            os.chown(runtime_dir, 65534, 65534)
+            cli_env = dict(env, XDG_RUNTIME_DIR=str(runtime_dir))
+            def cli_raw(*args):
+                return subprocess.run(["/tmp/netorch", "--data-dir", str(cli_data), "--json", *args],
+                    check=False, text=True, capture_output=True, env=cli_env, user=65534, group=65534,
                     timeout=90)
+            def cli(*args):
+                result = cli_raw(*args)
                 if result.returncode:
                     raise AssertionError("synthetic CLI failed: " + result.stderr)
                 return json.loads(result.stdout)
@@ -329,6 +362,123 @@ def inside():
             until(lambda: request("pinned.test") == "pinned", "pinned route uses independent node")
             until(lambda: watchdog()["uplink"] is True and watchdog()["httpsLatencyMs"] is not None,
                 "watchdog verifies HTTPS through the owned TUN")
+            if os.environ.get("NETORCH_SERVICE_CHECKS_E2E") in ("1", "2"):
+                assert records["serviceRequests"] == [], "unsolicited inferred service probe"
+                assert cli("checks", "list", "country-proof") == []
+                Path(xray).rename(xray + ".disabled")
+                try:
+                    assert cli("checks", "run", "country-proof") == []
+                finally:
+                    Path(xray + ".disabled").rename(xray)
+                assert records["serviceRequests"] == [], "empty checks caused network traffic"
+                cli("checks", "add", "country-proof", "--via", saved["pinnedPolicies"][0]["endpointKey"],
+                    "--name", "Service denial", "--url", "https://localhost:9443/denied-service?fixture=private")
+                listed = cli("checks", "list", "country-proof")
+                assert len(listed) == 1 and listed[0]["background"] is False
+                assert "url" not in listed[0] and "private" not in json.dumps(listed)
+                assert records["serviceRequests"] == [], "saving a check caused remote traffic"
+                denial = cli("checks", "run", "country-proof")
+                assert len(denial) == 1 and denial[0]["outcome"] == "http"
+                assert denial[0]["httpStatus"] == 403 and denial[0]["consecutiveFailures"] == 0
+                assert "private" not in json.dumps(denial) and "url" not in denial[0]
+                assert records["serviceRequests"][-1]["node"] == "pinned"
+                assert records["serviceRequests"][-1]["authorization"] is None
+                assert records["serviceRequests"][-1]["cookie"] is None
+                cli("checks", "add", "country-proof", "--via", saved["pinnedPolicies"][0]["endpointKey"],
+                    "--name", "Service redirect", "--url", "https://localhost:9443/redirect-service")
+                redirected = cli("checks", "run", "country-proof")
+                assert {row["httpStatus"] for row in redirected} == {302, 403}
+                assert all(row["cookie"] is None for row in records["serviceRequests"])
+                assert not any(row["path"] == "/unexpected-redirect-follow" for row in records["serviceRequests"])
+                print("PASS real CLI checks are explicit HEAD requests on the pin, without credentials, cookie reuse or redirects", flush=True)
+                cli("checks", "add", "country-proof", "--via", saved["pinnedPolicies"][0]["endpointKey"],
+                    "--name", "Service TLS rejection", "--url", "https://127.0.0.1:9443/tls-service")
+                classified = cli("checks", "run", "country-proof")
+                tls = next(row for row in classified if row["name"] == "Service TLS rejection")
+                assert tls["outcome"] == "tlsError" and tls["httpStatus"] is None
+                assert not any(b"stdin:" in path.read_bytes() and b"xray" in path.read_bytes()
+                    for path in Path("/proc").glob("[0-9]*/cmdline")), "manual probe child was not reaped"
+                before_refresh = json.loads((cli_data / "profiles.json").read_text())["profiles"][0]["xrayServiceChecks"]
+                cli("refresh", "country-proof")
+                after_refresh = json.loads((cli_data / "profiles.json").read_text())["profiles"][0]["xrayServiceChecks"]
+                assert after_refresh == before_refresh, "subscription refresh lost service check configuration"
+                print("PASS real TLS failures are classified without URL leakage, temporary children exit and refresh preserves checks", flush=True)
+                # A real unprivileged CLI owns a separate narrow TUN, so these
+                # assertions exercise cancellation rather than a mock RPC echo.
+                document_path = cli_data / "profiles.json"
+                document = json.loads(document_path.read_text())
+                user_profile = document["profiles"][0]
+                user_profile["xrayMode"] = "tun"
+                user_profile["routes"] = [{"destination": "198.51.100.50/32", "metric": 5}]
+                user_profile["xrayTunDnsServers"] = []
+                user_profile["xrayQuicReject"] = False
+                user_profile["subscription"]["probeUrl"] = "https://198.51.100.50:9443/"
+                document_path.write_text(json.dumps(document))
+                cli("up", "country-proof")
+                assert (runtime_dir / "netorch" / f'{user_profile["id"]}.pid').is_file(), "CLI keeper did not start"
+                first_id = user_profile["xrayServiceChecks"][0]["id"]
+                pin_key = user_profile["pinnedPolicies"][0]["endpointKey"]
+                heads_before = len(records["serviceRequests"])
+                cli("checks", "background", "country-proof", first_id, "on")
+                until(lambda: len(records["serviceRequests"]) > heads_before,
+                    "unprivileged CLI enables an actual live diagnostic worker", timeout=70)
+                cli("route", "unpin", "country-proof", "--via", pin_key)
+                stopped_count = len(records["serviceRequests"])
+                time.sleep(62)
+                assert len(records["serviceRequests"]) == stopped_count, "unpin left an old SOCKS probe active"
+                assert all(row["outcome"] == "unavailable" for row in cli("checks", "run", "country-proof"))
+                cli("route", "pin", "country-proof", "--via", pin_key, "--selector", "full:pinned.test")
+                unchanged_document = document_path.read_bytes()
+                fault = cli_data / "profiles.json.tmp"
+                fault.mkdir()
+                try:
+                    failed = cli_raw("checks", "add", "country-proof", "--via", pin_key,
+                        "--name", "Unsaved background check", "--url",
+                        "https://localhost:9443/denied-service?fixture=unsaved-private", "--background")
+                    assert failed.returncode != 0, "write fault did not reject the configuration save"
+                    assert "unsaved-private" not in failed.stdout + failed.stderr
+                    assert document_path.read_bytes() == unchanged_document
+                finally:
+                    fault.rmdir()
+                cancelled_count = len(records["serviceRequests"])
+                time.sleep(62)
+                assert len(records["serviceRequests"]) == cancelled_count, "failed save left a diagnostic worker running"
+                cli("down", "country-proof")
+                print("PASS live unpin and failed persistence cancel diagnostic workers without losing canonical settings", flush=True)
+                if os.environ.get("NETORCH_SERVICE_CHECKS_E2E") == "2":
+                    rpc("xray.disconnect", {"profileId": "multinode-e2e"})
+                    return
+                stable_pid = managed_pid()
+                check = {"id": "service-failure", "name": "Service-specific failure",
+                    "url": "https://localhost:9443/blocked-service?fixture=private",
+                    "endpointKey": keys["pinned"], "background": True}
+                records["serviceFailure"] = True
+                before = len(records["serviceRequests"])
+                rpc("xray.serviceChecks", {"profileId": "multinode-e2e", "checks": [check]})
+                time.sleep(1)
+                assert len(records["serviceRequests"]) == before, "saving background checks probed immediately"
+                until(lambda: any(row.get("degraded") and row["consecutiveFailures"] >= 3
+                    and row["outcome"] == "timeout" for row in watchdog().get("serviceChecks", [])),
+                    "three target-specific timeouts produce diagnostic degradation", timeout=205)
+                assert request("default.test") == "primary" and request("pinned.test") == "pinned"
+                assert managed_pid() == stable_pid, "service failure restarted the tunnel"
+                assert active() == keys["primary"], "service failure selected another node"
+                assert "private" not in json.dumps(rpc("owned.list", {}))
+                assert "private" not in json.dumps(watchdog())
+                records["serviceFailure"] = False
+                until(lambda: any(row["outcome"] == "http" and row["consecutiveFailures"] == 0
+                    and not row["degraded"] for row in watchdog().get("serviceChecks", [])),
+                    "fresh HTTP response clears service failure streak", timeout=70)
+                assert managed_pid() == stable_pid
+                rpc("xray.serviceChecks", {"profileId": "multinode-e2e", "checks": []})
+                stopped_count = len(records["serviceRequests"])
+                time.sleep(62)
+                assert len(records["serviceRequests"]) == stopped_count, "opt-out left background traffic running"
+                assert not watchdog().get("serviceChecks")
+                assert managed_pid() == stable_pid
+                print("PASS service diagnostics never recover/restart/change pins and opt-out stops requests immediately", flush=True)
+                rpc("xray.disconnect", {"profileId": "multinode-e2e"})
+                return
             def dns_query(qtype):
                 name = b"".join(bytes([len(label)]) + label.encode() for label in "default.test".split(".")) + b"\0"
                 query = pack("!6H", 1234, 0x100, 1, 0, 0, 0) + name + pack("!2H", qtype, 1)
@@ -548,5 +698,9 @@ if __name__ == "__main__":
         inside()
     elif not sys.argv[1:]:
         driver()
+    elif sys.argv[1:] == ["--service-checks"]:
+        driver(service_checks_only=True)
+    elif sys.argv[1:] == ["--service-checks-client"]:
+        driver(service_checks_only=2)
     else:
-        raise SystemExit("usage: python3 e2e/linux/multinode_scenarios.py")
+        raise SystemExit("usage: python3 e2e/linux/multinode_scenarios.py [--service-checks|--service-checks-client]")
