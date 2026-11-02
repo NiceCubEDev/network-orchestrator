@@ -26,13 +26,23 @@ pub struct XrayPlan {
     pub mark: u32,
     /// Loopback port of the injected `api-in` StatsService listener.
     pub api_port: u16,
-    /// Upstream host of the first outbound (literal IP or hostname). Kernel
-    /// must keep a direct route to it outside the tunnel, otherwise the
-    /// tunnel would try to carry its own server traffic.
-    pub server_host: Option<String>,
-    /// The first outbound dials a literal IP (see [`pin_server_address`]), so
-    /// nothing has to resolve the server's name once the tunnel is up.
+    /// Upstream host of every proxy outbound (`node-`/`pin-` and the
+    /// primary): literal IPs or hostnames. The kernel keeps a direct route
+    /// to each outside the tunnel — any node must be reachable while the
+    /// tunnel captures the family, not only the currently selected one.
+    pub server_hosts: Vec<String>,
+    /// Node hostnames [`pin_server_addresses`] could not resolve while the
+    /// uplink was intact: they resolve inside the tunnel instead.
+    pub unpinned_hosts: Vec<String>,
+    /// Every node host is a literal IP or was pre-resolved, so nothing has
+    /// to resolve a server name once the tunnel is up.
     pub server_pinned: bool,
+    /// Multinode failover the probe supervisor steers at runtime; absent on
+    /// single-endpoint tunnels.
+    pub failover: Option<net_manager_core::daemon_protocol::XrayFailoverParams>,
+    pub reject_quic: bool,
+    pub probe_url: Option<String>,
+    pub pinned_keys: Vec<String>,
     /// Inline caller-provided `geoip.dat`/`geosite.dat` contents; decoded
     /// into the root-owned staging dir before spawn (the sandboxed unit
     /// cannot see caller paths).
@@ -54,9 +64,11 @@ impl std::fmt::Debug for XrayPlan {
             .field("full_ipv4", &self.full_ipv4)
             .field("full_ipv6", &self.full_ipv6)
             .field("mark", &self.mark)
-            .field("server_host", &self.server_host)
+            .field("server_hosts", &self.server_hosts)
             .field("server_pinned", &self.server_pinned)
+            .field("unpinned_hosts", &self.unpinned_hosts.len())
             .field("geo_assets", &self.geo_assets.is_some())
+            .field("failover", &self.failover.is_some())
             .finish()
     }
 }
@@ -115,7 +127,15 @@ fn one(value: &Value) -> io::Result<&Value> {
 fn validate_generated(config: &Value) -> io::Result<()> {
     let root = object(
         config,
-        &["log", "inbounds", "outbounds", "routing", "dns", "fakedns"],
+        &[
+            "log",
+            "inbounds",
+            "outbounds",
+            "routing",
+            "dns",
+            "fakedns",
+            "policy",
+        ],
     )?;
     if let Some(log) = root.get("log") {
         object(log, &["loglevel"])?;
@@ -128,6 +148,18 @@ fn validate_generated(config: &Value) -> io::Result<()> {
     }
     if let Some(fakedns) = root.get("fakedns") {
         validate_fakedns(fakedns)?;
+    }
+    if let Some(policy) = root.get("policy") {
+        object(policy, &["levels"])?;
+        object(&policy["levels"], &["0"])?;
+        let level = object(&policy["levels"]["0"], &["connIdle"])?;
+        if !level
+            .get("connIdle")
+            .and_then(Value::as_u64)
+            .is_some_and(|value| value <= 86_400)
+        {
+            return Err(rejected());
+        }
     }
     let inbounds = root
         .get("inbounds")
@@ -166,24 +198,40 @@ fn validate_generated(config: &Value) -> io::Result<()> {
         .get("outbounds")
         .and_then(Value::as_array)
         .ok_or_else(rejected)?;
-    if outbounds.len() < 2 || outbounds.len() > 8 {
+    if outbounds.len() < 2 || outbounds.len() > 64 {
         return Err(rejected());
     }
+    // Tags the daemon injects itself; a client-supplied one would collide
+    // (or smuggle a fake API/blackhole handler).
+    const RESERVED_TAGS: [&str; 4] = ["api", "api-in", "tun-in", "unavailable"];
     let mut tags = HashSet::new();
-    for (index, outbound) in outbounds.iter().enumerate() {
+    let mut proxies = 0usize;
+    let mut freedom = false;
+    for outbound in outbounds.iter() {
         let map = object(
             outbound,
             &["tag", "protocol", "settings", "streamSettings", "mux"],
         )?;
         let tag = string(&outbound["tag"])?;
-        if !tags.insert(tag) {
+        if !tags.insert(tag.to_string()) {
             return Err(rejected());
+        }
+        if RESERVED_TAGS.contains(&tag) || tag.starts_with("probe-") {
+            return Err(rejected());
+        }
+        // `node-`/`pin-` tags carry a stable endpoint key and only appear
+        // on multinode configs; any other suffix is malformed.
+        for prefix in ["node-", "pin-"] {
+            if tag.starts_with(prefix) && !valid_node_key(&tag[prefix.len()..]) {
+                return Err(rejected());
+            }
         }
         if let Some(mux) = map.get("mux") {
             validate_mux(mux)?;
         }
         match string(&outbound["protocol"])? {
-            "vless" if index == 0 => {
+            "vless" => {
+                proxies += 1;
                 let settings = object(&outbound["settings"], &["vnext"])?;
                 let server = one(settings.get("vnext").ok_or_else(rejected)?)?;
                 object(server, &["address", "port", "users"])?;
@@ -207,7 +255,8 @@ fn validate_generated(config: &Value) -> io::Result<()> {
                 }
                 validate_vless_stream(&outbound["streamSettings"])?;
             }
-            "hysteria" if index == 0 => {
+            "hysteria" => {
+                proxies += 1;
                 object(&outbound["settings"], &["version", "address", "port"])?;
                 if outbound["settings"]["version"] != 2 {
                     return Err(rejected());
@@ -216,30 +265,41 @@ fn validate_generated(config: &Value) -> io::Result<()> {
                 port(&outbound["settings"]["port"])?;
                 validate_hysteria_stream(&outbound["streamSettings"])?;
             }
-            "freedom" | "blackhole" | "dns" if index > 0 => {
-                // Auxiliary outbounds cannot open listeners; their settings
-                // only shape outbound behaviour, so validate the emitted
-                // inner shapes rather than forbid them outright.
-                if let Some(settings) = map.get("settings") {
-                    validate_auxiliary_settings(
-                        string(&outbound["protocol"]).unwrap_or_default(),
-                        settings,
-                    )?;
-                }
-                if let Some(stream) = map.get("streamSettings") {
-                    validate_auxiliary_stream(stream)?;
-                }
+            "freedom" => {
+                freedom = true;
+                validate_auxiliary(outbound, map)?;
+            }
+            "blackhole" | "dns" => {
+                validate_auxiliary(outbound, map)?;
             }
             _ => return Err(rejected()),
         }
     }
-    if outbounds[1]["protocol"] != "freedom" {
+    if proxies == 0 || !freedom {
         return Err(rejected());
     }
+
     let routing = object(
         &config["routing"],
-        &["domainStrategy", "domainMatcher", "rules"],
+        &["domainStrategy", "domainMatcher", "rules", "balancers"],
     )?;
+    // The only balancer this daemon runs: `failover`, initially selecting
+    // nothing but the `unavailable` blackhole (the override that pins a
+    // real node is installed by the probe supervisor at runtime).
+    if let Some(balancers) = routing.get("balancers") {
+        let balancers = balancers.as_array().ok_or_else(rejected)?;
+        if balancers.len() != 1 {
+            return Err(rejected());
+        }
+        let balancer = object(&balancers[0], &["tag", "selector"])?;
+        if string(&balancer["tag"])? != "failover" {
+            return Err(rejected());
+        }
+        let selector = balancer["selector"].as_array().ok_or_else(rejected)?;
+        if selector.len() != 1 || selector[0] != "unavailable" {
+            return Err(rejected());
+        }
+    }
     if let Some(strategy) = routing.get("domainStrategy") {
         if !matches!(
             strategy.as_str(),
@@ -267,6 +327,7 @@ fn validate_generated(config: &Value) -> io::Result<()> {
                 "port",
                 "network",
                 "outboundTag",
+                "balancerTag",
                 "inboundTag",
             ],
         )?;
@@ -277,8 +338,19 @@ fn validate_generated(config: &Value) -> io::Result<()> {
                 return Err(rejected());
             }
         }
-        if !tags.contains(string(&rule["outboundTag"])?) {
-            return Err(rejected());
+        match (rule.get("outboundTag"), rule.get("balancerTag")) {
+            (Some(outbound), None) => {
+                if !tags.contains(string(outbound)?) {
+                    return Err(rejected());
+                }
+            }
+            // The only balancer a generated config may target.
+            (None, Some(balancer)) => {
+                if string(balancer)? != "failover" {
+                    return Err(rejected());
+                }
+            }
+            _ => return Err(rejected()),
         }
         if let Some(inbound_tag) = rule.get("inboundTag") {
             let items = inbound_tag.as_array().ok_or_else(rejected)?;
@@ -324,6 +396,27 @@ fn validate_generated(config: &Value) -> io::Result<()> {
                 }
             }
         }
+    }
+    Ok(())
+}
+
+/// `node-`/`pin-` tag suffixes are endpoint keys: exactly 16 lowercase hex.
+fn valid_node_key(key: &str) -> bool {
+    key.len() == 16
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Auxiliary outbounds cannot open listeners; their settings only shape
+/// outbound behaviour, so validate the emitted inner shapes rather than
+/// forbid them outright.
+fn validate_auxiliary(outbound: &Value, map: &Map<String, Value>) -> io::Result<()> {
+    if let Some(settings) = map.get("settings") {
+        validate_auxiliary_settings(string(&outbound["protocol"]).unwrap_or_default(), settings)?;
+    }
+    if let Some(stream) = map.get("streamSettings") {
+        validate_auxiliary_stream(stream)?;
     }
     Ok(())
 }
@@ -548,6 +641,7 @@ fn validate_sockopt(sockopt: &Value) -> io::Result<()> {
             "tproxy",
             "tcpKeepAliveInterval",
             "tcpKeepAliveIdle",
+            "tcpUserTimeout",
             "tcpcongestion",
             "interface",
             "V6Only",
@@ -562,6 +656,14 @@ fn validate_sockopt(sockopt: &Value) -> io::Result<()> {
                 value
                     .as_u64()
                     .filter(|n| *n <= u32::MAX as u64)
+                    .ok_or_else(rejected)?;
+            }
+            // `TCP_USER_TIMEOUT` is milliseconds; bound it to an hour so a
+            // generated config cannot stall dead-stream detection for days.
+            "tcpUserTimeout" => {
+                value
+                    .as_u64()
+                    .filter(|n| *n <= 3_600_000)
                     .ok_or_else(rejected)?;
             }
             "tcpFastOpen" | "V6Only" | "tcpMptcp" | "tcpNoDelay" => {
@@ -680,7 +782,7 @@ fn validate_dns_rewrite_rule(rule: &Value) -> io::Result<()> {
     let map = object(rule, &["action", "qType", "rCode", "domain", "domains"])?;
     if let Some(action) = map.get("action") {
         let action = string(action)?;
-        if !matches!(action, "return" | "hijack" | "direct" | "reject" | "skip") {
+        if !matches!(action, "return" | "hijack" | "direct" | "drop") {
             return Err(rejected());
         }
     }
@@ -966,15 +1068,30 @@ pub fn prepare_xray(uid: u32, params: XrayConnectParams, mark: u32) -> io::Resul
     }
     let mut config: Value = serde_json::from_str(&params.config).map_err(|_| rejected())?;
     validate_generated(&config)?;
-    // `validate_generated` guarantees the shape of outbounds[0]; extracting
-    // the upstream host here lets the daemon install a direct bypass route
-    // before any tunnel routes land.
-    let server_host = match config["outbounds"][0]["protocol"].as_str() {
-        Some("vless") => config["outbounds"][0]["settings"]["vnext"][0]["address"].as_str(),
-        Some("hysteria") => config["outbounds"][0]["settings"]["address"].as_str(),
-        _ => None,
+    let failover = params
+        .failover
+        .as_ref()
+        .map(|f| validate_failover(f, &config));
+    let failover = match failover {
+        Some(Ok(params)) => Some(params),
+        Some(Err(err)) => return Err(err),
+        None => None,
+    };
+    // Upstream host of every proxy outbound: each candidate node needs its
+    // own bypass route (the failover target changes at runtime).
+    let mut server_hosts: Vec<String> = Vec::new();
+    for outbound in config["outbounds"].as_array().ok_or_else(rejected)? {
+        let host = match outbound["protocol"].as_str() {
+            Some("vless") => outbound["settings"]["vnext"][0]["address"].as_str(),
+            Some("hysteria") => outbound["settings"]["address"].as_str(),
+            _ => None,
+        };
+        if let Some(host) = host {
+            if !server_hosts.iter().any(|known| known == host) {
+                server_hosts.push(host.to_owned());
+            }
+        }
     }
-    .map(str::to_owned);
     let mut hash = 0xcbf29ce484222325_u64;
     for byte in uid.to_le_bytes().iter().chain(params.profile_id.as_bytes()) {
         hash ^= u64::from(*byte);
@@ -996,7 +1113,30 @@ pub fn prepare_xray(uid: u32, params: XrayConnectParams, mark: u32) -> io::Resul
     )
     .parse()
     .map_err(|_| rejected())?;
-    let mtu = 1500;
+    let mtu = params.mtu.unwrap_or(1500);
+    if !(1280..=9000).contains(&mtu) {
+        return Err(rejected());
+    }
+    let probe_url = params
+        .probe_url
+        .as_deref()
+        .map(crate::watchdog::checked_probe_url)
+        .transpose()?;
+    let pinned_keys: Vec<String> = config["outbounds"]
+        .as_array()
+        .ok_or_else(rejected)?
+        .iter()
+        .filter(|outbound| matches!(outbound["protocol"].as_str(), Some("vless" | "hysteria")))
+        .filter_map(|outbound| {
+            outbound["tag"]
+                .as_str()?
+                .strip_prefix("pin-")
+                .map(str::to_owned)
+        })
+        .collect();
+    if pinned_keys.len() > 33 {
+        return Err(rejected());
+    }
     let mut dest_override = vec!["http", "tls", "quic"];
     // Fake-IP answers need the sniffing stage to keep the fake destination so
     // routing can match it against domain policies.
@@ -1008,40 +1148,112 @@ pub fn prepare_xray(uid: u32, params: XrayConnectParams, mark: u32) -> io::Resul
     }
     // Caller inbounds are loopback socks/http listeners that a TUN tunnel
     // replaces wholesale. The extra `api-in` dokodemo door feeds the local
-    // StatsService; it never leaves loopback.
+    // StatsService/RoutingService; it never leaves loopback. Each failover
+    // node gets its own loopback SOCKS inbound so a probe's health path
+    // really traverses that node.
     let api_port = xray_api_port(mark);
-    config["inbounds"] = json!([
-        {
+    let mut inbounds = vec![
+        json!({
             "tag": "tun-in",
             "protocol": "tun",
             "settings": { "name": name, "mtu": mtu },
             // TUN traffic arrives as bare IP packets; sniffing recovers the TLS
             // SNI / HTTP Host so domain and geosite routing rules can match.
             "sniffing": { "enabled": true, "destOverride": dest_override },
-        },
-        {
+        }),
+        json!({
             "tag": "api-in",
             "protocol": "dokodemo-door",
             "listen": "127.0.0.1",
             "port": api_port,
             "settings": { "address": "127.0.0.1" },
-        },
-    ]);
+        }),
+    ];
+    if let Some(failover) = &failover {
+        for (index, node) in failover.nodes.iter().enumerate() {
+            inbounds.push(json!({
+                "tag": format!("probe-{}", node.key),
+                "protocol": "socks",
+                "listen": "127.0.0.1",
+                "port": xray_probe_port(mark, index),
+            }));
+        }
+    }
+    for (index, key) in pinned_keys.iter().enumerate() {
+        inbounds.push(json!({
+            "tag": format!("pin-probe-{key}"),
+            "protocol": "socks", "listen": "127.0.0.1",
+            "port": xray_pin_probe_port(mark, index),
+        }));
+    }
+    config["inbounds"] = json!(inbounds);
     config["log"] = json!({"loglevel":"warning"});
     config["stats"] = json!({});
-    config["policy"] = json!({
-        "system": {
-            "statsInboundUplink": true,
-            "statsInboundDownlink": true,
-            "statsOutboundUplink": true,
-            "statsOutboundDownlink": true,
-        }
+    if config["policy"].is_null() {
+        config["policy"] = json!({});
+    }
+    config["policy"]["system"] = json!({
+        "statsInboundUplink": true,
+        "statsInboundDownlink": true,
+        "statsOutboundUplink": true,
+        "statsOutboundDownlink": true,
     });
-    config["api"] = json!({"tag": "api", "services": ["StatsService"]});
-    config["routing"]["rules"]
-        .as_array_mut()
-        .ok_or_else(rejected)?
-        .push(json!({"type": "field", "inboundTag": ["api-in"], "outboundTag": "api"}));
+    let services = if failover.is_some() {
+        vec!["StatsService", "RoutingService"]
+    } else {
+        vec!["StatsService"]
+    };
+    config["api"] = json!({"tag": "api", "services": services});
+    {
+        let rules = config["routing"]["rules"]
+            .as_array_mut()
+            .ok_or_else(rejected)?;
+        // Control and probe traffic must win over every user rule, including
+        // the failover catch-all; otherwise a fresh tunnel cannot probe or
+        // install its first override.
+        let api_rule = json!({"type": "field", "inboundTag": ["api-in"], "outboundTag": "api"});
+        let probe_rules = failover
+            .iter()
+            .flat_map(|plan| plan.nodes.iter())
+            .map(|node| {
+                json!({
+                    "type": "field",
+                    "inboundTag": [format!("probe-{}", node.key)],
+                    "outboundTag": net_manager_core::xray::node_tag(&node.key),
+                })
+            });
+        let pin_rules = pinned_keys.iter().map(|key| {
+            json!({
+                "type":"field", "inboundTag":[format!("pin-probe-{key}")],
+                "outboundTag":net_manager_core::xray::pin_tag(key),
+            })
+        });
+        rules.splice(
+            0..0,
+            std::iter::once(api_rule)
+                .chain(probe_rules)
+                .chain(pin_rules),
+        );
+        if failover.is_some() {
+            // Everything that matched no rule goes through the failover
+            // balancer; the probe supervisor pins it to the first healthy
+            // node or the `unavailable` blackhole — never direct.
+            rules.push(json!({
+                "type": "field",
+                "network": "tcp,udp",
+                "balancerTag": net_manager_core::xray::FAILOVER_BALANCER,
+            }));
+        }
+    }
+    if failover.is_some() {
+        config["outbounds"]
+            .as_array_mut()
+            .ok_or_else(rejected)?
+            .push(json!({
+                "tag": net_manager_core::xray::UNAVAILABLE_TAG,
+                "protocol": "blackhole",
+            }));
+    }
     for outbound in config["outbounds"].as_array_mut().ok_or_else(rejected)? {
         if outbound["protocol"] != "blackhole" {
             if outbound["streamSettings"].is_null() {
@@ -1076,10 +1288,63 @@ pub fn prepare_xray(uid: u32, params: XrayConnectParams, mark: u32) -> io::Resul
         full_ipv6,
         mark,
         api_port,
-        server_host,
+        server_hosts,
+        unpinned_hosts: Vec::new(),
         server_pinned: false,
+        failover,
+        reject_quic: params.reject_quic,
+        probe_url,
+        pinned_keys,
         geo_assets: params.geo_assets,
     })
+}
+
+/// Check the failover params against a validated config: every declared
+/// candidate owns a `node-<key>` outbound, no `node-` outbound goes
+/// undeclared (it would sit outside the supervisor's health tracking), and
+/// the probe URL stays inside the HTTPS-probe contract.
+fn validate_failover(
+    failover: &net_manager_core::daemon_protocol::XrayFailoverParams,
+    config: &Value,
+) -> io::Result<net_manager_core::daemon_protocol::XrayFailoverParams> {
+    let nodes = &failover.nodes;
+    if nodes.is_empty() || nodes.len() > net_manager_core::subscription::MAX_FAILOVER_NODES {
+        return Err(rejected());
+    }
+    let mut keys = HashSet::new();
+    for node in nodes {
+        if !valid_node_key(&node.key) || !keys.insert(node.key.as_str()) {
+            return Err(rejected());
+        }
+    }
+    if !valid_node_key(&failover.primary_key) || failover.primary_key != nodes[0].key {
+        return Err(rejected());
+    }
+    let tags: HashSet<&str> = config["outbounds"]
+        .as_array()
+        .ok_or_else(rejected)?
+        .iter()
+        .filter_map(|outbound| outbound["tag"].as_str())
+        .collect();
+    for node in nodes {
+        if !tags.contains(net_manager_core::xray::node_tag(&node.key).as_str()) {
+            return Err(rejected());
+        }
+    }
+    for tag in &tags {
+        if let Some(key) = tag.strip_prefix("node-") {
+            if !keys.contains(key) {
+                return Err(rejected());
+            }
+        }
+    }
+    let probe = crate::watchdog::checked_probe_url(failover.probe_url.trim())?;
+    if !(1..=300).contains(&failover.interval_secs) {
+        return Err(rejected());
+    }
+    let mut checked = failover.clone();
+    checked.probe_url = probe;
+    Ok(checked)
 }
 
 impl XrayPlan {
@@ -1095,62 +1360,113 @@ impl XrayPlan {
         dns_bypass_addrs(&self.dns_servers, self.full_ipv4, self.full_ipv6)
     }
 }
-
-/// Makes the first outbound dial the server by IP instead of by name.
+/// Makes every proxy outbound dial its server by IP instead of by name.
 ///
-/// Xray re-resolves a name through the system resolver whenever it reconnects,
-/// and by then the resolver points into the tunnel that is waiting for that
-/// very connection. `resolve` runs while the physical uplink is still intact.
-/// The name stays the TLS/Reality server name unless the config sets one. A
-/// name that does not resolve, or a transport that derives a Host header or
-/// authority from the address (ws, grpc, xhttp, ...), is left untouched.
-pub fn pin_server_address(plan: &mut XrayPlan, resolve: impl Fn(&str) -> Vec<IpAddr>) {
-    let Some(host) = plan.server_host.clone() else {
-        return;
-    };
-    if host.parse::<IpAddr>().is_ok() {
-        plan.server_pinned = true;
-        return;
-    }
+/// Xray re-resolves a name through the system resolver whenever it
+/// reconnects, and by then the resolver points into the tunnel that is
+/// waiting for that very connection. `resolve` runs while the physical
+/// uplink is still intact — once per distinct hostname, applied to every
+/// `node-`/`pin-` outbound that uses it. The name stays the TLS/Reality
+/// server name unless the config sets one. A name that does not resolve,
+/// or a transport that derives a Host header or authority from the address
+/// (ws, grpc, xhttp, ...), is left untouched and reported in
+/// `unpinned_hosts`.
+pub fn pin_server_addresses(plan: &mut XrayPlan, resolve: impl Fn(&str) -> Vec<IpAddr>) {
     let Ok(mut config) = serde_json::from_str::<Value>(&plan.config) else {
         return;
     };
-    let outbound = &mut config["outbounds"][0];
-    let carries_name = matches!(
-        outbound["streamSettings"]["network"].as_str(),
-        None | Some("tcp" | "raw" | "hysteria" | "kcp")
-    );
-    if !carries_name {
-        return;
-    }
-    let addresses = resolve(&host);
-    let Some(address) = addresses
-        .iter()
-        .find(|ip| ip.is_ipv4())
-        .or_else(|| addresses.first())
-    else {
+    let Some(outbounds) = config["outbounds"].as_array_mut() else {
         return;
     };
-    let slot = match outbound["protocol"].as_str() {
-        Some("vless") => &mut outbound["settings"]["vnext"][0]["address"],
-        Some("hysteria") => &mut outbound["settings"]["address"],
-        _ => return,
-    };
-    *slot = json!(address.to_string());
-    for security in ["tlsSettings", "realitySettings"] {
-        if let Some(settings) = outbound["streamSettings"][security].as_object_mut() {
-            settings
-                .entry("serverName")
-                .or_insert_with(|| json!(host.clone()));
+    let mut resolved: std::collections::HashMap<String, Option<IpAddr>> = Default::default();
+    let mut unpinned: Vec<String> = Vec::new();
+    let mut all_pinned = true;
+    for outbound in outbounds.iter_mut() {
+        let host = match outbound["protocol"].as_str() {
+            Some("vless") => outbound["settings"]["vnext"][0]["address"].as_str(),
+            Some("hysteria") => outbound["settings"]["address"].as_str(),
+            _ => None,
+        };
+        let Some(host) = host.map(str::to_string) else {
+            continue;
+        };
+        if host.parse::<IpAddr>().is_ok() {
+            continue;
+        }
+        let carries_name = matches!(
+            outbound["streamSettings"]["network"].as_str(),
+            None | Some("tcp" | "raw" | "hysteria" | "kcp")
+        );
+        let address = if carries_name {
+            resolved
+                .entry(host.clone())
+                .or_insert_with(|| {
+                    let addresses = resolve(&host);
+                    addresses
+                        .iter()
+                        .copied()
+                        .find(|ip| ip.is_ipv4())
+                        .or_else(|| addresses.first().copied())
+                })
+                .to_owned()
+        } else {
+            None
+        };
+        let Some(address) = address else {
+            all_pinned = false;
+            if !unpinned.iter().any(|known| known == &host) {
+                unpinned.push(host);
+            }
+            continue;
+        };
+        let slot = match outbound["protocol"].as_str() {
+            Some("vless") => &mut outbound["settings"]["vnext"][0]["address"],
+            Some("hysteria") => &mut outbound["settings"]["address"],
+            _ => continue,
+        };
+        *slot = json!(address.to_string());
+        for security in ["tlsSettings", "realitySettings"] {
+            if let Some(settings) = outbound["streamSettings"][security].as_object_mut() {
+                settings
+                    .entry("serverName")
+                    .or_insert_with(|| json!(host.clone()));
+            }
         }
     }
+    plan.server_hosts = outbounds
+        .iter()
+        .filter_map(|outbound| {
+            match outbound["protocol"].as_str() {
+                Some("vless") => outbound["settings"]["vnext"][0]["address"].as_str(),
+                Some("hysteria") => outbound["settings"]["address"].as_str(),
+                _ => None,
+            }
+            .map(str::to_owned)
+        })
+        .collect();
     let Ok(text) = serde_json::to_string(&config) else {
         return;
     };
     plan.config = text;
-    plan.server_host = Some(address.to_string());
-    plan.server_pinned = true;
+    plan.unpinned_hosts = unpinned;
+    plan.server_pinned = all_pinned;
 }
+
+/// Loopback port of the `probe-<key>` SOCKS inbound for failover node
+/// `index` (0-based, same order as `failover.nodes`). The range sits one
+/// hundred ports above the per-slot `api-in` listener so tunnels never
+/// collide; `MAX_FAILOVER_NODES` keeps it inside the slot stride.
+pub fn xray_probe_port(mark: u32, index: usize) -> u16 {
+    u16::try_from(
+        PROBE_PORT_BASE + mark.saturating_sub(POLICY_MARK_BASE).min(127) * 8 + index.min(7) as u32,
+    )
+    .unwrap_or(PROBE_PORT_BASE as u16)
+}
+
+/// Per-tunnel probe listeners take an 8-port stride per policy slot, in a
+/// range disjoint from `API_PORT_BASE` (api port + slot is shared across
+/// tunnels by design? no — one slot per tunnel; stride keeps indexes apart).
+const PROBE_PORT_BASE: u32 = 11185;
 
 /// Loopback port of the per-tunnel `api-in` listener, derived from the
 /// policy-routing slot so concurrently running tunnels never collide and a
@@ -1158,6 +1474,10 @@ pub fn pin_server_address(plan: &mut XrayPlan, resolve: impl Fn(&str) -> Vec<IpA
 pub fn xray_api_port(mark: u32) -> u16 {
     u16::try_from(API_PORT_BASE + mark.saturating_sub(POLICY_MARK_BASE).min(127))
         .unwrap_or(API_PORT_BASE as u16)
+}
+
+pub fn xray_pin_probe_port(mark: u32, index: usize) -> u16 {
+    (13_000 + mark.saturating_sub(POLICY_MARK_BASE).min(127) * 40 + index.min(32) as u32) as u16
 }
 
 /// Policy marks are allocated as `POLICY_MARK_BASE + slot` (0..128 slots); the
@@ -1212,6 +1532,10 @@ mod tests {
             geo_assets: None,
             macos_data_root: None,
             role: Default::default(),
+            failover: None,
+            reject_quic: false,
+            probe_url: None,
+            mtu: None,
         }
     }
 
@@ -1246,7 +1570,7 @@ mod tests {
     #[test]
     fn plan_extracts_server_host_for_bypass_routes() {
         let plan = prepare_xray(1000, params(), 51820).unwrap();
-        assert_eq!(plan.server_host.as_deref(), Some("example.test"));
+        assert_eq!(plan.server_hosts, ["example.test"]);
 
         let mut hysteria = params();
         hysteria.config = json!({
@@ -1260,7 +1584,7 @@ mod tests {
         })
         .to_string();
         let plan = prepare_xray(1000, hysteria, 51820).unwrap();
-        assert_eq!(plan.server_host.as_deref(), Some("hy.example.test"));
+        assert_eq!(plan.server_hosts, ["hy.example.test"]);
         assert!(!format!("{plan:?}").contains("SECRET-PASS"));
     }
 
@@ -1272,13 +1596,13 @@ mod tests {
     fn pinning_replaces_the_server_name_and_keeps_the_sni() {
         let mut plan = prepare_xray(1000, params(), 51820).unwrap();
         // The vless fixture uses plain TCP without TLS: nothing to carry over.
-        pin_server_address(&mut plan, |_| vec![ip("203.0.113.7")]);
+        pin_server_addresses(&mut plan, |_| vec![ip("203.0.113.7")]);
         let config: Value = serde_json::from_str(&plan.config).unwrap();
         assert_eq!(
             config["outbounds"][0]["settings"]["vnext"][0]["address"],
             "203.0.113.7"
         );
-        assert_eq!(plan.server_host.as_deref(), Some("203.0.113.7"));
+        assert_eq!(plan.server_hosts, ["203.0.113.7"]);
         assert!(plan.server_pinned);
 
         let mut hysteria = params();
@@ -1293,7 +1617,7 @@ mod tests {
         })
         .to_string();
         let mut plan = prepare_xray(1000, hysteria, 51820).unwrap();
-        pin_server_address(&mut plan, |_| vec![ip("2001:db8::1"), ip("203.0.113.9")]);
+        pin_server_addresses(&mut plan, |_| vec![ip("2001:db8::1"), ip("203.0.113.9")]);
         let config: Value = serde_json::from_str(&plan.config).unwrap();
         assert_eq!(config["outbounds"][0]["settings"]["address"], "203.0.113.9");
         assert_eq!(
@@ -1317,7 +1641,7 @@ mod tests {
         })
         .to_string();
         let mut plan = prepare_xray(1000, input, 51820).unwrap();
-        pin_server_address(&mut plan, |_| vec![ip("203.0.113.7")]);
+        pin_server_addresses(&mut plan, |_| vec![ip("203.0.113.7")]);
         let config: Value = serde_json::from_str(&plan.config).unwrap();
         assert_eq!(
             config["outbounds"][0]["streamSettings"]["realitySettings"]["serverName"],
@@ -1329,9 +1653,9 @@ mod tests {
     fn pinning_leaves_the_name_when_it_cannot_be_resolved_or_carried() {
         let mut plan = prepare_xray(1000, params(), 51820).unwrap();
         let before = plan.config.clone();
-        pin_server_address(&mut plan, |_| Vec::new());
+        pin_server_addresses(&mut plan, |_| Vec::new());
         assert_eq!(plan.config, before);
-        assert_eq!(plan.server_host.as_deref(), Some("example.test"));
+        assert_eq!(plan.server_hosts, ["example.test"]);
         assert!(!plan.server_pinned);
 
         // WebSocket derives its Host header from the address.
@@ -1341,7 +1665,7 @@ mod tests {
         ws.config = config.to_string();
         let mut plan = prepare_xray(1000, ws, 51820).unwrap();
         let before = plan.config.clone();
-        pin_server_address(&mut plan, |_| vec![ip("203.0.113.7")]);
+        pin_server_addresses(&mut plan, |_| vec![ip("203.0.113.7")]);
         assert_eq!(plan.config, before);
         assert!(!plan.server_pinned);
     }
@@ -1353,7 +1677,7 @@ mod tests {
         config["outbounds"][0]["settings"]["vnext"][0]["address"] = json!("203.0.113.7");
         input.config = config.to_string();
         let mut plan = prepare_xray(1000, input, 51820).unwrap();
-        pin_server_address(&mut plan, |_| panic!("no lookup for a literal address"));
+        pin_server_addresses(&mut plan, |_| panic!("no lookup for a literal address"));
         assert!(plan.server_pinned);
     }
 
@@ -1720,5 +2044,24 @@ mod tests {
         let mut input = params();
         input.dns_bypass = vec!["bad host/name".into()];
         assert!(prepare_xray(1000, input, 51820).is_err());
+    }
+
+    #[test]
+    fn connection_idle_policy_survives_privileged_stats_injection() {
+        let mut input = params();
+        let mut config: Value = serde_json::from_str(&input.config).unwrap();
+        config["policy"] = json!({"levels":{"0":{"connIdle":120}}});
+        input.config = config.to_string();
+        let plan = prepare_xray(1000, input, 51820).unwrap();
+        let runtime: Value = serde_json::from_str(&plan.config).unwrap();
+        assert_eq!(runtime["policy"]["levels"]["0"]["connIdle"], 120);
+        assert_eq!(runtime["policy"]["system"]["statsInboundUplink"], true);
+        config["policy"]["levels"]["0"]["bufferSize"] = json!(1024);
+        let mut input = params();
+        input.config = config.to_string();
+        assert!(
+            prepare_xray(1000, input, 51820).is_err(),
+            "unapproved policy settings reached root Xray"
+        );
     }
 }

@@ -166,6 +166,8 @@ pub(crate) fn diag_input(p: &Profile) -> DiagnosticsInput {
             state: TunnelState::Running,
             message: None,
             interface_name: None,
+            failover: None,
+            watchdog: None,
         },
         managed: true,
         inspection: Some(inspection_for(p, true)),

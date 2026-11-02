@@ -80,6 +80,11 @@ fn state_word(state: TunnelState) -> &'static str {
 }
 
 fn status_json(ctx: &Ctx, profile: &Profile, status: &TunnelStatus) -> Value {
+    let failover = serde_json::to_value(&status.failover).unwrap_or(Value::Null);
+    let active_node = failover
+        .get("activeKey")
+        .and_then(Value::as_str)
+        .and_then(|key| endpoints::node_name(ctx, profile, key));
     json!({
         "server": endpoints::active_name(ctx, profile),
         "id": profile.id,
@@ -88,7 +93,30 @@ fn status_json(ctx: &Ctx, profile: &Profile, status: &TunnelStatus) -> Value {
         "state": state_word(status.state),
         "interface": status.interface_name,
         "message": status.message,
+        "failover": failover,
+        "failoverServer": active_node,
+        "watchdog": status.watchdog,
     })
+}
+
+/// The node actually carrying traffic: the primary name, or the backup's
+/// name flagged while the failover chain is live.
+fn active_node(ctx: &Ctx, profile: &Profile, status: &TunnelStatus) -> String {
+    let failover = serde_json::to_value(&status.failover).unwrap_or(Value::Null);
+    if let Some(key) = failover.get("activeKey").and_then(Value::as_str) {
+        if let Some(name) = endpoints::node_name(ctx, profile, key) {
+            let on_backup = failover
+                .get("failoverActive")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            return if on_backup {
+                format!("{name} (backup)")
+            } else {
+                name
+            };
+        }
+    }
+    endpoints::active_name(ctx, profile).unwrap_or_default()
 }
 
 /// Profiles the daemon runs; the rest are not this CLI's yet.
@@ -126,7 +154,7 @@ pub fn status(ctx: &Ctx, target: Option<&str>) -> Result<Output, String> {
                         profile.name.clone(),
                         state_word(status.state).into(),
                         status.interface_name.clone().unwrap_or_default(),
-                        endpoints::active_name(ctx, profile).unwrap_or_default(),
+                        active_node(ctx, profile, status),
                     ]
                 })
                 .collect::<Vec<_>>(),
@@ -258,7 +286,7 @@ pub fn down(ctx: &Ctx, target: Option<&str>, all: bool) -> Result<Output, String
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::linux::compat;
+    use crate::linux::{compat, route};
     use net_manager_core::daemon_protocol::{method, HelloResult, PROTOCOL_VERSION};
     use net_manager_core::helper_client::HelperError;
     use net_manager_core::models::{PolicyRoute, TunnelRole};
@@ -748,6 +776,278 @@ mod tests {
             .lock()
             .unwrap()
             .contains(&method::XRAY_CONNECT.to_string()));
+    }
+
+    fn backup_command(
+        kind: super::super::args::BackupCommand,
+    ) -> super::super::args::BackupCommand {
+        kind
+    }
+
+    #[test]
+    fn backups_form_an_ordered_chain_and_missing_keys_survive() {
+        use super::super::args::BackupCommand::*;
+        let (_dir, ctx, _) = subscription_setup(FakeDaemon {
+            replies: HashMap::from([(method::XRAY_STATUS, xray_status("stopped"))]),
+            ..Default::default()
+        });
+        let (_, text) = endpoints::backup(
+            &ctx,
+            backup_command(Set {
+                profile: "sub1".into(),
+                servers: vec!["gamma".into(), "beta".into()],
+            }),
+        )
+        .unwrap();
+        assert!(text.contains("Gamma DE, then Beta NL"), "{text}");
+        let meta = ctx.find("sub1").unwrap().subscription.unwrap();
+        assert_eq!(meta.backup_keys.len(), 2);
+        // A remembered-but-gone key is kept: it may reappear on refresh.
+        endpoints::backup(
+            &ctx,
+            backup_command(Set {
+                profile: "sub1".into(),
+                servers: vec!["deadbeefdeadbeef".into(), "beta".into()],
+            }),
+        )
+        .unwrap();
+        let (value, text) = endpoints::backup(
+            &ctx,
+            backup_command(Show {
+                profile: "sub1".into(),
+            }),
+        )
+        .unwrap();
+        assert!(text.contains("backup 1"), "{text}");
+        assert_eq!(value["backups"].as_array().unwrap().len(), 2);
+        assert_eq!(value["backups"][0]["missing"], true);
+        assert_eq!(value["autoReturn"], true);
+        // The primary cannot be its own backup.
+        assert!(endpoints::backup(
+            &ctx,
+            backup_command(Add {
+                profile: "sub1".into(),
+                server: "alpha".into(),
+            }),
+        )
+        .is_err());
+        endpoints::backup(
+            &ctx,
+            backup_command(Rm {
+                profile: "sub1".into(),
+                server: "deadbeefdeadbeef".into(),
+            }),
+        )
+        .unwrap();
+        let meta = ctx.find("sub1").unwrap().subscription.unwrap();
+        assert_eq!(meta.backup_keys.len(), 1);
+        endpoints::backup(
+            &ctx,
+            backup_command(Auto {
+                profile: "sub1".into(),
+                enabled: super::super::args::BoolOnOff::Off,
+            }),
+        )
+        .unwrap();
+        let meta = ctx.find("sub1").unwrap().subscription.unwrap();
+        assert_eq!(meta.auto_return_primary, Some(false));
+    }
+
+    #[test]
+    fn pinned_routes_bind_domains_to_a_node_and_unpin_frees_them() {
+        let (_dir, ctx, _) = subscription_setup(FakeDaemon {
+            replies: HashMap::from([(method::XRAY_STATUS, xray_status("stopped"))]),
+            ..Default::default()
+        });
+        let (value, text) = route::run(
+            &ctx,
+            super::super::args::RouteCommand::Pin {
+                profile: "sub1".into(),
+                via: "beta".into(),
+                selector: vec!["domain:bank.test".into(), "geosite:category-gov".into()],
+            },
+        )
+        .unwrap();
+        assert!(text.contains("Beta NL"), "{text}");
+        assert_eq!(value["selectors"].as_array().unwrap().len(), 2);
+        let profile = ctx.find("sub1").unwrap();
+        assert_eq!(profile.pinned_policies.len(), 1);
+        assert_eq!(profile.pinned_policies[0].selectors.len(), 2);
+        // Addresses and geoip selectors do not pin; domain rules do.
+        assert!(route::run(
+            &ctx,
+            super::super::args::RouteCommand::Pin {
+                profile: "sub1".into(),
+                via: "beta".into(),
+                selector: vec!["203.0.113.9".into()],
+            },
+        )
+        .is_err());
+        // The same selector cannot follow two routes.
+        assert!(route::run(
+            &ctx,
+            super::super::args::RouteCommand::Add {
+                profile: "sub1".into(),
+                rules: super::super::args::RuleArgs {
+                    proxy: vec!["domain:bank.test".into()],
+                    ..Default::default()
+                },
+            },
+        )
+        .is_err());
+        let (_, text) = route::run(
+            &ctx,
+            super::super::args::RouteCommand::Unpin {
+                profile: "sub1".into(),
+                via: "beta".into(),
+                selector: vec![],
+            },
+        )
+        .unwrap();
+        assert!(text.contains("Unpinned"), "{text}");
+        assert!(ctx.find("sub1").unwrap().pinned_policies.is_empty());
+    }
+
+    #[test]
+    fn pool_filters_bind_countries_and_clear_turns_the_pool_off() {
+        use super::super::args::{BackupCommand::*, PoolCommand};
+        let (_dir, ctx, _) = subscription_setup(FakeDaemon::default());
+        let (value, _) = endpoints::backup(
+            &ctx,
+            Pool(PoolCommand::Set {
+                profile: "sub1".into(),
+                filters: vec!["DE:erman|Герман".into()],
+                no_verify: false,
+            }),
+        )
+        .unwrap();
+        let meta = ctx.find("sub1").unwrap().subscription.unwrap();
+        let pool = meta.node_pool.unwrap();
+        assert!(pool.verify_exit_country);
+        assert_eq!(pool.filters.len(), 1);
+        assert_eq!(pool.filters[0].exit_country.as_deref(), Some("DE"));
+        assert_eq!(pool.filters[0].name_contains.len(), 2);
+        assert_eq!(value["pool"]["verifyExitCountry"], true);
+        // Country-less filters need --no-verify, which cannot promise exits.
+        assert!(endpoints::backup(
+            &ctx,
+            Pool(PoolCommand::Set {
+                profile: "sub1".into(),
+                filters: vec!["erman".into()],
+                no_verify: false,
+            }),
+        )
+        .is_err());
+        assert!(endpoints::backup(
+            &ctx,
+            Pool(PoolCommand::Set {
+                profile: "sub1".into(),
+                filters: vec!["DE:erman".into()],
+                no_verify: true,
+            }),
+        )
+        .is_err());
+        let (_, text) = endpoints::backup(
+            &ctx,
+            Pool(PoolCommand::Show {
+                profile: "sub1".into(),
+            }),
+        )
+        .unwrap();
+        assert!(text.contains("DE:erman|Герман"), "{text}");
+        endpoints::backup(
+            &ctx,
+            Pool(PoolCommand::Clear {
+                profile: "sub1".into(),
+            }),
+        )
+        .unwrap();
+        let meta = ctx.find("sub1").unwrap().subscription.unwrap();
+        assert!(meta.node_pool.is_none());
+        assert!(meta.pool_keys.is_empty());
+    }
+
+    #[test]
+    fn quic_reject_is_a_profile_flag_shown_with_the_rules() {
+        let (_dir, ctx, _) = subscription_setup(FakeDaemon::default());
+        let (_, text) = route::run(
+            &ctx,
+            super::super::args::RouteCommand::Quic {
+                profile: "sub1".into(),
+                enabled: Some(super::super::args::BoolOnOff::On),
+            },
+        )
+        .unwrap();
+        assert!(text.contains("on"), "{text}");
+        assert!(ctx.find("sub1").unwrap().xray_quic_reject);
+        let (value, _) = route::run(
+            &ctx,
+            super::super::args::RouteCommand::Quic {
+                profile: "sub1".into(),
+                enabled: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(value["quicReject"], true);
+        route::run(
+            &ctx,
+            super::super::args::RouteCommand::Quic {
+                profile: "sub1".into(),
+                enabled: Some(super::super::args::BoolOnOff::Off),
+            },
+        )
+        .unwrap();
+        assert!(!ctx.find("sub1").unwrap().xray_quic_reject);
+    }
+
+    #[test]
+    fn flag_country_reads_regional_indicators() {
+        assert_eq!(
+            crate::linux::endpoints::flag_country("🇷🇺 Россия"),
+            Some("RU".into())
+        );
+        assert_eq!(crate::linux::endpoints::flag_country("Beta NL"), None);
+    }
+
+    #[test]
+    fn migration_preview_reports_and_apply_refuses_unsupported_rules() {
+        use super::super::args::MigrateCommand::*;
+        let (_dir, ctx, _) = subscription_setup(FakeDaemon::default());
+        let source_dir = tempfile::tempdir().unwrap();
+        let file = source_dir.path().join("config.json");
+        std::fs::write(
+            &file,
+            r#"{"outbounds":[
+                {"tag":"proxy","protocol":"vless"},
+                {"tag":"direct","protocol":"freedom"},
+                {"tag":"block","protocol":"blackhole"},
+                {"tag":"exotic","protocol":"vless"}
+              ],
+              "routing":{"rules":[
+                {"type":"field","domain":["domain:home.test"],"outboundTag":"direct"},
+                {"type":"field","domain":["domain:mystery.test"],"outboundTag":"exotic"}
+              ]}}"#,
+        )
+        .unwrap();
+        let (value, _) = crate::linux::migrate::run(
+            &ctx,
+            Preview {
+                profile: "sub1".into(),
+                from: file.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(value["policies"]["direct"], 1, "{value}");
+        assert!(crate::linux::migrate::run(
+            &ctx,
+            Apply {
+                profile: "sub1".into(),
+                from: file,
+            },
+        )
+        .is_err());
+        // The refused apply changed nothing.
+        assert!(ctx.find("sub1").unwrap().domain_policies.is_empty());
     }
 
     #[test]

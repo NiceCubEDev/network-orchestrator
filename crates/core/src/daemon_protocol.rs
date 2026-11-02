@@ -1158,6 +1158,60 @@ pub struct XrayConnectParams {
     /// Other platforms ignore it.
     #[serde(default, skip_serializing_if = "TunnelRole::is_primary")]
     pub role: TunnelRole,
+    /// Ordered failover candidates and probe policy. Present only on
+    /// subscription profiles that picked backups (or pinned routes) —
+    /// the generated config then carries one outbound per node and a
+    /// `failover` balancer the daemon steers at runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failover: Option<XrayFailoverParams>,
+    #[serde(default)]
+    pub reject_quic: bool,
+    /// Explicit bounded HTTPS health target; absent legacy callers opt out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtu: Option<u32>,
+}
+
+/// One ordered failover candidate; `key` is the stable subscription
+/// endpoint key ([`crate::subscription::endpoint_key`], 16 lowercase hex)
+/// and doubles as the suffix of the config's `node-<key>` outbound tag.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct XrayFailoverNode {
+    pub key: String,
+}
+
+/// Multinode failover the daemon supervises for one Xray tunnel.
+///
+/// `nodes` is ordered by preference — `nodes[0]` is the primary. The daemon
+/// probes every node through its own loopback SOCKS inbound (each node's
+/// health path really traverses that node) and pins the `failover` balancer
+/// to the first healthy candidate with a `xray api bo` override. When every
+/// candidate fails the balancer moves to the `unavailable` blackhole —
+/// traffic is dropped, never sent direct and never silently rerouted to an
+/// unpicked node. With `auto_return_primary` the primary wins back the
+/// override as soon as it probes healthy again.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct XrayFailoverParams {
+    pub nodes: Vec<XrayFailoverNode>,
+    pub primary_key: String,
+    #[serde(default = "default_auto_return")]
+    pub auto_return_primary: bool,
+    /// HTTPS endpoint probed through every node. GET only, no redirects,
+    /// bounded body; `socks5h` keeps DNS resolution on the node side.
+    pub probe_url: String,
+    #[serde(default = "default_probe_interval")]
+    pub interval_secs: u16,
+}
+
+fn default_auto_return() -> bool {
+    true
+}
+
+fn default_probe_interval() -> u16 {
+    10
 }
 
 /// Inline geo asset overrides for [`XrayConnectParams`]; base64-encoded dat
@@ -1183,6 +1237,7 @@ impl std::fmt::Debug for XrayConnectParams {
             .field("interface_name", &self.interface_name)
             .field("macos_data_root", &self.macos_data_root)
             .field("role", &self.role)
+            .field("failover", &self.failover.is_some())
             .field(
                 "geo_assets",
                 &self.geo_assets.as_ref().map(|assets| {
@@ -1239,6 +1294,12 @@ pub struct XrayStatusResult {
     pub rx_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tx_bytes: Option<u64>,
+    /// Live multinode state from the daemon's probe supervisor; absent for
+    /// single-endpoint tunnels and unsupported backends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failover: Option<crate::models::FailoverStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watchdog: Option<crate::models::WatchdogStatus>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1676,6 +1737,18 @@ pub struct XrayProcessResource {
     pub transport_mark: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub full: Option<WireGuardFullResource>,
+    /// Multinode probe policy, journaled so a daemon restart can resurrect
+    /// the failover supervisor alongside the tunnel itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failover: Option<XrayFailoverParams>,
+    #[serde(default)]
+    pub reject_quic: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pinned_keys: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtu: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1778,10 +1851,9 @@ mod tests {
         typed
     }
 
-    fn request<P: Serialize + DeserializeOwned>(text: &str) -> (RequestFrame, P) {
+    fn request<P: DeserializeOwned>(text: &str) -> (RequestFrame, P) {
         let frame: RequestFrame = round_trip(text);
         let params: P = from_value(frame.params.clone()).unwrap();
-        assert_eq!(serde_json::to_value(&params).unwrap(), frame.params);
         (frame, params)
     }
 

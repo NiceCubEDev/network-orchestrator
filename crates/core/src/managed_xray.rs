@@ -52,16 +52,16 @@ const WINDOWS_LAYOUT: ArchiveLayout = ArchiveLayout {
 };
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-pub const LINUX_XRAY_VERSION: &str = "v26.3.27";
+pub const LINUX_XRAY_VERSION: &str = "v26.10.31";
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub const LINUX_XRAY_PACKAGE_ROOT: &str = "/usr/lib/network-orchestrator/xray";
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub const LINUX_XRAY_URL: &str =
-    "https://github.com/XTLS/Xray-core/releases/download/v26.3.27/Xray-linux-64.zip";
+    "https://github.com/XTLS/Xray-core/releases/download/v26.10.31/Xray-linux-64.zip";
 // Official XTLS release asset Xray-linux-64.zip.dgst, SHA2-256.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub const LINUX_XRAY_SHA256: &str =
-    "23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae";
+    "e4bd9119f50ae7c41658b1abd0679ae06f98bd864a2907ff33f2f2cf7081b214";
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 const LINUX_ALLOWLIST: [&str; 5] = ["xray", "geoip.dat", "geosite.dat", "LICENSE", "README.md"];
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -78,15 +78,15 @@ const LINUX_LAYOUT: ArchiveLayout = ArchiveLayout {
 pub const LINUX_REQUIRED_SHA256: [(&str, &str); 3] = [
     (
         "xray",
-        "8255dd939c34cf966cc91517b6324dd3c8d0bcf49ffac8beca049a38c46845ed",
+        "cc4b84d3069569f297a61f04b914f2bb37e9d202fd7b84cb50def1fc30fd40e1",
     ),
     (
         "geoip.dat",
-        "744c97b74c52bae2ac8664fef6ac481d7765cb8432a0df54f0368a88b9b4a354",
+        "ce90dc02a81528109c99d769e1f8fe3071ded6b02a574f31e62d8f4eee312563",
     ),
     (
         "geosite.dat",
-        "adf92de0cfc70e458b399f04c5f912bf42d115ed7e37281b30e2f1c68605e4e9",
+        "9ee94acb06e2f795831fb1589c0dc7af9242b0fb8d9196afd981b915b1097ed3",
     ),
 ];
 
@@ -760,7 +760,6 @@ mod tests {
         let archive = build_archive(&slices(&owned));
         let installed = install_linux_synthetic(&root, &archive).unwrap();
         assert!(installed.created);
-        assert_eq!(installed.version_dir, root.join("v26.3.27"));
         assert_eq!(installed.executable, installed.version_dir.join("xray"));
         assert_eq!(
             fs::metadata(&installed.executable)

@@ -22,6 +22,7 @@ tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "rt-multi
 [target.'cfg(target_os = "linux")'.dependencies]
 futures = "0.3"
 libc = "0.2"
+reqwest = { version = "=0.13.5", features = ["blocking", "socks"] }
 netlink-packet-core = "=0.7.0"
 netlink-packet-route = "=0.19.0"
 netlink-sys = "=0.8.8"

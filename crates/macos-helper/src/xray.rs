@@ -171,6 +171,8 @@ impl XrayExecutor {
             ipv6_covered: running,
             rx_bytes: None,
             tx_bytes: None,
+            failover: None,
+            watchdog: None,
         }
     }
 
@@ -184,6 +186,8 @@ impl XrayExecutor {
             ipv6_covered: false,
             rx_bytes: None,
             tx_bytes: None,
+            failover: None,
+            watchdog: None,
         }
     }
 
@@ -714,6 +718,9 @@ mod tests {
             geo_assets: None,
             macos_data_root: None,
             role: Default::default(),
+            failover: None,
+            reject_quic: false,
+            probe_url: None,
         }
     }
 

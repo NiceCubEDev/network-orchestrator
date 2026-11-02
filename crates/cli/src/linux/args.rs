@@ -29,6 +29,14 @@ pub enum Command {
     /// Routing rules of Xray profiles: what goes direct, through the tunnel or nowhere
     #[command(subcommand)]
     Route(RouteCommand),
+    /// Ordered backup servers and auto-return of a subscription (failover)
+    #[command(subcommand)]
+    Backup(BackupCommand),
+    /// Adopt the routing policy of a standalone Xray config (rules → this
+    /// app's direct/proxy/blocked lists and node pins)
+    #[command(subcommand)]
+    Migrate(MigrateCommand),
+
     /// Show which connections are running
     Status { target: Option<String> },
     /// Save a profile from a share link, subscription URL or config file
@@ -104,6 +112,142 @@ pub enum RouteCommand {
         /// Profile whose rules are replayed
         #[arg(long)]
         profile: String,
+    },
+    /// Send domains through one named server, nowhere else (fail-closed)
+    Pin {
+        profile: String,
+        /// Server number, part of its name, or a raw 16-hex key
+        #[arg(long, value_name = "SERVER")]
+        via: String,
+        /// Selector to pin (repeat for several); same syntax as --proxy
+        #[arg(long, required = true, value_name = "SELECTOR")]
+        selector: Vec<String>,
+    },
+    /// Unpin selectors — or every selector of one server
+    Unpin {
+        profile: String,
+        /// Server number, part of its name, or a raw 16-hex key
+        #[arg(long, value_name = "SERVER")]
+        via: String,
+        /// Selector to unpin; without it the whole pinned route is removed
+        #[arg(long, value_name = "SELECTOR")]
+        selector: Vec<String>,
+    },
+    /// Whether the kernel rejects QUIC (UDP/443) on the tunnel interface —
+    /// `on` returns an immediate rejection; `off` removes this owned reject rule
+    Quic {
+        profile: String,
+        /// `on` or `off`; omitted shows the current setting
+        #[arg(value_parser = clap::value_parser!(BoolOnOff))]
+        enabled: Option<BoolOnOff>,
+    },
+}
+
+/// The failover plan: which servers run after the primary fails its probes,
+/// and whether the tunnel returns to the primary when it answers again.
+#[derive(Subcommand, Debug)]
+pub enum BackupCommand {
+    /// Show the primary, the ordered backups and the pinned rules
+    Show { profile: String },
+    /// Replace the backup chain (order matters, first is tried first)
+    Set {
+        profile: String,
+        /// Server numbers, names or keys, tried in this order
+        #[arg(required = true, value_name = "SERVER")]
+        servers: Vec<String>,
+    },
+    /// Append a server to the backup chain
+    Add {
+        profile: String,
+        /// Server number, part of its name, or a raw 16-hex key
+        server: String,
+    },
+    /// Remove a server from the backup chain
+    Rm {
+        profile: String,
+        /// Server number, part of its name, or a raw 16-hex key
+        server: String,
+    },
+    /// Drop every backup
+    Clear { profile: String },
+    /// Whether the tunnel returns to the primary once it answers again
+    Auto {
+        profile: String,
+        /// `on` (default) or `off`
+        #[arg(value_parser = clap::value_parser!(BoolOnOff))]
+        enabled: BoolOnOff,
+    },
+    /// Opt-in filtered pool: matching servers join the failover chain after
+    /// the manual backups, verified by real exit country
+    #[command(subcommand)]
+    Pool(PoolCommand),
+    /// Check which servers really answer and which country they exit in
+    Verify { profile: String },
+}
+
+/// The opt-in pool: servers whose name matches a filter — and whose real
+/// exit country the filter names — join the failover chain after the manual
+/// backups, in subscription order.
+#[derive(Subcommand, Debug)]
+pub enum PoolCommand {
+    /// Show the filters and the members the last check kept
+    Show { profile: String },
+    /// Set the filters; the pool is off without this
+    Set {
+        profile: String,
+        /// Verified filter `CC:word|word` or `CC:` for any name in that country.
+        /// Name-only filters require --no-verify. Verification contacts
+        /// api.country.is and ipinfo.io through each candidate.
+        #[arg(required = true, value_name = "FILTER")]
+        filters: Vec<String>,
+        /// Admit name matches without proving the exit country
+        #[arg(long)]
+        no_verify: bool,
+    },
+    /// Turn the pool off and forget its members
+    Clear { profile: String },
+    /// Re-check the subscription now: live matches replace the pool
+    Rebuild { profile: String },
+}
+
+/// `on`/`off` as a typed flag for `backup auto`.
+#[derive(Debug, Clone, Copy)]
+pub enum BoolOnOff {
+    On,
+    Off,
+}
+
+impl std::str::FromStr for BoolOnOff {
+    type Err = String;
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        match input {
+            "on" => Ok(BoolOnOff::On),
+            "off" => Ok(BoolOnOff::Off),
+            _ => Err("write `on` or `off`".into()),
+        }
+    }
+}
+
+/// Adopting the routing policy of a standalone Xray `config.json` (like the
+/// one `~/vpn` carries) onto a saved Xray profile. `preview` changes
+/// nothing; `apply` refuses while the source contains rules this app cannot
+/// represent.
+#[derive(Subcommand, Debug)]
+pub enum MigrateCommand {
+    /// Show what the file would change — and what it cannot carry over
+    Preview {
+        profile: String,
+        /// Standalone Xray config.json to read
+        #[arg(long, value_name = "FILE")]
+        from: PathBuf,
+    },
+    /// Apply the file's policy to the profile (dry-run safe: fails on
+    /// non-equivalent rules instead of faking success)
+    Apply {
+        profile: String,
+        /// Standalone Xray config.json to read
+        #[arg(long, value_name = "FILE")]
+        from: PathBuf,
     },
 }
 

@@ -28,6 +28,7 @@ pub mod managed_xray;
 pub mod models;
 #[cfg(unix)]
 pub mod netbird;
+pub mod node_pool;
 pub mod openvpn_config;
 pub mod openvpn_management;
 pub mod policy;
@@ -44,3 +45,4 @@ pub mod system_proxy;
 pub mod vpn;
 pub mod windows_job;
 pub mod xray;
+pub mod xray_migrate;

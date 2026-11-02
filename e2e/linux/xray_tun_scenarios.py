@@ -4,7 +4,6 @@
 import json
 import os
 import re
-import subprocess
 import sys
 import tempfile
 import time
@@ -15,9 +14,9 @@ import xray_scenarios as proxy_fixture
 
 
 client_name, server_name = sys.argv[1:3]
-XRAY_DIR = "/usr/lib/network-orchestrator/xray/v26.3.27"
+XRAY_DIR = "/usr/lib/network-orchestrator/xray/v26.10.31"
 GEO_DIR = Path(
-    os.environ.get("XRAY_E2E_GEO_DIR", str(Path.home() / ".config/xray"))
+    os.environ.get("XRAY_E2E_GEO_DIR", str(proxy_fixture.XRAY.parent))
 )
 
 
@@ -62,7 +61,7 @@ for source, name, mode in (
     proxy_fixture.run("docker", "cp", str(source), f"{client_name}:{XRAY_DIR}/{name}")
     docker_exec(client_name, "chown", "0:0", f"{XRAY_DIR}/{name}")
     docker_exec(client_name, "chmod", mode, f"{XRAY_DIR}/{name}")
-assert docker_exec(client_name, f"{XRAY_DIR}/xray", "version").startswith("Xray 26.3.27 ")
+assert docker_exec(client_name, f"{XRAY_DIR}/xray", "version").startswith("Xray 26.10.31 ")
 assert docker_exec(client_name, "stat", "-c", "%u:%g", f"{XRAY_DIR}/xray") == "0:0"
 print("ok   daemon binary is root-owned and pinned", flush=True)
 
@@ -88,7 +87,9 @@ server_config = {
         "settings": {"decryption": "none", "clients": [{"id": vless_id}]},
         "streamSettings": {"network": "raw", "security": "none"},
     }],
-    "outbounds": [{"protocol": "freedom"}],
+    "outbounds": [{"protocol": "freedom", "settings": {
+        "finalRules": [{"action": "allow", "ip": [server_ip, "10.75.0.1"]}],
+    }}],
 }
 proxy_fixture.write_container_json(server_name, "/tmp/netorch-xray-tun-server.json", server_config)
 proxy_fixture.start_xray(server_name, "/tmp/netorch-xray-tun-server.json", "tun-server")
@@ -240,8 +241,8 @@ try:
 
         print("ALL 7 XRAY TUN SPLIT CHECKS PASSED", flush=True)
         print("\n=== Xray TUN full tunnel keeps endpoint on underlay", flush=True)
-        if "198.18.0.3" not in docker_exec(server_name, "ip", "-4", "addr", "show", "lo"):
-            docker_exec(server_name, "ip", "addr", "add", "198.18.0.3/32", "dev", "lo")
+        if "10.79.0.3" not in docker_exec(server_name, "ip", "-4", "addr", "show", "lo"):
+            docker_exec(server_name, "ip", "addr", "add", "10.79.0.3/32", "dev", "lo")
         original_default = docker_exec(
             client_name, "ip", "-4", "route", "show", "default"
         ).splitlines()[0].split()
@@ -259,12 +260,12 @@ try:
         )
         underlay_probe = (
             'from urllib.request import urlopen; '
-            'print(urlopen("http://198.18.0.3:8765/server-health.txt", timeout=3).read().decode().strip())'
+            'print(urlopen("http://10.79.0.3:8765/server-health.txt", timeout=3).read().decode().strip())'
         )
         assert docker_exec(client_name, "python3", "-c", underlay_probe) == "netorch-e2e-server"
         print("ok   Xray endpoint reachable through underlay default", flush=True)
 
-        full_uri = f"vless://{vless_id}@198.18.0.3:11001?type=raw&security=none"
+        full_uri = f"vless://{vless_id}@10.79.0.3:11001?type=raw&security=none"
         full_config = proxy_fixture.generate_client(full_uri, Path(directory), "full").read_text()
         full_params = {
             "profileId": "xray-full",
@@ -283,9 +284,9 @@ try:
         print("ok   daemon created Xray full TUN and fwmark rule", flush=True)
 
         marked = docker_exec(
-            client_name, "ip", "-4", "route", "get", "198.18.0.3", "mark", mark
+            client_name, "ip", "-4", "route", "get", "10.79.0.3", "mark", mark
         )
-        plain = docker_exec(client_name, "ip", "-4", "route", "get", "198.18.0.3")
+        plain = docker_exec(client_name, "ip", "-4", "route", "get", "10.79.0.3")
         payload = docker_exec(client_name, "ip", "-4", "route", "get", "10.75.0.1")
         assert f"via {server_ip}" in marked and "dev eth0" in marked
         assert f"via {server_ip}" in plain and "dev eth0" in plain

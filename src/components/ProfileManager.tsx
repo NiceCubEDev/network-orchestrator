@@ -881,7 +881,7 @@ export default function ProfileManager() {
   };
 
   /** Switching a running profile reconnects it on the new server. */
-  const onSwitchEndpoint = async (profile: Profile, index: number) => {
+  const onSwitchEndpoint = async (profile: Profile, key: string) => {
     const wasRunning = statusFor(profile.id).state === "running";
     if (wasRunning && requiresElevation(profile)) {
       try {
@@ -898,7 +898,7 @@ export default function ProfileManager() {
       }
       const updated = await invoke<Profile[]>("switch_subscription_endpoint", {
         profileId: profile.id,
-        endpointIndex: index,
+        endpointKey: key,
       });
       setProfiles(updated);
       const next: Record<string, SubscriptionEndpointInfo[]> = {};
@@ -932,6 +932,70 @@ export default function ProfileManager() {
       await refreshAll();
     }
   };
+
+  /** Failover edits land in the profile at once; a running tunnel picks them
+   * up on reconnect, so keep a persistent notice until it stops. */
+  const [failoverBusy, setFailoverBusy] = useState<string | null>(null);
+  const [applyOnReconnect, setApplyOnReconnect] = useState<Set<string>>(new Set());
+
+  useEffect(() => {
+    setApplyOnReconnect((current) => {
+      if (current.size === 0) return current;
+      const next = new Set([...current].filter((id) => statusFor(id).state === "running"));
+      return next.size === current.size ? current : next;
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [statuses]);
+
+  const acceptPolicyProfiles = async (profileId: string, updated: Profile[]) => {
+    setProfiles(updated);
+    const fresh = await refreshAll();
+    if (!fresh) throw new Error(t("The change was saved, but refreshing the displayed profile or endpoints failed. Refresh the profile before making another change."));
+    if (fresh.some((profile) => profile.id === profileId && profile.subscription)) {
+      const list = await invoke<SubscriptionEndpointInfo[]>(
+        "get_subscription_endpoints", { profileId },
+      );
+      setEndpoints((current) => ({ ...current, [profileId]: list }));
+    }
+  };
+
+  const saveFailover = async (
+    profile: Profile,
+    command: string,
+    args: Record<string, unknown>,
+  ) => {
+    setFailoverBusy(profile.id);
+    try {
+      const updated = await invoke<Profile[]>(command, {
+        profileId: profile.id,
+        ...args,
+      });
+      setProfiles(updated);
+      if (statusFor(profile.id).state === "running") {
+        setApplyOnReconnect((current) => new Set(current).add(profile.id));
+      }
+      try {
+        const list = await invoke<SubscriptionEndpointInfo[]>(
+          "get_subscription_endpoints",
+          { profileId: profile.id },
+        );
+        setEndpoints((current) => ({ ...current, [profile.id]: list }));
+      } catch {
+        // The badge flags refresh with the next endpoint read.
+      }
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setFailoverBusy(null);
+    }
+  };
+
+  const onSetBackups = (profile: Profile, keys: string[]) =>
+    saveFailover(profile, "set_subscription_backups", { backupKeys: keys });
+  const onSetAutoReturn = (profile: Profile, enabled: boolean) =>
+    saveFailover(profile, "set_subscription_auto_return", { enabled });
+  const onSetPinnedRoutes = (profile: Profile, routes: Profile["pinnedPolicies"]) =>
+    saveFailover(profile, "set_pinned_routes", { routes });
 
   const onRefreshSubscription = async (profile: Profile) => {
     setRefreshingSubscription(profile.id);
@@ -1981,6 +2045,8 @@ export default function ProfileManager() {
             />
           ) : selected ? (
             <ProfileDetail
+              key={selected.id}
+              onPolicySaved={acceptPolicyProfiles}
               profile={selected}
               onRoleChanged={() => void refreshAll()}
               status={statusFor(selected.id)}
@@ -2031,8 +2097,17 @@ export default function ProfileManager() {
               }
               onDiagnose={() => void onDiagnose(selected)}
               onDelete={() => void onDelete(selected)}
-              onSwitchEndpoint={(index) =>
-                void onSwitchEndpoint(selected, index)
+              onSwitchEndpoint={(key) =>
+                void onSwitchEndpoint(selected, key)
+              }
+              failoverBusy={failoverBusy === selected.id}
+              applyOnReconnect={applyOnReconnect.has(selected.id)}
+              onSetBackups={(keys) => void onSetBackups(selected, keys)}
+              onSetAutoReturn={(enabled) =>
+                void onSetAutoReturn(selected, enabled)
+              }
+              onSetPinnedRoutes={(routes) =>
+                void onSetPinnedRoutes(selected, routes)
               }
               onMeasureAllEndpoints={() =>
                 void onMeasureAllEndpoints(selected)

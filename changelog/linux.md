@@ -12,11 +12,43 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ### Added
 
+- Xray subscription profiles can select ordered backup nodes and pin domain
+  selectors to independent nodes from the app or `netorch backup` and
+  `netorch route pin|unpin`. The daemon uses bounded HTTPS probes per node,
+  prefers the primary and automatically returns after recovery. Missing pins
+  stay fail-closed; all-down default traffic is blocked, never sent direct.
+  Live status includes the selected node and candidate health.
+- Opt-in filtered backup pools and real exit-country verification in the app
+  and CLI. Country-only filters are supported; explicit domain/DNS nodes are
+  excluded from automatic recruitment, and name-only mode does not need Xray.
+- Stopped-profile preview/apply of standalone Xray policies, including fixed
+  egress, DNS rewriting, IP/port guards, interface policies, TUN MTU/DNS and
+  connection/socket settings. Unsupported semantics and conflicting pins
+  refuse the whole import; ordinary profile edits preserve imported settings.
+- Owned-child recovery for real underlay changes, HTTPS/pin stalls and UDP
+  socket accumulation, with DNS and application connection-storm diagnostics.
+  Unchanged DHCP identity preserves live streams; recovery waits while offline.
+- Tunnel-scoped nftables QUIC rejection with ownership-safe cleanup.
 - Single-file Debian/Ubuntu installers for CLI and GUI, each bundling its client
   and the shared daemon package. They install missing packages, update older
   versions, preserve a newer daemon patch from the same release line, and refuse
   client downgrades. `--check` previews the version plan without root or changes;
   `--yes` accepts the APT plan. A CLI-only build avoids the GUI/WebKit toolchain.
+
+### Changed
+
+- Linux Xray is pinned to 26.10.31 for DNS rewriting. Bundled GeoIP Lite and
+  GeoSite Standard replace the old data set; explicit geodata overrides remain
+  supported, and package notices describe the current data licenses.
+
+### Fixed
+
+- Endpoint bypasses migrate from an existing old gateway/interface without
+  adopting foreign routes. Recovery acknowledges replaced children, cancels
+  positively cleared queued stalls and does not charge a crash against the
+  independent stall cooldown.
+- Orphan cleanup verifies protected process ownership independently of the
+  current Xray pin, including a deleted executable from an older package.
 
 ## [0.10.1] - 2026-10-30
 

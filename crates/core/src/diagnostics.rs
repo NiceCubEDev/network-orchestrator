@@ -164,14 +164,41 @@ pub fn openvpn_health(status: &OpenVpnStatusResult) -> ProtocolHealth {
 }
 
 pub fn xray_tun_health(status: &XrayStatusResult) -> ProtocolHealth {
+    let (state, summary) = if status.state == TunnelState::Failed {
+        (ProtocolHealthState::Failed, "Xray TUN process failed")
+    } else if status.state == TunnelState::Running {
+        match status.watchdog.as_ref() {
+            Some(watchdog)
+                if watchdog.uplink == Some(false)
+                    || watchdog.https_stall_streak >= 3
+                    || watchdog.dns_stall_streak >= 3
+                    || !watchdog.pinned_stalled.is_empty()
+                    || !watchdog.anomalies.is_empty() =>
+            {
+                (
+                    ProtocolHealthState::Degraded,
+                    "Xray TUN watchdog reports a path or resource problem",
+                )
+            }
+            Some(watchdog)
+                if watchdog.https_latency_ms.is_some() && watchdog.https_stall_streak == 0 =>
+            {
+                (
+                    ProtocolHealthState::Healthy,
+                    "HTTPS through the owned Xray TUN was verified",
+                )
+            }
+            _ => (
+                ProtocolHealthState::Unknown,
+                "Xray TUN traffic has not been verified",
+            ),
+        }
+    } else {
+        (ProtocolHealthState::Unknown, "Xray TUN is not running")
+    };
     ProtocolHealth {
-        state: if status.state == TunnelState::Failed {
-            ProtocolHealthState::Failed
-        } else {
-            ProtocolHealthState::Unknown
-        },
-        summary: "Xray TUN state reported by the privileged helper; proxy traffic is not verified"
-            .into(),
+        state,
+        summary: summary.into(),
         last_handshake_unix: None,
         rx_bytes: status.rx_bytes,
         tx_bytes: status.tx_bytes,
@@ -710,6 +737,8 @@ mod tests {
             state,
             message: message.map(String::from),
             interface_name: None,
+            failover: None,
+            watchdog: None,
         }
     }
 
@@ -1216,7 +1245,7 @@ mod tests {
     }
 
     #[test]
-    fn xray_tun_health_only_knows_failed_or_unverified() {
+    fn xray_tun_health_tracks_verified_paths_and_stalls() {
         let status = |state| XrayStatusResult {
             profile_id: "x".into(),
             state,
@@ -1226,6 +1255,8 @@ mod tests {
             ipv6_covered: false,
             rx_bytes: Some(3),
             tx_bytes: None,
+            failover: None,
+            watchdog: None,
         };
         assert_eq!(
             xray_tun_health(&status(TunnelState::Running)).state,
@@ -1234,6 +1265,44 @@ mod tests {
         assert_eq!(
             xray_tun_health(&status(TunnelState::Failed)).state,
             ProtocolHealthState::Failed
+        );
+        let mut monitored = status(TunnelState::Running);
+        monitored.watchdog = Some(crate::models::WatchdogStatus {
+            uplink: Some(true),
+            https_latency_ms: Some(42),
+            ..Default::default()
+        });
+        assert_eq!(
+            xray_tun_health(&monitored).state,
+            ProtocolHealthState::Healthy
+        );
+        monitored.watchdog.as_mut().unwrap().https_stall_streak = 3;
+        assert_eq!(
+            xray_tun_health(&monitored).state,
+            ProtocolHealthState::Degraded
+        );
+        monitored.watchdog.as_mut().unwrap().https_stall_streak = 0;
+        monitored.watchdog.as_mut().unwrap().pinned_stalled = vec!["0123456789abcdef".into()];
+        assert_eq!(
+            xray_tun_health(&monitored).state,
+            ProtocolHealthState::Degraded
+        );
+        monitored.watchdog.as_mut().unwrap().pinned_stalled.clear();
+        monitored.watchdog.as_mut().unwrap().uplink = Some(false);
+        assert_eq!(
+            xray_tun_health(&monitored).state,
+            ProtocolHealthState::Degraded
+        );
+        monitored.state = TunnelState::Failed;
+        assert_eq!(
+            xray_tun_health(&monitored).state,
+            ProtocolHealthState::Failed
+        );
+        monitored.state = TunnelState::Stopped;
+        monitored.watchdog.as_mut().unwrap().uplink = Some(true);
+        assert_eq!(
+            xray_tun_health(&monitored).state,
+            ProtocolHealthState::Unknown
         );
         let detail = xray_tun_detail(&status(TunnelState::Running));
         assert_eq!(

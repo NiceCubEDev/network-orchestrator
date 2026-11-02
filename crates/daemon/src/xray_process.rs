@@ -264,7 +264,7 @@ impl XrayProcessRunner for TrustedXrayProcess {
                     "Xray process ownership mismatch",
                 ));
             }
-            let _ = self.stop(name);
+            self.stop(name)?;
         }
         // Kill a recorded process that outlived our tracking, keeping the
         // staging directory itself.
@@ -339,7 +339,7 @@ impl XrayProcessRunner for TrustedXrayProcess {
             }
         }
         if self.children.contains_key(name) {
-            let _ = self.stop(name);
+            self.stop(name)?;
         }
         recover_child(uid, name)?;
         let config_path = directory.join("config.json");
@@ -435,7 +435,7 @@ fn valid_tun_name(name: &str) -> bool {
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-fn trusted_binary() -> io::Result<PathBuf> {
+pub(crate) fn trusted_binary() -> io::Result<PathBuf> {
     let root = Path::new(BINARY_ROOT);
     let binary = net_manager_core::managed_xray::linux_managed_version_dir(root).join("xray");
     if !safe_root_owned_path(&binary)
@@ -464,7 +464,7 @@ fn trusted_binary() -> io::Result<PathBuf> {
 }
 
 #[cfg(all(target_os = "linux", not(target_arch = "x86_64")))]
-fn trusted_binary() -> io::Result<PathBuf> {
+pub(crate) fn trusted_binary() -> io::Result<PathBuf> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "managed Xray is not supported on this architecture",
@@ -977,7 +977,28 @@ fn read_starttime(pid: u32) -> io::Result<u64> {
 }
 
 #[cfg(target_os = "linux")]
-fn recover_child(uid: u32, name: &str) -> io::Result<()> {
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct VerifiedProcess {
+    pub pid: u32,
+    pub starttime: u64,
+    pub config: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn staged_config_path(uid: u32, name: &str) -> io::Result<PathBuf> {
+    if !valid_tun_name(name) {
+        return Err(invalid_input());
+    }
+    ensure_runtime_root()?;
+    Ok(assert_staging_dir(uid, name)?.join("config.json"))
+}
+
+/// Read protected ownership metadata; callers must verify live identity.
+#[cfg(target_os = "linux")]
+fn read_process_record(uid: u32, name: &str) -> io::Result<Option<VerifiedProcess>> {
+    if !valid_tun_name(name) {
+        return Err(invalid_input());
+    }
     ensure_runtime_root()?;
     let directory = runtime_root().join(uid.to_string()).join(name);
     for path in [
@@ -986,7 +1007,7 @@ fn recover_child(uid: u32, name: &str) -> io::Result<()> {
     ] {
         let metadata = match fs::symlink_metadata(path) {
             Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(_) => return Err(io::Error::other("Xray staging directory unavailable")),
         };
         if !metadata.is_dir() || metadata.uid() != 0 || metadata.mode() & 0o077 != 0 {
@@ -997,47 +1018,86 @@ fn recover_child(uid: u32, name: &str) -> io::Result<()> {
         }
     }
     let record_path = directory.join("process");
-    let record_metadata = match fs::symlink_metadata(&record_path) {
+    let metadata = match fs::symlink_metadata(&record_path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(_) => return Err(io::Error::other("Xray process record invalid")),
     };
-    if !record_metadata.is_file()
-        || record_metadata.uid() != 0
-        || record_metadata.mode() & 0o077 != 0
-        || record_metadata.len() > 64
+    if !metadata.is_file()
+        || metadata.uid() != 0
+        || metadata.mode() & 0o077 != 0
+        || metadata.len() > 64
     {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "Xray process record is unsafe",
         ));
     }
-    let record = match fs::read_to_string(&record_path) {
-        Ok(record) if record.len() <= 64 => record,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        _ => return Err(io::Error::other("Xray process record invalid")),
-    };
+    let mut record = String::new();
+    fs::File::open(&record_path)?
+        .take(65)
+        .read_to_string(&mut record)?;
+    if record.len() > 64 {
+        return Err(io::Error::other("Xray process record invalid"));
+    }
     let mut parts = record.split_whitespace();
     let pid: u32 = parts
         .next()
-        .and_then(|s| s.parse().ok())
+        .and_then(|part| part.parse().ok())
         .ok_or_else(|| io::Error::other("Xray process record invalid"))?;
-    let starttime: u64 = parts
+    let starttime = parts
         .next()
-        .and_then(|s| s.parse().ok())
+        .and_then(|part| part.parse().ok())
         .ok_or_else(|| io::Error::other("Xray process record invalid"))?;
     if parts.next().is_some() || pid == 0 {
         return Err(io::Error::other("Xray process record invalid"));
     }
-    let binary = trusted_binary()?;
     let config = directory.join("config.json");
-    if !same_process(pid, starttime, &binary, &config)? {
+    Ok(Some(VerifiedProcess {
+        pid,
+        starttime,
+        config,
+    }))
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn verified_process_record(
+    uid: u32,
+    name: &str,
+    binary: &Path,
+) -> io::Result<Option<VerifiedProcess>> {
+    let Some(process) = read_process_record(uid, name)? else {
+        return Ok(None);
+    };
+    if !same_process(process.pid, process.starttime, binary, &process.config)? {
+        return Ok(None);
+    }
+    Ok(Some(process))
+}
+
+#[cfg(target_os = "linux")]
+fn recover_child(uid: u32, name: &str) -> io::Result<()> {
+    let Some(process) = read_process_record(uid, name)? else {
+        return Ok(());
+    };
+    if !same_owned_cleanup_process(&process)? {
         return Ok(());
     }
-    let pidfd = open_pidfd(pid)?;
-    if !same_process(pid, starttime, &binary, &config)? {
+
+    let pidfd = match open_pidfd(process.pid) {
+        Ok(pidfd) => pidfd,
+        Err(error) => {
+            // It may have exited between identity check and pidfd_open.
+            if !same_owned_cleanup_process(&process)? {
+                return Ok(());
+            }
+            return Err(error);
+        }
+    };
+    if !same_owned_cleanup_process(&process)? {
         return Ok(());
     }
+
     signal_pidfd(&pidfd, libc::SIGTERM)?;
     let deadline = Instant::now() + STOP_TIMEOUT;
     while Instant::now() < deadline {
@@ -1046,38 +1106,159 @@ fn recover_child(uid: u32, name: &str) -> io::Result<()> {
         }
         thread::sleep(Duration::from_millis(25));
     }
+
     signal_pidfd(&pidfd, libc::SIGKILL)?;
-    Ok(())
+
+    // Do not delete ownership/staging or launch a replacement while an
+    // uninterruptible old process still owns its TUN.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if pidfd_exited(&pidfd)? {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "Xray process did not exit",
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn same_recorded_command(pid: u32, starttime: u64, config: &Path) -> io::Result<bool> {
+    let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(false);
+        }
+        Err(error) => {
+            return Err(io::Error::new(
+                error.kind(),
+                "Xray process identity unavailable",
+            ))
+        }
+    };
+    if parse_starttime(&stat) != Some(starttime) {
+        return Ok(false);
+    }
+
+    let mut cmdline = Vec::new();
+    let file = match fs::File::open(format!("/proc/{pid}/cmdline")) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(false);
+        }
+        Err(error) => {
+            return Err(io::Error::new(
+                error.kind(),
+                "Xray process command unavailable",
+            ))
+        }
+    };
+    file.take(4097).read_to_end(&mut cmdline)?;
+    if cmdline.len() > 4096 {
+        return Err(io::Error::other("Xray process command exceeds limit"));
+    }
+
+    let mut args = cmdline
+        .split(|byte| *byte == 0)
+        .filter(|arg| !arg.is_empty());
+    let _argv0 = args.next();
+    Ok(args.next() == Some(b"run".as_slice())
+        && args.next() == Some(b"-config".as_slice())
+        && args.next() == Some(config.as_os_str().as_encoded_bytes())
+        && args.next().is_none())
 }
 
 #[cfg(target_os = "linux")]
 fn same_process(pid: u32, starttime: u64, binary: &Path, config: &Path) -> io::Result<bool> {
-    let current = match read_starttime(pid) {
-        Ok(current) => current,
-        Err(_) => return Ok(false),
-    };
-    if current != starttime {
+    if !same_recorded_command(pid, starttime, config)? {
         return Ok(false);
     }
-    let executable = match fs::read_link(format!("/proc/{pid}/exe")) {
+    match fs::read_link(format!("/proc/{pid}/exe")) {
+        Ok(executable) => Ok(executable == binary),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(io::Error::new(
+            error.kind(),
+            "Xray executable identity unavailable",
+        )),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn same_owned_cleanup_process(process: &VerifiedProcess) -> io::Result<bool> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Component;
+
+    if !same_recorded_command(process.pid, process.starttime, &process.config)? {
+        return Ok(false);
+    }
+
+    let proc_exe = format!("/proc/{}/exe", process.pid);
+    let executable = match fs::read_link(&proc_exe) {
         Ok(executable) => executable,
-        Err(_) => return Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(false);
+        }
+        Err(error) => {
+            return Err(io::Error::new(
+                error.kind(),
+                "Xray executable identity unavailable",
+            ))
+        }
     };
-    if executable != binary {
+
+    // A deleted running executable remains inspectable through /proc/PID/exe.
+    let raw = executable.as_os_str().as_bytes();
+    let raw = raw.strip_suffix(b" (deleted)").unwrap_or(raw);
+    let path = Path::new(std::ffi::OsStr::from_bytes(raw));
+
+    // Location only; do not require the obsolete release to remain installed.
+    // This constant is deliberately Linux-wide, unlike current trusted_binary().
+    let root = Path::new("/usr/lib/network-orchestrator/xray");
+    let Ok(relative) = path.strip_prefix(root) else {
+        return Ok(false);
+    };
+    let mut components = relative.components();
+    let Some(Component::Normal(version)) = components.next() else {
+        return Ok(false);
+    };
+    let version = version.as_bytes();
+    if version.len() < 2
+        || version.len() > 64
+        || version[0] != b'v'
+        || !version[1..]
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'.' | b'-' | b'_'))
+        || components.next() != Some(Component::Normal(std::ffi::OsStr::new("xray")))
+        || components.next().is_some()
+    {
         return Ok(false);
     }
-    let mut cmdline = Vec::new();
-    fs::File::open(format!("/proc/{pid}/cmdline"))
-        .and_then(|file| file.take(4096).read_to_end(&mut cmdline))
-        .map_err(|_| io::Error::other("Xray process command unavailable"))?;
-    let args: Vec<&[u8]> = cmdline
-        .split(|b| *b == 0)
-        .filter(|arg| !arg.is_empty())
-        .collect();
-    Ok(args.len() == 4
-        && args[1] == b"run"
-        && args[2] == b"-config"
-        && args[3] == config.as_os_str().as_encoded_bytes())
+
+    let metadata = match fs::metadata(&proc_exe) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(false);
+        }
+        Err(error) => {
+            return Err(io::Error::new(
+                error.kind(),
+                "Xray executable identity unavailable",
+            ))
+        }
+    };
+    if !metadata.is_file()
+        || metadata.uid() != 0
+        || metadata.mode() & 0o022 != 0
+        || metadata.mode() & 0o111 == 0
+    {
+        return Ok(false);
+    }
+
+    // Recheck after reading executable metadata. PID reuse never authorizes
+    // signalling the new process.
+    same_recorded_command(process.pid, process.starttime, &process.config)
 }
 
 #[cfg(target_os = "linux")]
@@ -1437,17 +1618,6 @@ mod tests {
         ));
         assert_eq!(args[0], "run");
         assert!(!args.iter().any(|arg| arg == "-test"));
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[test]
-    fn trusted_xray_is_loaded_from_package_owned_directory() {
-        assert_eq!(BINARY_ROOT, "/usr/lib/network-orchestrator/xray");
-        assert_eq!(
-            net_manager_core::managed_xray::linux_managed_version_dir(Path::new(BINARY_ROOT))
-                .join("xray"),
-            Path::new("/usr/lib/network-orchestrator/xray/v26.3.27/xray")
-        );
     }
 
     #[cfg(not(target_arch = "x86_64"))]

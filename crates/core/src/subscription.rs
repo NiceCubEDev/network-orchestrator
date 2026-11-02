@@ -629,6 +629,12 @@ pub fn import_body(
                 web_page_url: meta.web_page_url,
                 update_interval_hours: meta.update_interval_hours,
                 skipped_protocols,
+                active_key: Some(endpoint_key(&endpoints[0].url)),
+                backup_keys: Vec::new(),
+                auto_return_primary: None,
+                probe_url: None,
+                node_pool: None,
+                pool_keys: Vec::new(),
             }),
             ..Profile::default()
         };
@@ -653,6 +659,29 @@ pub fn switch_endpoint(
     index: usize,
     available: impl Fn(u16) -> bool,
 ) -> io::Result<ProfileDocument> {
+    let endpoints = vault.read_subscription_endpoints(id)?;
+    let key = endpoint_key(
+        &endpoints
+            .get(index)
+            .ok_or_else(|| invalid("Invalid endpoint index"))?
+            .url,
+    );
+    switch_endpoint_key(vault, store, id, &key, available)
+}
+
+/// Select the primary endpoint by its stable key (see [`endpoint_key`]).
+/// The key must resolve to a current endpoint — a key the refresh dropped
+/// is rejected instead of retargeted to whatever took its position.
+pub fn switch_endpoint_key(
+    vault: &ConfigVault,
+    store: &ProfileStore,
+    id: &str,
+    key: &str,
+    available: impl Fn(u16) -> bool,
+) -> io::Result<ProfileDocument> {
+    if !valid_endpoint_key(key) {
+        return Err(invalid("Invalid endpoint key"));
+    }
     let document = store.load()?;
     let mut profile = document
         .profiles
@@ -665,9 +694,9 @@ pub fn switch_endpoint(
         .as_mut()
         .ok_or_else(|| invalid("Profile is not a subscription"))?;
     let endpoints = vault.read_subscription_endpoints(id)?;
-    let endpoint = endpoints
-        .get(index)
-        .ok_or_else(|| invalid("Invalid endpoint index"))?;
+    let index = key_index(&endpoints, key)
+        .ok_or_else(|| invalid("Endpoint is no longer part of the subscription"))?;
+    let endpoint = &endpoints[index];
     let used = profile_listener_ports(&document.profiles, id);
     let (socks, http) = select_generated_ports(
         profile.xray_socks_port,
@@ -688,6 +717,7 @@ pub fn switch_endpoint(
         profile.name = subscription_profile_name(title.as_deref(), &endpoint.name);
     }
     subscription.active_index = index;
+    subscription.active_key = Some(key.to_string());
     subscription.endpoint_count = endpoints.len();
     match store.upsert(profile) {
         Ok(document) => {
@@ -702,6 +732,238 @@ pub fn switch_endpoint(
         }
     }
 }
+
+/// Endpoint rows for clients: real endpoints first (key + flags), then one
+/// `is_missing` row per stored backup key the refresh no longer returns so
+/// the UI can show — and clear — the dangling choice.
+pub fn list_endpoints(
+    vault: &ConfigVault,
+    store: &ProfileStore,
+    id: &str,
+) -> io::Result<Vec<SubscriptionEndpointInfo>> {
+    let profile = subscription_profile(store, id)?;
+    let subscription = profile.subscription.as_ref().expect("checked above");
+    let endpoints = vault.read_subscription_endpoints(id)?;
+    let active_key = stored_active_key(&profile).or_else(|| {
+        endpoints
+            .get(subscription.active_index)
+            .map(|endpoint| endpoint_key(&endpoint.url))
+    });
+    let backup: std::collections::HashSet<&str> = subscription
+        .backup_keys
+        .iter()
+        .map(|backup| backup.key.as_str())
+        .collect();
+    let pooled: std::collections::HashSet<&str> = subscription
+        .pool_keys
+        .iter()
+        .filter(|member| {
+            subscription.node_pool.is_some()
+                && active_key.as_deref() != Some(member.key.as_str())
+                && !backup.contains(member.key.as_str())
+                && !profile
+                    .pinned_policies
+                    .iter()
+                    .any(|pin| pin.endpoint_key == member.key)
+                && profile.xray_dns.outbound_key.as_deref() != Some(member.key.as_str())
+        })
+        .map(|member| member.key.as_str())
+        .collect();
+    let mut rows: Vec<SubscriptionEndpointInfo> = endpoints
+        .iter()
+        .map(|endpoint| {
+            let key = endpoint_key(&endpoint.url);
+            SubscriptionEndpointInfo {
+                name: endpoint.name.clone(),
+                active: active_key.as_deref() == Some(key.as_str()),
+                protocol: xray::endpoint_protocol(&endpoint.url),
+                key: key.clone(),
+                is_backup: backup.contains(key.as_str()),
+                is_missing: false,
+                in_pool: pooled.contains(key.as_str()),
+            }
+        })
+        .collect();
+    for stored in subscription.backup_keys.iter().chain(
+        subscription
+            .pool_keys
+            .iter()
+            .filter(|member| pooled.contains(member.key.as_str())),
+    ) {
+        if key_index(&endpoints, &stored.key).is_none()
+            && !rows.iter().any(|row| row.key == stored.key)
+        {
+            rows.push(SubscriptionEndpointInfo {
+                name: stored.name.clone(),
+                active: false,
+                protocol: None,
+                key: stored.key.clone(),
+                is_backup: backup.contains(stored.key.as_str()),
+                is_missing: true,
+                in_pool: pooled.contains(stored.key.as_str()),
+            });
+        }
+    }
+    Ok(rows)
+}
+
+/// Ordered failover candidates behind the primary. Well-formed keys that do
+/// not resolve are kept (`EndpointRef.name` keeps the last known name):
+/// they may reappear, and dropping them would silently lose a user choice.
+/// The primary's own key inside the list is ignored.
+pub fn set_backup_endpoints(
+    vault: &ConfigVault,
+    store: &ProfileStore,
+    id: &str,
+    keys: &[String],
+) -> io::Result<ProfileDocument> {
+    if keys.len() >= MAX_FAILOVER_NODES {
+        return Err(invalid("At most seven backup endpoints can be selected"));
+    }
+    let mut profile = subscription_profile(store, id)?;
+    let endpoints = vault.read_subscription_endpoints(id)?;
+    let mut refs = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for key in keys {
+        if !valid_endpoint_key(key) {
+            return Err(invalid("Invalid endpoint key"));
+        }
+        if !seen.insert(key.as_str()) {
+            return Err(invalid("Duplicate failover endpoint"));
+        }
+        let name = key_index(&endpoints, key)
+            .map(|index| endpoints[index].name.clone())
+            .unwrap_or_else(|| key.clone());
+        refs.push(EndpointRef {
+            key: key.clone(),
+            name,
+        });
+    }
+    let active = stored_active_key(&profile).or_else(|| {
+        profile
+            .subscription
+            .as_ref()
+            .and_then(|subscription| endpoints.get(subscription.active_index))
+            .map(|endpoint| endpoint_key(&endpoint.url))
+    });
+    refs.retain(|reference| Some(reference.key.as_str()) != active.as_deref());
+    profile
+        .subscription
+        .as_mut()
+        .expect("checked above")
+        .backup_keys = refs;
+    store.upsert(profile)
+}
+
+/// Whether the daemon steers the tunnel back to the primary once it probes
+/// healthy again after a failover.
+pub fn set_auto_return_primary(
+    store: &ProfileStore,
+    id: &str,
+    enabled: bool,
+) -> io::Result<ProfileDocument> {
+    let mut profile = subscription_profile(store, id)?;
+    profile
+        .subscription
+        .as_mut()
+        .expect("checked above")
+        .auto_return_primary = Some(enabled);
+    store.upsert(profile)
+}
+
+/// Replace the profile's pinned routes wholesale. Keys are validated for
+/// shape only: a pinned node that left the subscription stays configured
+/// and fail-closed (marked `missing`), never rerouted. Selector syntax is
+/// the same as `DomainPolicy` domain rules — no IP selectors.
+pub fn set_pinned_routes(
+    vault: &ConfigVault,
+    store: &ProfileStore,
+    id: &str,
+    routes: Vec<PinnedRoute>,
+) -> io::Result<ProfileDocument> {
+    let mut profile = subscription_profile(store, id)?;
+    let endpoints = vault.read_subscription_endpoints(id)?;
+    for route in &routes {
+        if !valid_endpoint_key(&route.endpoint_key) {
+            return Err(invalid("Invalid pinned endpoint key"));
+        }
+        if route.selectors.is_empty() || route.selectors.len() > 128 {
+            return Err(invalid("A pinned route needs 1-128 selectors"));
+        }
+        xray::validate_routing_policy_selectors(&[DomainPolicy {
+            domains: route.selectors.clone(),
+            target: DomainRouteTarget::Direct,
+        }])?;
+        for selector in &route.selectors {
+            if let Some(("ip", _)) = xray::classify_routing_selector(selector)? {
+                return Err(invalid("Pinned routes take domain selectors only"));
+            }
+        }
+    }
+    profile.pinned_policies = routes;
+    sync_endpoint_refs(&mut profile, &endpoints);
+    store.upsert(profile)
+}
+
+/// Ordered failover candidates for a connect: the primary first, then the
+/// stored backups that still resolve, then the verified auto-pool members
+/// (the pool extends the ordered list, never reorders it). Missing backups
+/// are skipped (they are kept in `backup_keys`/`pool_keys` and may
+/// reappear); pinned routes are returned separately with their missing
+/// flag refreshed.
+pub fn failover_plan(
+    vault: &ConfigVault,
+    profile: &Profile,
+) -> io::Result<(Vec<SubscriptionEndpoint>, Vec<PinnedRoute>)> {
+    let subscription = profile
+        .subscription
+        .as_ref()
+        .ok_or_else(|| invalid("Profile is not a subscription"))?;
+    let endpoints = vault.read_subscription_endpoints(&profile.id)?;
+    let active_key = stored_active_key(profile).or_else(|| {
+        endpoints
+            .get(subscription.active_index)
+            .map(|endpoint| endpoint_key(&endpoint.url))
+    });
+    let primary_index = active_key
+        .as_deref()
+        .and_then(|key| key_index(&endpoints, key))
+        .ok_or_else(|| invalid("The selected endpoint left the subscription"))?;
+    let mut nodes = vec![endpoints[primary_index].clone()];
+    for backup in subscription
+        .backup_keys
+        .iter()
+        .chain(subscription.pool_keys.iter().filter(|node| {
+            subscription.node_pool.is_some()
+                && !profile
+                    .pinned_policies
+                    .iter()
+                    .any(|pin| pin.endpoint_key == node.key)
+                && profile.xray_dns.outbound_key.as_deref() != Some(node.key.as_str())
+        }))
+    {
+        if nodes.len() == MAX_FAILOVER_NODES {
+            break;
+        }
+        if let Some(index) = key_index(&endpoints, &backup.key) {
+            if !nodes
+                .iter()
+                .any(|node| endpoint_key(&node.url) == endpoint_key(&endpoints[index].url))
+            {
+                nodes.push(endpoints[index].clone());
+            }
+        }
+    }
+    let mut pinned = profile.pinned_policies.clone();
+    for route in &mut pinned {
+        route.missing = key_index(&endpoints, &route.endpoint_key).is_none();
+    }
+    Ok((nodes, pinned))
+}
+
+/// Maximum failover candidates (primary + backups): bounds the loopback
+/// probe listeners the daemon creates per tunnel.
+pub const MAX_FAILOVER_NODES: usize = 8;
 
 /// Auto-refresh cadences the clients offer, in minutes.
 pub const REFRESH_INTERVALS: [u32; 3] = [15, 60, 360];
@@ -753,21 +1015,63 @@ pub fn record_refresh_failure(store: &ProfileStore, id: &str, now: u64) -> io::R
     store.upsert(profile).map(|_| ())
 }
 
-/// Identity of an endpoint across refreshes: the share link without its
-/// display fragment, or the server name for full Xray JSON entries (their
-/// serialized config may change between fetches).
+/// Key format: 16 lowercase hex characters of a SHA-256 digest.
+pub fn valid_endpoint_key(key: &str) -> bool {
+    key.len() == 16
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+fn key_digest(identity: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(identity.as_bytes())
+        .iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Secret-safe identity of an endpoint across refreshes and credential
+/// rotation: the transport the client actually dials, never the display
+/// name and never the userinfo (`uuid`/password) — rotating credentials
+/// keeps the same node while a genuinely different server or transport
+/// produces a different key. Two entries that hash identically are the
+/// same transport (duplicate lines collapse to the first match).
+///
+/// Share links reduce to `scheme|host:port|sorted query` (transport
+/// parameters like `sni`, `pbk`, `type` are part of the identity; a panel
+/// that rotates them yields a new, unavailable key rather than a silent
+/// retarget). Whole-config `xray-json:` entries reduce to
+/// `protocol|address:port|network|security` of their first outbound.
 pub fn endpoint_key(url: &str) -> String {
-    if url.trim().starts_with(xray::XRAY_JSON_PREFIX) {
-        return format!(
-            "{}{}",
-            xray::XRAY_JSON_PREFIX,
-            xray::share_link_name(url).unwrap_or_default()
-        );
+    let trimmed = url.trim();
+    if trimmed.starts_with(xray::XRAY_JSON_PREFIX) {
+        let identity = xray::xray_json_identity(trimmed).unwrap_or_else(|| trimmed.to_string());
+        return key_digest(&identity);
     }
-    url.split_once('#')
-        .map(|(link, _)| link)
-        .unwrap_or(url)
-        .to_string()
+    let Some((scheme, rest)) = trimmed.split_once("://") else {
+        return key_digest(trimmed);
+    };
+    let rest = rest.split_once('#').map(|(link, _)| link).unwrap_or(rest);
+    let (authority, query) = match rest.split_once('?') {
+        Some((authority, query)) => (authority, query),
+        None => (rest, ""),
+    };
+    // Userinfo is stripped at the last '@' (a '@' inside it is always
+    // percent-encoded), leaving `host:port` only.
+    let host = authority
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(authority);
+    let mut params: Vec<&str> = query.split('&').filter(|part| !part.is_empty()).collect();
+    params.sort_unstable();
+    key_digest(&format!(
+        "{}|{}|{}",
+        scheme.to_ascii_lowercase(),
+        host.to_ascii_lowercase(),
+        params.join("&")
+    ))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -814,18 +1118,10 @@ pub fn refresh_body(
         available,
     )?;
     let previous = vault.read_subscription_endpoints(id)?;
-    let selected = previous.get(old_index).map(|e| endpoint_key(&e.url));
-    let selected_ordinal = selected
-        .as_ref()
-        .map(|key| {
-            previous
-                .iter()
-                .take(old_index + 1)
-                .filter(|e| &endpoint_key(&e.url) == key)
-                .count()
-                - 1
-        })
-        .unwrap_or(0);
+    // The stored key wins; a profile saved before `active_key` existed
+    // resolves its index against the previous endpoint list instead.
+    let selected = stored_active_key(&profile)
+        .or_else(|| previous.get(old_index).map(|e| endpoint_key(&e.url)));
 
     let (urls, mut skipped_count, skipped_protocols) = parse_subscription_body_detailed(body);
     if is_unsupported_client_placeholder(&urls) {
@@ -849,18 +1145,10 @@ pub fn refresh_body(
             "subscription refresh contained no valid share links ({skipped_count} skipped)"
         )));
     }
-    let mut matching = 0;
-    let new_index = selected.as_ref().and_then(|key| {
-        endpoints.iter().enumerate().find_map(|(index, endpoint)| {
-            if &endpoint_key(&endpoint.url) == key {
-                let found = matching == selected_ordinal;
-                matching += 1;
-                found.then_some(index)
-            } else {
-                None
-            }
-        })
-    });
+    // Duplicate transports collapse to the first match — the key identifies
+    // a node, not a list position, so two identical entries can never steer
+    // the selection to a different server.
+    let new_index = selected.as_ref().and_then(|key| key_index(&endpoints, key));
     let fallback_used = new_index.is_none();
     let active_index = new_index.unwrap_or(0);
     let imported =
@@ -900,6 +1188,7 @@ pub fn refresh_body(
     let subscription = profile.subscription.as_mut().expect("checked above");
     subscription.endpoint_count = endpoints.len();
     subscription.active_index = active_index;
+    subscription.active_key = Some(endpoint_key(&endpoints[active_index].url));
     subscription.last_refresh_at_unix = Some(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -926,6 +1215,7 @@ pub fn refresh_body(
         subscription.update_interval_hours = meta.update_interval_hours;
     }
     subscription.skipped_protocols = skipped_protocols;
+    sync_endpoint_refs(&mut profile, &endpoints);
     if store.upsert(profile).is_err() {
         return Err(failure_message("failed to store refreshed profile"));
     }
@@ -939,16 +1229,134 @@ pub fn refresh_body(
         cleanup_failed,
     })
 }
+/// Index of the endpoint with this key; duplicates collapse to the first.
+pub fn key_index(endpoints: &[SubscriptionEndpoint], key: &str) -> Option<usize> {
+    endpoints
+        .iter()
+        .position(|endpoint| endpoint_key(&endpoint.url) == key)
+}
+
+/// The stored `active_key` when it is a well-formed key (legacy profiles
+/// fall back to `active_index`).
+fn stored_active_key(profile: &Profile) -> Option<String> {
+    profile
+        .subscription
+        .as_ref()
+        .and_then(|subscription| subscription.active_key.clone())
+        .filter(|key| valid_endpoint_key(key))
+}
+
+/// Reconcile stored key references with a fresh endpoint list: backup refs
+/// take the names the panel sent, pinned routes learn whether their node
+/// still exists. Missing keys stay stored — a refresh must never silently
+/// retarget or drop a user choice.
+fn sync_endpoint_refs(profile: &mut Profile, endpoints: &[SubscriptionEndpoint]) {
+    if let Some(subscription) = profile.subscription.as_mut() {
+        for backup in subscription
+            .backup_keys
+            .iter_mut()
+            .chain(subscription.pool_keys.iter_mut())
+        {
+            if let Some(index) = key_index(endpoints, &backup.key) {
+                backup.name = endpoints[index].name.clone();
+            }
+        }
+    }
+    for pinned in &mut profile.pinned_policies {
+        pinned.missing = key_index(endpoints, &pinned.endpoint_key).is_none();
+    }
+}
 
 pub const DELAY_PROBE_URL: &str = "https://connectivitycheck.gstatic.com/generate_204";
 pub const DELAY_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
-struct TemporaryXray(tokio::process::Child);
+pub(crate) struct TemporaryXray(tokio::process::Child);
+
+impl TemporaryXray {
+    pub(crate) async fn stop(&mut self) -> Result<(), String> {
+        tokio::time::timeout(Duration::from_secs(2), self.0.kill())
+            .await
+            .map_err(|_| "temporary Xray cleanup timed out".to_string())?
+            .map_err(|_| "temporary Xray cleanup failed".to_string())
+    }
+}
 
 impl Drop for TemporaryXray {
     fn drop(&mut self) {
         let _ = self.0.start_kill();
     }
+}
+
+/// Spawn a temporary unprivileged Xray serving the caller's config on a
+/// free loopback SOCKS port, wait for the listener and return a proxied
+/// client. The caller retains ownership across timeouts and awaits stop before
+/// returning; Drop still kills on cancellation. Errors never echo configuration.
+/// Shared by delay and exit-country probes.
+pub(crate) async fn temporary_socks_client(
+    build_config: impl FnOnce(u16) -> Result<serde_json::Value, String>,
+    mut command: tokio::process::Command,
+    timeout: std::time::Duration,
+    process: &mut Option<TemporaryXray>,
+) -> Result<reqwest::Client, String> {
+    use tokio::io::AsyncWriteExt;
+
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .map_err(|_| "failed to reserve delay probe port".to_string())?;
+    let socks_port = listener
+        .local_addr()
+        .map_err(|_| "failed to reserve delay probe port".to_string())?
+        .port();
+    let config = build_config(socks_port)?;
+    let config = serde_json::to_vec(&config)
+        .map_err(|_| "failed to encode delay probe config".to_string())?;
+    drop(listener);
+
+    command
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    *process = Some(TemporaryXray(
+        command
+            .spawn()
+            .map_err(|_| "failed to start delay probe".to_string())?,
+    ));
+    let child = &mut process.as_mut().expect("probe process was assigned").0;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "failed to send delay probe config".to_string())?;
+    stdin
+        .write_all(&config)
+        .await
+        .map_err(|_| "failed to send delay probe config".to_string())?;
+    drop(stdin);
+    loop {
+        if tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, socks_port))
+            .await
+            .is_ok()
+        {
+            break;
+        }
+        if child
+            .try_wait()
+            .map_err(|_| "delay probe process failed".to_string())?
+            .is_some()
+        {
+            return Err("delay probe process exited before proxy was ready".into());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let proxy = reqwest::Proxy::all(format!("socks5h://127.0.0.1:{socks_port}"))
+        .map_err(|_| "failed to configure delay probe proxy".to_string())?;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .proxy(proxy)
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(timeout)
+        .build()
+        .map_err(|_| "failed to build delay probe client".to_string())?;
+    Ok(client)
 }
 
 /// Measure HTTP latency through a temporary Xray that runs one endpoint on a
@@ -977,70 +1385,13 @@ pub async fn measure_delay_with_command(
 /// connection will use.
 pub async fn measure_delay_with_config(
     build_config: impl FnOnce(u16) -> Result<serde_json::Value, String>,
-    mut command: tokio::process::Command,
+    command: tokio::process::Command,
     probe_url: &str,
     timeout: std::time::Duration,
 ) -> Result<u64, String> {
-    use tokio::io::AsyncWriteExt;
-
-    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-        .map_err(|_| "failed to reserve delay probe port".to_string())?;
-    let socks_port = listener
-        .local_addr()
-        .map_err(|_| "failed to reserve delay probe port".to_string())?
-        .port();
-    let config = build_config(socks_port)?;
-    let config = serde_json::to_vec(&config)
-        .map_err(|_| "failed to encode delay probe config".to_string())?;
-    drop(listener);
-
-    command
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true);
-    let mut child = TemporaryXray(
-        command
-            .spawn()
-            .map_err(|_| "failed to start delay probe".to_string())?,
-    );
+    let mut process = None;
     let result = tokio::time::timeout(timeout, async {
-        let mut stdin = child
-            .0
-            .stdin
-            .take()
-            .ok_or_else(|| "failed to send delay probe config".to_string())?;
-        stdin
-            .write_all(&config)
-            .await
-            .map_err(|_| "failed to send delay probe config".to_string())?;
-        drop(stdin);
-        loop {
-            if tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, socks_port))
-                .await
-                .is_ok()
-            {
-                break;
-            }
-            if child
-                .0
-                .try_wait()
-                .map_err(|_| "delay probe process failed".to_string())?
-                .is_some()
-            {
-                return Err("delay probe process exited before proxy was ready".into());
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-        let proxy = reqwest::Proxy::all(format!("socks5h://127.0.0.1:{socks_port}"))
-            .map_err(|_| "failed to configure delay probe proxy".to_string())?;
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .proxy(proxy)
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(timeout)
-            .build()
-            .map_err(|_| "failed to build delay probe client".to_string())?;
+        let client = temporary_socks_client(build_config, command, timeout, &mut process).await?;
         let started = std::time::Instant::now();
         let response = client
             .get(probe_url)
@@ -1053,8 +1404,9 @@ pub async fn measure_delay_with_config(
         Ok(started.elapsed().as_millis().max(1) as u64)
     })
     .await;
-    let _ = child.0.start_kill();
-    let _ = child.0.wait().await;
+    if let Some(mut process) = process {
+        process.stop().await?;
+    }
     result.map_err(|_| "delay probe timed out".to_string())?
 }
 
@@ -1221,17 +1573,112 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_key_uses_the_server_name_for_json_entries() {
-        let a = crate::xray::xray_json_entry(
-            &serde_json::json!({"remarks": "NL", "outbounds": [{"protocol": "vless", "x": 1}]}),
+    fn endpoint_keys_survive_credentials_and_name_changes_but_not_server_changes() {
+        let old = endpoint_key("vless://old@one.test:443?security=tls&type=tcp#Old");
+        assert_eq!(
+            old,
+            endpoint_key("vless://new@one.test:443?type=tcp&security=tls#Renamed")
+        );
+        assert_ne!(
+            old,
+            endpoint_key("vless://new@two.test:443?type=tcp&security=tls#Renamed")
+        );
+        assert_ne!(
+            old,
+            endpoint_key("vless://new@one.test:443?type=ws&security=tls#Renamed")
+        );
+        assert!(valid_endpoint_key(&old));
+    }
+
+    #[test]
+    fn json_hysteria_identity_survives_password_rotation() {
+        let entry = |password: &str| {
+            crate::xray::xray_json_entry(&serde_json::json!({
+            "remarks": "Node",
+            "outbounds": [{"protocol": "hysteria", "settings": {"address": "one.test", "port": 443},
+                "streamSettings": {"network": "hysteria", "security": "tls",
+                    "hysteriaSettings": {"auth": password}}}]
+        })).unwrap()
+        };
+        assert_eq!(
+            endpoint_key(&entry("old-password")),
+            endpoint_key(&entry("new-password"))
+        );
+    }
+
+    #[test]
+    fn refresh_keeps_backup_order_and_marks_missing_pins_without_retargeting() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = ConfigVault::new(dir.path().join("configs"));
+        let store = ProfileStore::new(dir.path().join("profiles.json"));
+        let links = [
+            "vless://old@one.test:443?security=tls#Primary",
+            "vless://old@two.test:443?security=tls#Backup",
+            "vless://old@three.test:443?security=tls#Pinned",
+        ];
+        import_body(
+            &vault,
+            &store,
+            &SubscriptionImport {
+                id: "nodes",
+                url: "https://example.test/sub",
+                hwid: "",
+                name: "Nodes",
+                refresh_interval_minutes: None,
+            },
+            &links.join("\n"),
+            ResponseMeta::default(),
+            |_| true,
         )
         .unwrap();
-        let b = crate::xray::xray_json_entry(
-            &serde_json::json!({"remarks": "NL", "outbounds": [{"protocol": "vless", "x": 2}]}),
+        let backup = endpoint_key(links[1]);
+        let pinned = endpoint_key(links[2]);
+        set_backup_endpoints(&vault, &store, "nodes", &[pinned.clone(), backup.clone()]).unwrap();
+        set_pinned_routes(
+            &vault,
+            &store,
+            "nodes",
+            vec![PinnedRoute {
+                selectors: vec!["domain:private.example".into()],
+                endpoint_key: pinned.clone(),
+                missing: false,
+            }],
         )
         .unwrap();
-        assert_eq!(endpoint_key(&a), endpoint_key(&b));
-        assert_eq!(endpoint_key("vless://id@h:1#Name"), "vless://id@h:1");
+        refresh_body(&vault, &store, "nodes",
+            "vless://new@two.test:443?security=tls#Renamed\nvless://new@one.test:443?security=tls#Primary",
+            ResponseMeta::default(), |_| true).unwrap();
+        let profile = store.load().unwrap().profiles.remove(0);
+        let meta = profile.subscription.as_ref().unwrap();
+        assert_eq!(
+            meta.backup_keys
+                .iter()
+                .map(|node| node.key.as_str())
+                .collect::<Vec<_>>(),
+            [pinned.as_str(), backup.as_str()]
+        );
+        assert_eq!(meta.backup_keys[1].name, "Renamed");
+        assert_eq!(profile.pinned_policies[0].endpoint_key, pinned);
+        assert!(profile.pinned_policies[0].missing);
+        let (candidates, pins) = failover_plan(&vault, &profile).unwrap();
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|node| endpoint_key(&node.url))
+                .collect::<Vec<_>>(),
+            [endpoint_key(links[0]), backup]
+        );
+        assert!(pins[0].missing);
+    }
+
+    #[test]
+    fn backup_plan_cannot_exceed_daemon_candidate_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, store) = import_panel(dir.path(), &["Primary"]);
+        let keys = (0..MAX_FAILOVER_NODES)
+            .map(|index| format!("{index:016x}"))
+            .collect::<Vec<_>>();
+        assert!(set_backup_endpoints(&vault, &store, "panel", &keys).is_err());
     }
 
     #[test]

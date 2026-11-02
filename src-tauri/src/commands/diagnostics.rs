@@ -1017,6 +1017,8 @@ pub(crate) async fn diagnose_profile(
                 state: TunnelState::Failed,
                 message: Some(err.clone()),
                 interface_name: None,
+                failover: None,
+                watchdog: None,
             },
             ProtocolHealth {
                 state: ProtocolHealthState::Failed,
@@ -1042,6 +1044,8 @@ pub(crate) async fn diagnose_profile(
                     state: TunnelState::Failed,
                     message: Some(err.clone()),
                     interface_name: None,
+                    watchdog: None,
+                    failover: None,
                 },
                 ProtocolHealth {
                     state: ProtocolHealthState::Failed,
@@ -1074,7 +1078,9 @@ pub(crate) async fn diagnose_profile(
                         profile_id: profile.id.clone(),
                         state: TunnelState::Failed,
                         message: Some(err.clone()),
+                        watchdog: None,
                         interface_name: None,
+                        failover: None,
                     },
                     ProtocolHealth {
                         state: ProtocolHealthState::Failed,

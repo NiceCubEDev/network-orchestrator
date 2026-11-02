@@ -15,6 +15,10 @@ pub mod dns;
 #[cfg(target_os = "linux")]
 pub mod dns_status;
 #[cfg(target_os = "linux")]
+pub mod egress;
+#[cfg(target_os = "linux")]
+pub mod failover;
+#[cfg(target_os = "linux")]
 pub mod intents;
 pub mod link_names;
 #[cfg(target_os = "linux")]
@@ -27,10 +31,14 @@ pub mod openvpn_process;
 #[cfg(target_os = "linux")]
 pub mod peer;
 #[cfg(target_os = "linux")]
+pub mod quic_reject;
+#[cfg(target_os = "linux")]
 pub mod server;
 pub mod settings;
 pub mod tailscale;
 pub mod validate;
+#[cfg(target_os = "linux")]
+pub mod watchdog;
 pub mod wireguard;
 pub mod xray;
 #[cfg(target_os = "linux")]

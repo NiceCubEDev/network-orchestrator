@@ -8,6 +8,7 @@ import {
   DomainRouteTarget,
   HappRoutingImport,
   NetworkInterface,
+  PinnedRoute,
   PolicyRoute,
   Profile,
   ProfileInspection,
@@ -112,6 +113,8 @@ function parseBypass(text: string): string[] {
 }
 
 export interface ProfileFormState {
+  /** Preserve settings owned by dedicated editors, not this form. */
+  preservedProfile: Profile | null;
   id: string;
   name: string;
   backend: TunnelBackend;
@@ -144,8 +147,13 @@ export interface ProfileFormState {
   xrayDomainMatcher: XrayDomainMatcher | "";
   /** Opaque pass-through: no editor yet, but a save must not wipe it. */
   xrayDns: XrayDnsConfig | null;
+  /** Opaque pass-through: the failover editor owns node pins; a form save
+   * carries them back unchanged. */
+  pinnedPolicies: PinnedRoute[];
   /** Linux TUN: def1 halves (0.0.0.0/1 + 128.0.0.0/1) instead of 0.0.0.0/0. */
   xraySplitDefault: boolean;
+  /** Linux TUN: kernel-level UDP/443 reject so QUIC falls back to TCP fast. */
+  xrayQuicReject: boolean;
   /** staticRoutes: keep routes armed until the target interface appears. */
   waitForInterface: boolean;
   /** staticRoutes: comma-separated endpoint IPs/hostnames routed via the
@@ -190,6 +198,7 @@ export function newFormState(
   os?: string,
 ): ProfileFormState {
   return {
+    preservedProfile: null,
     id: newProfileId(),
     name: "",
     backend,
@@ -222,13 +231,16 @@ export function newFormState(
     xrayDomainMatcher: "",
     xrayDns: null,
     xraySplitDefault: false,
+    xrayQuicReject: false,
     waitForInterface: false,
     endpointBypasses: "",
+    pinnedPolicies: [],
   };
 }
 
 export function editFormState(profile: Profile): ProfileFormState {
   return {
+    preservedProfile: structuredClone(profile),
     id: profile.id,
     name: profile.name,
     backend: profile.backend,
@@ -257,10 +269,12 @@ export function editFormState(profile: Profile): ProfileFormState {
     xrayGeositeUrl: profile.xrayGeositeUrl ?? "",
     xrayDomainStrategy: profile.xrayDomainStrategy ?? "",
     xrayDomainMatcher: profile.xrayDomainMatcher ?? "",
-    xrayDns: profile.xrayDns ?? null,
+    xrayDns: profile.xrayDns ? structuredClone(profile.xrayDns) : null,
     xraySplitDefault: profile.xraySplitDefault ?? false,
+    xrayQuicReject: profile.xrayQuicReject ?? false,
     waitForInterface: profile.waitForInterface ?? false,
     endpointBypasses: (profile.endpointBypasses ?? []).join(", "),
+    pinnedPolicies: profile.pinnedPolicies ?? [],
   };
 }
 
@@ -462,7 +476,10 @@ export default function ProfileFormModal({
         dns.servers.length > 0 ||
         Object.keys(dns.hosts).length > 0 ||
         dns.fakeDns ||
-        dns.queryStrategy !== null;
+        dns.queryStrategy != null ||
+        dns.enableParallelQuery != null ||
+        dns.outboundKey != null ||
+        dns.outbound != null;
       update({
         // A profile with any lists replaces all three buckets — absent
         // buckets are empty in Happ semantics. A DNS-only import leaves
@@ -478,7 +495,7 @@ export default function ProfileFormModal({
         xrayDomainStrategy:
           imported.domainStrategy ?? current.xrayDomainStrategy,
         xrayDomainMatcher: imported.domainMatcher ?? current.xrayDomainMatcher,
-        xrayDns: hasDns ? dns : current.xrayDns,
+        xrayDns: hasDns ? { ...current.xrayDns, ...dns } : current.xrayDns,
         xrayGeoipUrl: imported.geoipUrl ?? current.xrayGeoipUrl,
         xrayGeositeUrl: imported.geositeUrl ?? current.xrayGeositeUrl,
       });
@@ -611,6 +628,7 @@ export default function ProfileFormModal({
       }
     }
     const payload: Profile = {
+      ...(current.preservedProfile ?? {}),
       id: current.id,
       name: current.name.trim(),
       backend: current.backend,
@@ -636,17 +654,36 @@ export default function ProfileFormModal({
       proxyBypass: isXray ? proxyBypass : [],
       subscription: current.isNew ? null : current.subscription ?? null,
       xrayMode: isXray ? current.xrayMode : "socks",
-      xrayTunInterface: isXray && current.xrayMode === "tun" && caps?.os === "windows" ? current.xrayTunInterface.trim() : null,
-      xrayTunIp: isXray && current.xrayMode === "tun" && caps?.os === "windows" ? current.xrayTunIp.trim() : null,
-      xrayGeoipUrl: isXray && current.xrayMode === "tun" ? current.xrayGeoipUrl.trim() || null : null,
-      xrayGeositeUrl: isXray && current.xrayMode === "tun" ? current.xrayGeositeUrl.trim() || null : null,
+      xrayTunInterface: isXray
+        ? current.xrayMode === "tun" && caps?.os === "windows"
+          ? current.xrayTunInterface.trim() || null
+          : current.preservedProfile?.xrayTunInterface ?? null
+        : null,
+      xrayTunIp: isXray
+        ? current.xrayMode === "tun" && caps?.os === "windows"
+          ? current.xrayTunIp.trim() || null
+          : current.preservedProfile?.xrayTunIp ?? null
+        : null,
+      xrayGeoipUrl: isXray ? current.xrayGeoipUrl.trim() || null : null,
+      xrayGeositeUrl: isXray ? current.xrayGeositeUrl.trim() || null : null,
       xrayDomainStrategy: isXray && current.xrayDomainStrategy ? current.xrayDomainStrategy : null,
       xrayDomainMatcher: isXray && current.xrayDomainMatcher ? current.xrayDomainMatcher : null,
       xrayDns: isXray ? (current.xrayDns ?? undefined) : undefined,
       xraySplitDefault: isXray && current.xrayMode === "tun" && current.xraySplitDefault,
+      // Linux TUN only: edited on Linux; a save made elsewhere keeps the
+      // stored flag, non-Xray backends never carry it.
+      xrayQuicReject:
+        isXray && caps?.os === "linux" && current.xrayMode === "tun"
+          ? current.xrayQuicReject
+          : isXray
+            ? (current.xrayQuicReject ?? false)
+            : false,
       waitForInterface: current.backend === "none" && current.waitForInterface,
       endpointBypasses:
-        current.backend === "none" ? endpointBypasses : [],
+        current.backend === "none" || isXray ? endpointBypasses : [],
+      // Linux multinode: the failover editor owns these; carry them back so a
+      // form save cannot drop them (the backend re-restores either way).
+      pinnedPolicies: isXray ? current.pinnedPolicies : [],
     };
     setSaving(true);
     try {
@@ -1072,6 +1109,19 @@ export default function ProfileFormModal({
               </label>
               <span className="profile-help">
                 {tr("form.splitDefaultHint")}
+              </span>
+              <label className="profile-proxy-toggle">
+                <input
+                  type="checkbox"
+                  checked={current.xrayQuicReject}
+                  onChange={(e) =>
+                    update({ xrayQuicReject: e.target.checked })
+                  }
+                />
+                <span>{tr("form.quicReject")}</span>
+              </label>
+              <span className="profile-help">
+                {tr("form.quicRejectHint")}
               </span>
               </>
             ) : (

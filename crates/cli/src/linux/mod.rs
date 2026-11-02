@@ -13,6 +13,7 @@ mod ctx;
 mod endpoints;
 mod hold;
 mod library;
+mod migrate;
 mod route;
 
 use args::{Cli, Command};
@@ -107,6 +108,8 @@ fn run(ctx: &ctx::Ctx, command: Command, json: bool) -> Result<commands::Output,
             Ok((value, text))
         }
         Command::Route(command) => route::run(ctx, command),
+        Command::Backup(command) => endpoints::backup(ctx, command),
+        Command::Migrate(command) => migrate::run(ctx, command),
         Command::Refresh { target } => endpoints::refresh(ctx, &target),
         Command::Test(args) => endpoints::test(
             ctx,

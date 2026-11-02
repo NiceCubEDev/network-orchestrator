@@ -93,6 +93,29 @@ impl ProfileStore {
         Ok(document)
     }
 
+    /// Change one existing profile under the store transaction, preserving
+    /// unrelated edits made while a network operation was in flight.
+    pub fn update_profile(
+        &self,
+        id: &str,
+        update: impl FnOnce(&mut Profile) -> io::Result<()>,
+    ) -> io::Result<ProfileDocument> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| io::Error::other("profile store lock poisoned"))?;
+        let mut document = self.load()?;
+        let profile = document
+            .profiles
+            .iter_mut()
+            .find(|profile| profile.id == id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "profile not found"))?;
+        update(profile)?;
+        validate_profile(profile)?;
+        self.save_locked(&document)?;
+        Ok(document)
+    }
+
     /// Flags whether the app starts this profile when it launches.
     pub fn set_auto_connect(&self, id: &str, enabled: bool) -> io::Result<ProfileDocument> {
         let _guard = self
@@ -258,6 +281,25 @@ pub fn validate_profile(profile: &Profile) -> io::Result<()> {
         ));
     }
     if profile.backend == TunnelBackend::Xray {
+        crate::xray::validate_routing_policy_selectors(&profile.domain_policies)
+            .map_err(|error| invalid_data(error.to_string()))?;
+        crate::xray::validate_dns_config(&profile.xray_dns)
+            .map_err(|error| invalid_data(error.to_string()))?;
+        crate::xray::validate_advanced_routing_options(
+            &profile.xray_traffic_rules,
+            &profile.xray_interface_routes,
+            profile.xray_sockopts.as_ref(),
+            profile.xray_connection_idle_secs,
+            profile.xray_direct_domain_strategy.as_deref(),
+        )
+        .map_err(|error| invalid_data(error.to_string()))?;
+        crate::xray::validate_tun_profile_settings(
+            profile.xray_tun_mtu,
+            &profile.xray_tun_dns_servers,
+        )
+        .map_err(|error| invalid_data(error.to_string()))?;
+        crate::xray::validate_pinned_routes(&profile.pinned_policies)
+            .map_err(|error| invalid_data(error.to_string()))?;
         for policy in &profile.domain_policies {
             if policy.domains.is_empty() {
                 return Err(invalid_data("domain policy must list at least one domain"));

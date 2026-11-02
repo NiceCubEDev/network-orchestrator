@@ -196,6 +196,8 @@ mod tests {
             state,
             message: message.map(str::to_string),
             interface_name: iface.map(str::to_string),
+            failover: None,
+            watchdog: None,
         }
     }
 

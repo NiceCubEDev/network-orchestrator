@@ -265,6 +265,8 @@ async fn collect(state: &AppState) -> Result<(RecoveryReport, Vec<String>), Stri
                 state: TunnelState::Failed,
                 message: Some(err),
                 interface_name: None,
+                failover: None,
+                watchdog: None,
             });
             (profile_id, status)
         })
@@ -358,6 +360,8 @@ mod tests {
                 state,
                 message: None,
                 interface_name: None,
+                watchdog: None,
+                failover: None,
             },
         )
     }

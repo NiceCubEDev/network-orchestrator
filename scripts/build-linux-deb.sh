@@ -29,7 +29,7 @@ fi
 XRAY_URL="$(cargo run -q --release -p net-manager-core --example package_linux_xray -- url)"
 XRAY_SHA256="$(cargo run -q --release -p net-manager-core --example package_linux_xray -- sha256)"
 XRAY_VERSION="$(cargo run -q --release -p net-manager-core --example package_linux_xray -- version)"
-if [ "$XRAY_VERSION" != v26.3.27 ]; then
+if [ "$XRAY_VERSION" != v26.10.31 ]; then
     echo "error: update the .deb Xray file mappings for $XRAY_VERSION" >&2
     exit 1
 fi
@@ -44,10 +44,10 @@ cargo run -q --release -p net-manager-core --example package_linux_xray -- \
 
 cargo build --release -p network-orchestrator-daemon
 chmod 0755 target/release/network-orchestrator-daemon \
-    target/release/xray-package/v26.3.27/xray
-chmod 0644 target/release/xray-package/v26.3.27/*.dat \
-    target/release/xray-package/v26.3.27/LICENSE \
-    target/release/xray-package/v26.3.27/README.md \
+    target/release/xray-package/v26.10.31/xray
+chmod 0644 target/release/xray-package/v26.10.31/*.dat \
+    target/release/xray-package/v26.10.31/LICENSE \
+    target/release/xray-package/v26.10.31/README.md \
     packaging/linux/network-orchestrator.service \
     packaging/linux/com.netmanager.app.policy packaging/linux/xray-NOTICES
 test -x target/release/network-orchestrator-daemon

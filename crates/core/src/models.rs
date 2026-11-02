@@ -175,6 +175,71 @@ pub struct DomainPolicy {
     pub target: DomainRouteTarget,
 }
 
+/// A domain-selector route pinned to a specific subscription endpoint.
+///
+/// Pinned routes are fail-closed by construction: the selectors may only
+/// leave through the named node — never directly and never through another
+/// endpoint. When the endpoint disappears from the subscription the rule is
+/// kept (`missing` is recomputed at connect/list time) and its selectors are
+/// dropped instead of retargeted.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PinnedRoute {
+    /// Selector syntax is identical to [`DomainPolicy::domains`]
+    /// (`domain:`, `geosite:`, `full:`, `keyword:`, `regexp:` and plain
+    /// suffixes); IP selectors are not allowed — a pinned node is a domain
+    /// policy, not a network route.
+    pub selectors: Vec<String>,
+    /// [`crate::subscription::endpoint_key`] of the node, 16 lowercase hex.
+    pub endpoint_key: String,
+    /// Set when the key does not resolve to a current endpoint; persisted
+    /// so the clients can grey the entry out, refreshed on every change.
+    #[serde(default)]
+    pub missing: bool,
+}
+
+/// Reference to one subscription endpoint by its stable key plus the last
+/// known display name (kept so a vanished node stays readable).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct EndpointRef {
+    pub key: String,
+    pub name: String,
+}
+
+/// Probed health of one failover candidate, as the daemon last saw it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeHealth {
+    pub key: String,
+    /// `None` until the first probe completes.
+    #[serde(default)]
+    pub healthy: Option<bool>,
+    #[serde(default)]
+    pub last_probe_unix: Option<u64>,
+    #[serde(default)]
+    pub latency_ms: Option<u32>,
+}
+
+/// Live multinode state of a running Xray tunnel: which node currently
+/// carries the default traffic and how each candidate is doing.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FailoverStatus {
+    pub primary_key: String,
+    /// Tag of the node the balancer currently selects; `unavailable` when
+    /// every candidate failed its probes (traffic is dropped, never sent
+    /// direct).
+    pub active_key: String,
+    #[serde(default)]
+    pub auto_return_primary: bool,
+    /// True while `active_key` is neither the primary nor `unavailable`.
+    #[serde(default)]
+    pub failover_active: bool,
+    #[serde(default)]
+    pub nodes: Vec<NodeHealth>,
+}
+
 /// How a tunnel takes part when several run together (macOS). The primary
 /// tunnel owns the default route and the system DNS; a secondary tunnel only
 /// carries the networks the user lists for it, which win over the primary's
@@ -409,6 +474,31 @@ pub struct XrayDnsServer {
     pub route: XrayDnsRoute,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct XrayDnsOutboundSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rewrite_address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rewrite_network: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rewrite_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<XrayDnsRewriteRule>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct XrayDnsRewriteRule {
+    pub action: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub q_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub r_code: Option<u16>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub domain: Vec<String>,
+}
+
 /// Profile-level Xray `dns` policy: ordered resolvers, static host
 /// overrides and fake-DNS capture.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -425,11 +515,25 @@ pub struct XrayDnsConfig {
     pub fake_dns: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query_strategy: Option<XrayDnsQueryStrategy>,
+    /// Preserve an explicit DNS query scheduling policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enable_parallel_query: Option<bool>,
+    /// Fixed subscription endpoint for the DNS outbound's forwarded traffic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outbound_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outbound: Option<XrayDnsOutboundSettings>,
 }
 
 impl XrayDnsConfig {
     pub fn is_empty(&self) -> bool {
-        self.servers.is_empty() && self.hosts.is_empty() && !self.fake_dns
+        self.servers.is_empty()
+            && self.hosts.is_empty()
+            && !self.fake_dns
+            && self.query_strategy.is_none()
+            && self.enable_parallel_query.is_none()
+            && self.outbound_key.is_none()
+            && self.outbound.is_none()
     }
 }
 
@@ -445,6 +549,10 @@ pub struct Profile {
     pub auto_connect: bool,
     #[serde(default)]
     pub domain_policies: Vec<DomainPolicy>,
+    /// Domain selectors pinned to specific subscription endpoints. Always
+    /// fail-closed: selectors exit through the named node or are dropped.
+    #[serde(default)]
+    pub pinned_policies: Vec<PinnedRoute>,
     #[serde(default)]
     pub private_lan_direct: bool,
     #[serde(default)]
@@ -493,6 +601,24 @@ pub struct Profile {
     /// Ignored in SOCKS mode and when explicit profile routes are set.
     #[serde(default)]
     pub xray_split_default: bool,
+    /// Linux TUN: reject UDP/443 at the owned interface instead of silently
+    /// dropping QUIC, so clients can immediately fall back to TCP.
+    #[serde(default)]
+    pub xray_quic_reject: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xray_sockopts: Option<XraySockopts>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub xray_traffic_rules: Vec<XrayTrafficRule>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub xray_interface_routes: Vec<XrayInterfaceRoute>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xray_connection_idle_secs: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xray_tun_mtu: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub xray_tun_dns_servers: Vec<IpAddr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xray_direct_domain_strategy: Option<String>,
     /// Hosts (literal IPs or DNS names) that must stay reachable via the
     /// physical uplink, bypassing any foreign capture tunnel — e.g. a VPN
     /// server's own endpoint while another client's TUN holds the default
@@ -583,11 +709,20 @@ impl Default for Profile {
             xray_domain_matcher: None,
             xray_dns: XrayDnsConfig::default(),
             xray_split_default: false,
+            xray_quic_reject: false,
+            xray_sockopts: None,
+            xray_traffic_rules: Vec::new(),
+            xray_interface_routes: Vec::new(),
+            xray_connection_idle_secs: None,
+            xray_tun_mtu: None,
+            xray_tun_dns_servers: Vec::new(),
+            xray_direct_domain_strategy: None,
             endpoint_bypasses: Vec::new(),
             wait_for_interface: false,
             tunnel_role: TunnelRole::Primary,
             tunnel_dns_domains: Vec::new(),
             tunnel_networks: Vec::new(),
+            pinned_policies: Vec::new(),
         }
     }
 }
@@ -619,6 +754,18 @@ pub struct SubscriptionMeta {
     pub update_interval_hours: Option<u32>,
     #[serde(default)]
     pub skipped_protocols: Vec<String>,
+    #[serde(default)]
+    pub active_key: Option<String>,
+    #[serde(default)]
+    pub backup_keys: Vec<EndpointRef>,
+    #[serde(default)]
+    pub auto_return_primary: Option<bool>,
+    #[serde(default)]
+    pub probe_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_pool: Option<NodePoolSettings>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pool_keys: Vec<EndpointRef>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -654,6 +801,10 @@ impl std::fmt::Debug for SubscriptionMeta {
             )
             .field("update_interval_hours", &self.update_interval_hours)
             .field("skipped_protocols", &self.skipped_protocols)
+            .field("active_key", &self.active_key)
+            .field("backup_keys", &self.backup_keys)
+            .field("auto_return_primary", &self.auto_return_primary)
+            .field("probe_url", &self.probe_url.as_ref().map(|_| "<redacted>"))
             .finish()
     }
 }
@@ -665,6 +816,90 @@ pub struct SubscriptionEndpointInfo {
     pub active: bool,
     #[serde(default)]
     pub protocol: Option<String>,
+    /// [`crate::subscription::endpoint_key`] of this endpoint.
+    #[serde(default)]
+    pub key: String,
+    /// Listed in `SubscriptionMeta::backup_keys`.
+    #[serde(default)]
+    pub is_backup: bool,
+    /// Synthesized entry for a stored key the refresh no longer returns.
+    #[serde(default)]
+    pub is_missing: bool,
+    #[serde(default)]
+    pub in_pool: bool,
+}
+
+/// Traffic explicitly bound to another existing tunnel, never a direct fallback.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct XrayInterfaceRoute {
+    pub selectors: Vec<String>,
+    pub interface_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain_strategy: Option<String>,
+}
+
+/// Ordered IP/port guards applied before DNS capture and domain policies.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct XrayTrafficRule {
+    pub ips: Vec<String>,
+    pub port: u16,
+    /// `tcp`, `udp`, or `tcp,udp`.
+    pub network: String,
+    pub target: DomainRouteTarget,
+}
+
+/// Xray socket settings; keepalive durations are seconds, user timeout is milliseconds.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct XraySockopts {
+    pub tcp_keep_alive_idle: Option<u32>,
+    pub tcp_keep_alive_interval: Option<u32>,
+    pub tcp_user_timeout: Option<u32>,
+    #[serde(default)]
+    pub tcp_no_delay: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NodePoolFilter {
+    #[serde(default)]
+    pub name_contains: Vec<String>,
+    pub exit_country: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NodePoolSettings {
+    pub filters: Vec<NodePoolFilter>,
+    #[serde(default)]
+    pub verify_exit_country: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WatchdogStatus {
+    pub uplink: Option<bool>,
+    /// Fingerprint of the effective underlay, not a gateway/interface address.
+    pub egress_signature: Option<String>,
+    pub last_egress_change_unix: Option<u64>,
+    pub https_stall_streak: u32,
+    pub https_latency_ms: Option<u32>,
+    pub dns_stall_streak: u32,
+    pub pinned_stalled: Vec<String>,
+    pub xray_udp_sockets: u32,
+    pub conn_storm: Option<ConnStorm>,
+    pub last_recovery_unix: Option<u64>,
+    pub anomalies: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnStorm {
+    pub destination: String,
+    pub process: Option<String>,
+    pub count: u32,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -685,6 +920,11 @@ pub struct TunnelStatus {
     /// `wg-44c5d5827e76`), when the profile is daemon-managed and running.
     #[serde(default)]
     pub interface_name: Option<String>,
+    /// Live multinode state, present while a daemon Xray tunnel reports it.
+    #[serde(default)]
+    pub failover: Option<FailoverStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watchdog: Option<WatchdogStatus>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1023,6 +1263,12 @@ mod tests {
             web_page_url: None,
             update_interval_hours: None,
             skipped_protocols: Vec::new(),
+            active_key: None,
+            backup_keys: Vec::new(),
+            auto_return_primary: None,
+            probe_url: None,
+            node_pool: None,
+            pool_keys: Vec::new(),
         };
         let debug = format!("{subscription:?}");
         assert!(!debug.contains("private-token"));

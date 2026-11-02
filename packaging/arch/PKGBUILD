@@ -7,18 +7,18 @@ url='https://github.com/Nie1iX/network-orchestrator'
 license=('MIT' 'MPL-2.0' 'GPL-3.0-only')
 # libappindicator-gtk3 (provided by libappindicator) is loaded at runtime by
 # the tray; without it the app aborts at startup.
-depends=('webkit2gtk-4.1' 'polkit' 'iproute2' 'systemd' 'libappindicator-gtk3')
+depends=('webkit2gtk-4.1' 'polkit' 'iproute2' 'nftables' 'systemd' 'libappindicator-gtk3')
 optdepends=('wireguard-tools: WireGuard tunnels'
             'openvpn: OpenVPN tunnels')
 makedepends=('cargo' 'nodejs' 'npm' 'pkgconf' 'openssl' 'libappindicator-gtk3' 'librsvg' 'xdotool')
 options=('!lto' '!debug' '!strip')
 install="${pkgname}.install"
 source=("${pkgname}-${pkgver}.tar.gz"
-        'Xray-linux-64.zip::https://github.com/XTLS/Xray-core/releases/download/v26.3.27/Xray-linux-64.zip')
+        'Xray-linux-64.zip::https://github.com/XTLS/Xray-core/releases/download/v26.10.31/Xray-linux-64.zip')
 noextract=('Xray-linux-64.zip')
 # scripts/build-linux-arch.sh replaces SKIP with the local snapshot's SHA-256.
 sha256sums=('SKIP'
-            '23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae')
+            'e4bd9119f50ae7c41658b1abd0679ae06f98bd864a2907ff33f2f2cf7081b214')
 
 build() {
     cd "${srcdir}/${pkgname}-${pkgver}"
@@ -41,14 +41,14 @@ package() {
         "${pkgdir}/usr/share/polkit-1/actions/com.netmanager.app.policy"
     install -Dm0644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
 
-    install -Dm0755 "${srcdir}/xray-verified/v26.3.27/xray" \
-        "${pkgdir}/usr/lib/network-orchestrator/xray/v26.3.27/xray"
+    install -Dm0755 "${srcdir}/xray-verified/v26.10.31/xray" \
+        "${pkgdir}/usr/lib/network-orchestrator/xray/v26.10.31/xray"
     for name in geoip.dat geosite.dat; do
-        install -Dm0644 "${srcdir}/xray-verified/v26.3.27/${name}" \
-            "${pkgdir}/usr/lib/network-orchestrator/xray/v26.3.27/${name}"
+        install -Dm0644 "${srcdir}/xray-verified/v26.10.31/${name}" \
+            "${pkgdir}/usr/lib/network-orchestrator/xray/v26.10.31/${name}"
     done
     for name in LICENSE README.md; do
-        install -Dm0644 "${srcdir}/xray-verified/v26.3.27/${name}" \
+        install -Dm0644 "${srcdir}/xray-verified/v26.10.31/${name}" \
             "${pkgdir}/usr/share/doc/${pkgname}/xray/${name}"
     done
     install -Dm0644 packaging/arch/xray-NOTICES \

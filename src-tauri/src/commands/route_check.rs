@@ -126,6 +126,7 @@ pub(crate) fn xray_test_route(
         domain_strategy: request.domain_strategy,
         domain_matcher: None,
         dns: request.dns,
+        ..ProfileRoutingOptions::default()
     };
     check_route(&request.domain_policies, &options, &request.target, &geo)
         .map_err(|err| err.to_string())

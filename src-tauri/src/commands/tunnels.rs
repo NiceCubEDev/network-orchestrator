@@ -144,6 +144,8 @@ async fn linux_xray_disconnect(
         state: TunnelState::Stopped,
         message: None,
         interface_name: None,
+        failover: None,
+        watchdog: None,
     })
 }
 
@@ -265,6 +267,8 @@ async fn linux_openvpn_disconnect(
         state: TunnelState::Stopped,
         message: None,
         interface_name: None,
+        watchdog: None,
+        failover: None,
     })
 }
 
@@ -330,7 +334,9 @@ async fn linux_wireguard_disconnect(
         profile_id: profile.id.clone(),
         state: TunnelState::Stopped,
         message: None,
+        watchdog: None,
         interface_name: None,
+        failover: None,
     })
 }
 
@@ -773,8 +779,10 @@ pub(crate) async fn collect_tunnel_statuses(
                         .unwrap_or_else(|err| TunnelStatus {
                             profile_id: profile.id.clone(),
                             state: TunnelState::Failed,
+                            watchdog: None,
                             message: Some(err),
                             interface_name: None,
+                            failover: None,
                         }),
                 );
             } else if profile.backend == TunnelBackend::OpenVpn {
@@ -783,9 +791,11 @@ pub(crate) async fn collect_tunnel_statuses(
                         .await
                         .unwrap_or_else(|err| TunnelStatus {
                             profile_id: profile.id.clone(),
+                            watchdog: None,
                             state: TunnelState::Failed,
                             message: Some(err),
                             interface_name: None,
+                            failover: None,
                         }),
                 );
             } else if profile.backend == TunnelBackend::Xray && profile.xray_mode == XrayMode::Tun {
@@ -793,10 +803,12 @@ pub(crate) async fn collect_tunnel_statuses(
                     linux_xray_status(&client, profile)
                         .await
                         .unwrap_or_else(|err| TunnelStatus {
+                            watchdog: None,
                             profile_id: profile.id.clone(),
                             state: TunnelState::Failed,
                             message: Some(err),
                             interface_name: None,
+                            failover: None,
                         }),
                 );
             } else {
@@ -1821,11 +1833,13 @@ mod tests {
             profile_id: p.id.clone(),
             state: TunnelState::Running,
             interface_name: Some("xray-split".into()),
+            watchdog: None,
             dns_applied: false,
             ipv4_covered: false,
             ipv6_covered: false,
             rx_bytes: None,
             tx_bytes: None,
+            failover: None,
         };
         assert!(linux_xray_tunnel_status(status, &p).message.is_none());
     }
@@ -1839,12 +1853,14 @@ mod tests {
         let status = XrayStatusResult {
             profile_id: p.id.clone(),
             state: TunnelState::Running,
+            watchdog: None,
             interface_name: Some("xray-default".into()),
             dns_applied: false,
             ipv4_covered: true,
             ipv6_covered: false,
             rx_bytes: None,
             tx_bytes: None,
+            failover: None,
         };
         let message = linux_xray_tunnel_status(status, &p).message.unwrap();
         assert!(message.contains("DNS was not applied"));

@@ -73,7 +73,7 @@ expected = dict(re.findall(r'\(\s*"([^"]+)",\s*"([0-9a-f]{64})",\s*\)', match.gr
 if set(expected) != {'xray', 'geoip.dat', 'geosite.dat'}:
     raise SystemExit('unexpected Linux Xray hash list in core')
 for name, pinned_hash in expected.items():
-    path = f'usr/lib/network-orchestrator/xray/v26.3.27/{name}'
+    path = f'usr/lib/network-orchestrator/xray/v26.10.31/{name}'
     data = subprocess.check_output(['tar', '-I', 'zstd', '-xOf', sys.argv[2], path])
     if hashlib.sha256(data).hexdigest() != pinned_hash:
         raise SystemExit(f'package Xray file hash mismatch: {name}')

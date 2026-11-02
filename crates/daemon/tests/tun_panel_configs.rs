@@ -19,6 +19,10 @@ fn params(config: &Value) -> XrayConnectParams {
         geo_assets: None,
         macos_data_root: None,
         role: Default::default(),
+        failover: None,
+        reject_quic: false,
+        probe_url: None,
+        mtu: None,
     }
 }
 
@@ -72,4 +76,50 @@ fn a_reduced_panel_hysteria_config_passes_the_daemon_validator() {
     }));
     let reduced = xray::tun_compatible_config(&config).unwrap();
     prepare_xray(1000, params(&reduced), 1).expect("reduced config");
+}
+
+#[test]
+fn multinode_preserves_proxy_policies_and_accepts_missing_pinned_nodes() {
+    use net_manager_core::daemon_protocol::{XrayFailoverNode, XrayFailoverParams};
+    use net_manager_core::models::{DomainPolicy, DomainRouteTarget};
+    let uri =
+        "vless://00000000-0000-0000-0000-000000000001@primary.test:443?security=none&type=tcp";
+    let key = net_manager_core::subscription::endpoint_key(uri);
+    let base = xray::generate_share_link_config_with_http(uri, 10808, 10809).unwrap();
+    let routed = xray::apply_profile_routing(
+        &base,
+        &[DomainPolicy {
+            domains: vec!["domain:default.test".into()],
+            target: DomainRouteTarget::Proxy,
+        }],
+        &Default::default(),
+    )
+    .unwrap();
+    let config = xray::apply_multinode_config(
+        &routed,
+        &key,
+        &[],
+        &[xray::PinnedOutbound {
+            key: "ffffffffffffffff".into(),
+            selectors: vec!["domain:pinned.test".into()],
+            outbound: None,
+        }],
+    )
+    .unwrap();
+    let mut request = params(&config);
+    request.failover = Some(XrayFailoverParams {
+        nodes: vec![XrayFailoverNode { key: key.clone() }],
+        primary_key: key,
+        auto_return_primary: true,
+        probe_url: "https://example.test/check".into(),
+        interval_secs: 10,
+    });
+    let plan = prepare_xray(1000, request, 51820).expect("valid generated multinode policy");
+    let running: Value = serde_json::from_str(&plan.config).unwrap();
+    assert!(running["outbounds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|outbound| outbound["tag"] == "pin-ffffffffffffffff"
+            && outbound["protocol"] == "blackhole"));
 }

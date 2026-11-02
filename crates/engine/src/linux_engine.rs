@@ -176,6 +176,8 @@ impl LinuxEngine {
             state: TunnelState::Stopped,
             message: None,
             interface_name: None,
+            failover: None,
+            watchdog: None,
         })
     }
 

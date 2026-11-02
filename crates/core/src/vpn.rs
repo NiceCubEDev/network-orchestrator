@@ -516,12 +516,7 @@ fn prepared_routing_config(profile: &Profile) -> io::Result<serde_json::Value> {
     crate::xray::apply_profile_routing(
         &base,
         &profile.domain_policies,
-        &crate::xray::ProfileRoutingOptions {
-            private_lan_direct: profile.private_lan_direct,
-            domain_strategy: profile.xray_domain_strategy,
-            domain_matcher: profile.xray_domain_matcher,
-            dns: profile.xray_dns.clone(),
-        },
+        &crate::xray::ProfileRoutingOptions::from(profile),
     )
     .map_err(|_| invalid_data("failed to apply Xray routing policies"))
 }
@@ -666,6 +661,8 @@ fn status_for(profile_id: &str, state: TunnelState, message: Option<String>) -> 
         state,
         message,
         interface_name: None,
+        failover: None,
+        watchdog: None,
     }
 }
 

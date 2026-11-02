@@ -196,6 +196,7 @@ fn tun_status(client: &dyn Privileged, profile: &Profile) -> TunnelStatus {
         state: TunnelState::Stopped,
         message: None,
         interface_name: None,
+        failover: None,
     };
     match client.call::<_, XrayStatusResult>(
         method::XRAY_STATUS,
@@ -210,6 +211,7 @@ fn tun_status(client: &dyn Privileged, profile: &Profile) -> TunnelStatus {
                 .map(|line| format!("Xray stopped: {line}")),
             state: status.state,
             interface_name: status.interface_name,
+            failover: status.failover,
             ..stopped
         },
         Err(_) => stopped,
@@ -386,6 +388,7 @@ fn request_tunnel(
         geo_assets,
         macos_data_root: Some(root.to_string_lossy().into_owned()),
         role: profile.tunnel_role,
+        failover: None,
     };
     client
         .call::<_, XrayConnectResult>(method::XRAY_CONNECT, params)

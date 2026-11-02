@@ -1,6 +1,14 @@
+import { useState } from "react";
 import { isTauri } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { backendIcon, SpinnerIcon } from "../../icons";
+import {
+  ArrowDownIcon,
+  ArrowUpIcon,
+  backendIcon,
+  CloseIcon,
+  PlusIcon,
+  SpinnerIcon,
+} from "../../icons";
 import { formatBytes } from "../../format";
 import { TranslationKey, useT } from "../../i18n";
 import { providerPrefix } from "../../subscriptions";
@@ -9,6 +17,7 @@ import {
   AlwaysOnListResult,
   DomainPolicy,
   DomainRouteTarget,
+  PinnedRoute,
   Profile,
   ProfileInspection,
   SubscriptionDelayResult,
@@ -18,6 +27,7 @@ import {
 import OverflowMenu from "../ui/OverflowMenu";
 import RateText from "../ui/RateText";
 import ToggleSwitch from "../ui/ToggleSwitch";
+import LinuxXrayPolicySection from "./LinuxXrayPolicySection";
 import TunnelRoleSection, { supportsRole } from "./TunnelRoleSection";
 
 const CONFIG_FIELD_LABEL_KEYS: Record<string, TranslationKey> = {
@@ -96,18 +106,27 @@ interface ProfileDetailProps {
   onRefreshSubscription: () => void;
   onDiagnose: () => void;
   onDelete: () => void;
-  onSwitchEndpoint: (index: number) => void;
+  onSwitchEndpoint: (key: string) => void;
   onMeasureAllEndpoints: () => void;
   onSetRefreshInterval: (minutes: number | null) => void;
   onCopyTerminalProxy: () => void;
   onRoleChanged: () => void;
+  /** Linux failover: replace the ordered backup chain with these keys. */
+  onSetBackups: (keys: string[]) => void;
+  onSetAutoReturn: (enabled: boolean) => void;
+  onSetPinnedRoutes: (routes: PinnedRoute[]) => void;
+  /** One failover save in flight (backups, auto-return or pins). */
+  failoverBusy: boolean;
+  /** Edits were saved while the tunnel ran: they apply on reconnect. */
+  applyOnReconnect: boolean;
+  onPolicySaved: (profileId: string, profiles: Profile[]) => Promise<void>;
 }
 
 export default function ProfileDetail({
   profile,
   status,
   rate,
-  isBusy,
+  isBusy: profileBusy,
   backendLabel,
   managedConfig,
   inspection,
@@ -138,8 +157,19 @@ export default function ProfileDetail({
   onSetRefreshInterval,
   onCopyTerminalProxy,
   onRoleChanged,
+  onSetBackups,
+  onSetAutoReturn,
+  onSetPinnedRoutes,
+  failoverBusy,
+  applyOnReconnect,
+  onPolicySaved,
 }: ProfileDetailProps) {
   const t = useT();
+  const [pinVia, setPinVia] = useState("");
+  const [pinSelectors, setPinSelectors] = useState("");
+  const [policyBusy, setPolicyBusy] = useState(false);
+  const isBusy = profileBusy || policyBusy;
+
   const alwaysOnKind: AlwaysOnKind | null =
     profile.backend === "wireGuard"
       ? "wireGuard"
@@ -185,6 +215,62 @@ export default function ProfileDetail({
     subscription?.userInfo?.expiresAtUnix != null
       ? Math.ceil((subscription.userInfo.expiresAtUnix * 1000 - Date.now()) / 86_400_000)
       : null;
+
+  // Linux multinode: ordered backups, auto-return and fail-closed node pins.
+  const multinode = os === "linux" && Boolean(profile.subscription) && endpoints !== undefined;
+  const backupRefs = subscription?.backupKeys ?? [];
+  const backupOrder = new Map(backupRefs.map((ref, i) => [ref.key, i]));
+  const endpointName = (key: string): string => {
+    const index = endpoints?.findIndex((e) => e.key === key) ?? -1;
+    if (index >= 0) {
+      return endpointDisplay?.names[index] ?? endpoints![index].name;
+    }
+    return [...backupRefs, ...(subscription?.poolKeys ?? [])]
+      .find((ref) => ref.key === key)?.name ?? key;
+  };
+  const failover = status.failover ?? null;
+  const pinnedRoutes = profile.pinnedPolicies ?? [];
+  const liveEndpoints = endpoints?.filter((e) => !e.isMissing) ?? [];
+
+  const moveBackup = (key: string, delta: number) => {
+    const keys = backupRefs.map((ref) => ref.key);
+    const index = keys.indexOf(key);
+    const target = index + delta;
+    if (index < 0 || target < 0 || target >= keys.length) return;
+    [keys[index], keys[target]] = [keys[target], keys[index]];
+    onSetBackups(keys);
+  };
+  const setBackupMembership = (key: string, member: boolean) => {
+    onSetBackups(
+      member
+        ? [...backupRefs.map((ref) => ref.key), key]
+        : backupRefs.map((ref) => ref.key).filter((k) => k !== key),
+    );
+  };
+  const addPinnedRoute = () => {
+    const selectors = pinSelectors
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line !== "" && !line.startsWith("#"));
+    if (!pinVia || selectors.length === 0) return;
+    const routes = pinnedRoutes.map((route) => ({
+      ...route,
+      selectors: [...route.selectors],
+    }));
+    const existing = routes.find((route) => route.endpointKey === pinVia);
+    if (existing) {
+      for (const selector of selectors) {
+        if (!existing.selectors.includes(selector)) existing.selectors.push(selector);
+      }
+    } else {
+      routes.push({ selectors, endpointKey: pinVia });
+    }
+    onSetPinnedRoutes(routes);
+    setPinSelectors("");
+  };
+  const removePinnedRoute = (key: string) => {
+    onSetPinnedRoutes(pinnedRoutes.filter((route) => route.endpointKey !== key));
+  };
 
   const openExternal = (url: string) => {
     if (isTauri()) {
@@ -621,11 +707,22 @@ export default function ProfileDetail({
           </div>
         )}
 
+        {os === "linux" && profile.backend === "xray" && (
+          <LinuxXrayPolicySection
+            profile={profile}
+            status={status}
+            endpoints={endpoints}
+            busy={profileBusy || failoverBusy || switching || refreshingSubscription}
+            onBusyChange={setPolicyBusy}
+            onSaved={onPolicySaved}
+          />
+        )}
+
         {profile.subscription && endpoints && (
           <div className="endpoint-section">
             <div className="endpoint-section-head">
               <span className="section-label">
-                {t("detail.endpoints")} · {endpoints.length}
+                {t("detail.endpoints")} · {liveEndpoints.length}
                 {switching && <span className="endpoint-note">{t("detail.switching")}</span>}
               </span>
               <button
@@ -644,33 +741,49 @@ export default function ProfileDetail({
                 {measuringAll
                   ? t("detail.testingProgress", {
                       done: Object.keys(delayResults ?? {}).length,
-                      total: endpoints.length,
+                      total: liveEndpoints.length,
                     })
                   : t("detail.testAll")}
               </button>
             </div>
+            {multinode && failover && (
+              <div className="endpoint-failover">
+                {failover.activeKey === "unavailable"
+                  ? t("All nodes are unavailable; traffic is blocked")
+                  : failover.failoverActive
+                    ? t("detail.onBackup", { name: endpointName(failover.activeKey) })
+                    : t("detail.onPrimary", { name: endpointName(failover.activeKey) })}
+                {failover.autoReturnPrimary &&
+                  ` · ${t("detail.autoReturnArmed")}`}
+              </div>
+            )}
             <ul className="endpoint-list">
               {endpoints.map((ep, i) => {
                 const res = delayResults?.[i];
                 const measuring = measuringEndpoints.has(`${profile.id}:${i}`);
+                const order = backupOrder.get(ep.key);
+                const live = failover?.nodes.find((n) => n.key === ep.key);
                 return (
-                  <li key={i}>
+                  <li key={ep.key} className="endpoint-row">
                     <button
                       type="button"
                       className={`endpoint-item ${ep.active ? "active" : ""}`}
-                      onClick={() => onSwitchEndpoint(i)}
+                      onClick={() => onSwitchEndpoint(ep.key)}
                       disabled={
+                        ep.isMissing ||
                         switching ||
                         refreshingSubscription ||
                         isBusy ||
                         ep.active
                       }
                       title={
-                        ep.active
-                          ? t("detail.activeEndpoint")
-                          : status.state === "running"
-                            ? t("detail.switchEndpointReconnect")
-                            : t("detail.switchEndpoint")
+                        ep.isMissing
+                          ? t("detail.missingEndpoint")
+                          : ep.active
+                            ? t("detail.activeEndpoint")
+                            : status.state === "running"
+                              ? t("detail.switchEndpointReconnect")
+                              : t("detail.switchEndpoint")
                       }
                     >
                       <span
@@ -679,6 +792,17 @@ export default function ProfileDetail({
                       <span className="endpoint-item-name">
                         {endpointDisplay?.names[i] ?? ep.name}
                       </span>
+                      {ep.isMissing && (
+                        <span className="badge badge-external">{t("detail.missing")}</span>
+                      )}
+                      {multinode && ep.isBackup && !ep.isMissing && (
+                        <span className="endpoint-proto">
+                          {t("detail.backupN", { n: (order ?? 0) + 1 })}
+                        </span>
+                      )}
+                      {multinode && ep.inPool && (
+                        <span className="endpoint-proto">{t("Backup pool")}</span>
+                      )}
                       {ep.protocol && (
                         <span className="endpoint-proto">{ep.protocol}</span>
                       )}
@@ -694,15 +818,154 @@ export default function ProfileDetail({
                           ) : (
                             t("detail.unreachable")
                           )
+                        ) : ep.isMissing ? (
+                          t("detail.unreachable")
+                        ) : live?.healthy === false ? (
+                          t("detail.nodeDown")
+                        ) : live?.latencyMs != null ? (
+                          t("detail.delayMs", { ms: live.latencyMs })
                         ) : (
                           "—"
                         )}
                       </span>
                     </button>
+                    {multinode && !ep.active && (
+                      <span className="endpoint-actions">
+                        {order !== undefined && order > 0 && (
+                          <button
+                            type="button"
+                            className="btn-ghost icon-btn"
+                            onClick={() => moveBackup(ep.key, -1)}
+                            disabled={failoverBusy || isBusy}
+                            title={t("detail.backupSooner")}
+                          >
+                            <ArrowUpIcon size={12} />
+                          </button>
+                        )}
+                        {order !== undefined &&
+                          order < backupRefs.length - 1 && (
+                            <button
+                              type="button"
+                              className="btn-ghost icon-btn"
+                              onClick={() => moveBackup(ep.key, 1)}
+                              disabled={failoverBusy || isBusy}
+                              title={t("detail.backupLater")}
+                            >
+                              <ArrowDownIcon size={12} />
+                            </button>
+                          )}
+                        <button
+                          type="button"
+                          className="btn-ghost icon-btn"
+                          onClick={() =>
+                            setBackupMembership(ep.key, order === undefined)
+                          }
+                          disabled={failoverBusy || isBusy}
+                          title={
+                            order === undefined
+                              ? t("detail.addBackup")
+                              : t("detail.removeBackup")
+                          }
+                        >
+                          {order === undefined ? (
+                            <PlusIcon size={12} />
+                          ) : (
+                            <CloseIcon size={12} />
+                          )}
+                        </button>
+                      </span>
+                    )}
                   </li>
                 );
               })}
             </ul>
+            {multinode && (backupRefs.length > 0 ||
+              (subscription?.poolKeys?.length ?? 0) > 0) && (
+              <div className="interface-row">
+                <span className="row-label">{t("detail.autoReturn")}</span>
+                <span className="row-value">
+                  <ToggleSwitch
+                    checked={subscription?.autoReturnPrimary ?? true}
+                    onChange={() =>
+                      onSetAutoReturn(!(subscription?.autoReturnPrimary ?? true))
+                    }
+                    disabled={failoverBusy || isBusy}
+                    title={t("detail.autoReturnTitle")}
+                  />
+                  <span className="row-hint">{t("detail.autoReturnHint")}</span>
+                </span>
+              </div>
+            )}
+            {multinode && applyOnReconnect && (
+              <div className="runtime-notice">{t("detail.applyOnReconnect")}</div>
+            )}
+            {multinode && (
+              <div className="pinned-section">
+                <span className="section-label">{t("detail.pinnedRoutes")}</span>
+                {pinnedRoutes.length === 0 && (
+                  <span className="row-hint">{t("detail.pinnedEmpty")}</span>
+                )}
+                <ul className="pinned-list">
+                  {pinnedRoutes.map((route) => (
+                    <li key={route.endpointKey}>
+                      <span className="pinned-node">
+                        {endpointName(route.endpointKey)}
+                        {route.missing && (
+                          <span className="badge badge-external">
+                            {t("detail.missing")}
+                          </span>
+                        )}
+                      </span>
+                      <span className="pinned-selectors mono">
+                        {route.selectors.join(", ")}
+                      </span>
+                      <button
+                        type="button"
+                        className="btn-ghost icon-btn"
+                        onClick={() => removePinnedRoute(route.endpointKey)}
+                        disabled={failoverBusy || isBusy}
+                        title={t("detail.unpinTitle")}
+                      >
+                        <CloseIcon size={12} />
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+                <div className="pinned-add">
+                  <select
+                    aria-label={t("detail.pinVia")}
+                    value={pinVia}
+                    onChange={(e) => setPinVia(e.target.value)}
+                    disabled={failoverBusy || isBusy}
+                  >
+                    <option value="">{t("detail.pinVia")}</option>
+                    {liveEndpoints
+                      .filter((e) => !e.active)
+                      .map((e, i) => (
+                        <option key={e.key} value={e.key}>
+                          {endpointDisplay?.names[endpoints.indexOf(e)] ?? (e.name || `#${i + 1}`)}
+                        </option>
+                      ))}
+                  </select>
+                  <input
+                    type="text"
+                    value={pinSelectors}
+                    onChange={(e) => setPinSelectors(e.target.value)}
+                    placeholder={t("detail.pinSelectorsPlaceholder")}
+                    disabled={failoverBusy || isBusy}
+                  />
+                  <button
+                    type="button"
+                    className="btn-sm btn-with-icon"
+                    onClick={addPinnedRoute}
+                    disabled={failoverBusy || isBusy || !pinVia || !pinSelectors.trim()}
+                  >
+                    <PlusIcon size={12} />
+                    {t("detail.pinAdd")}
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
         )}
       </div>

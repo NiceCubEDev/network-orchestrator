@@ -1,7 +1,8 @@
 import type {
   AlwaysOnListResult, BackendAvailability, ConditionalRuleEntry, ConditionalRouteRule,
-  ConfigAnalysis, DomainPolicy, NetIntentView, NetworkInterface, Profile, ProfileInspection,
-  RouteEntry, RouteMap, TunnelStatus, VpnAuthMode,
+  ConfigAnalysis, DomainPolicy, NetIntentView, NetworkInterface, NodePoolSettings, PinnedRoute,
+  PoolProbeEntry, Profile, ProfileInspection, RouteEntry, RouteMap, TunnelStatus, VpnAuthMode,
+  XrayPolicyPreview,
 } from "../types.ts";
 
 // This module intentionally has no I/O imports, fetch, or process calls.
@@ -16,7 +17,10 @@ function profile(id: string, name: string, backend: Profile["backend"], cidr?: s
     xrayHttpPort: backend === "xray" ? 10809 : null,
     useSystemProxy: false, proxyBypass: [], subscription: null,
     xrayMode: "socks", xrayTunInterface: null, xrayTunIp: null,
+    pinnedPolicies: [],
     endpointBypasses,
+    // Linux TUN flag; the fixture profiles are SOCKS so it stays off.
+    xrayQuicReject: false,
   };
 }
 
@@ -111,6 +115,9 @@ export class SandboxBackend {
     "AcmeVPN · 🇯🇵 Япония", "AcmeVPN · 🇺🇸 США", "AcmeVPN · 🇧🇷 Бразилия",
     "AcmeVPN · 🇸🇬 Сингапур", "AcmeVPN · 🇬🇧 Великобритания",
   ];
+  private endpointKeys = this.endpoints.map((_, i) => `00000000000000${(i + 1).toString(16).padStart(2, "0")}`);
+  // Independent synthetic measurements, not countries inferred from names.
+  private readonly exitCountries = ["NL", "NL", "FI", "JP", "US", "BR", "SG", "GB"];
   private backendPaths = new Map<string, string>();
   private xrayManaged = false;
   private condRules: ConditionalRuleEntry[] = [
@@ -130,8 +137,23 @@ export class SandboxBackend {
     // QA WireGuard wants the same interface the external wg-home tunnel holds:
     // demonstrates the "interface occupied" conflict until it is connected.
     this.profiles[0].interfaceName = "wg-home";
-    this.profiles[2].subscription = {
+    const sub = this.profiles[2];
+    sub.subscription = {
       url: "", hwid: "", endpointCount: this.endpoints.length, activeIndex: 0,
+      activeKey: this.endpointKeys[0],
+      backupKeys: [
+        { key: this.endpointKeys[1], name: this.endpoints[1] },
+        { key: "deadbeefdeadbeef", name: "AcmeVPN · 🇵🇱 Польша" },
+      ],
+      autoReturnPrimary: true,
+      nodePool: {
+        filters: [
+          { nameContains: ["Герман"], exitCountry: "DE" },
+          { nameContains: ["Великобритан"], exitCountry: "GB" },
+        ],
+        verifyExitCountry: true,
+      },
+      poolKeys: [{ key: this.endpointKeys[7], name: this.endpoints[7] }],
       refreshIntervalMinutes: null, lastRefreshAtUnix: null, lastRefreshError: null,
       providerTitle: "AcmeVPN",
       announce: "Maintenance window on Saturday 03:00–05:00 UTC.\nNL endpoints may flap briefly.",
@@ -140,6 +162,101 @@ export class SandboxBackend {
       updateIntervalHours: 12,
       skippedProtocols: ["trojan", "ss"],
       userInfo: { uploadBytes: 1048576, downloadBytes: 2097152, totalBytes: 1073741824, expiresAtUnix: Math.floor(Date.now() / 1000) + 5 * 86400 },
+    };
+    // One pinned route, plus one whose node left the list (fail-closed demo).
+    sub.pinnedPolicies = [
+      { selectors: ["domain:bank.example", "geosite:category-gov"], endpointKey: this.endpointKeys[4] },
+      { selectors: ["domain:only-pl.example"], endpointKey: "deadbeefdeadbeef", missing: true },
+    ];
+    // Linux subscription profiles run as daemon TUN tunnels — needed for the
+    // QUIC-reject toggle to be visible in the sandbox.
+    sub.xrayMode = "tun";
+  }
+
+  private poolMembers(profile: Profile) {
+    const sub = profile.subscription;
+    if (!sub?.nodePool) return [];
+    const explicit = new Set([
+      sub.activeKey ?? this.endpointKeys[sub.activeIndex],
+      ...(sub.backupKeys ?? []).map((node) => node.key),
+      ...(profile.pinnedPolicies ?? []).map((route) => route.endpointKey),
+      profile.xrayDns?.outboundKey,
+    ]);
+    return (sub.poolKeys ?? []).filter((node) => !explicit.has(node.key));
+  }
+
+  private flagCountry(name: string): string | null {
+    const indicators = Array.from(name).map((character) => character.codePointAt(0)!)
+      .filter((code) => code >= 0x1f1e6 && code <= 0x1f1ff);
+    return indicators.length === 2
+      ? String.fromCharCode(...indicators.map((code) => code - 0x1f1e6 + 65))
+      : null;
+  }
+
+  private rebuildPool(p: Profile) {
+    const subscription = p.subscription;
+    const pool = subscription?.nodePool;
+    if (!subscription || !pool) throw new Error("Set backup-pool filters before rebuilding the pool");
+    const primary = subscription.activeKey ?? this.endpointKeys[subscription.activeIndex];
+    const explicit = new Set([primary, ...(subscription.backupKeys ?? []).map((node) => node.key),
+      ...(p.pinnedPolicies ?? []).map((route) => route.endpointKey), p.xrayDns?.outboundKey]);
+    const capacity = Math.max(0, 8 - 1 - (subscription.backupKeys?.length ?? 0));
+    let selected = 0;
+    let candidates = 0;
+    const entries = this.endpoints.flatMap<PoolProbeEntry>((name, index) => {
+      const filters = pool.filters.filter((filter) => filter.nameContains.length === 0 ||
+        filter.nameContains.some((term) => name.toLowerCase().includes(term.toLowerCase())));
+      if (filters.length === 0) return [];
+      const key = this.endpointKeys[index];
+      if (explicit.has(key)) return [{ key, name, verdict: "explicit", exitCountry: null }];
+      if (candidates++ >= 32) return [{ key, name, verdict: "skipped", exitCountry: null }];
+      const exitCountry = pool.verifyExitCountry ? this.exitCountries[index] : null;
+      const accepted = !pool.verifyExitCountry ||
+        filters.some((filter) => filter.exitCountry?.toUpperCase() === exitCountry);
+      const verdict: PoolProbeEntry["verdict"] = !accepted ? "wrongCountry"
+        : selected >= capacity ? "skipped" : "member";
+      if (verdict === "member") selected++;
+      return [{ key, name, verdict, exitCountry }];
+    });
+    let members = entries.filter((entry) => entry.verdict === "member")
+      .map((entry) => ({ key: entry.key, name: entry.name }));
+    const previous = subscription.poolKeys ?? [];
+    let keptPrevious = false;
+    if (members.length === 0) {
+      const seen = new Set<string>();
+      members = previous.filter((node) => {
+        const index = this.endpointKeys.indexOf(node.key);
+        if (explicit.has(node.key) || seen.has(node.key) ||
+          entries.some((entry) => entry.key === node.key && entry.verdict === "wrongCountry")) return false;
+        seen.add(node.key);
+        return index < 0 || pool.filters.some((filter) => filter.nameContains.length === 0 ||
+          filter.nameContains.some((term) => this.endpoints[index].toLowerCase().includes(term.toLowerCase())));
+      }).slice(0, capacity);
+      keptPrevious = members.length > 0;
+    }
+    const poolChanged = JSON.stringify(members) !== JSON.stringify(previous);
+    subscription.poolKeys = members;
+    return { probedAtUnix: Math.floor(Date.now() / 1000),
+      members, entries, poolChanged, keptPrevious };
+  }
+
+  private migrationPreview(p: Profile, path: string): XrayPolicyPreview {
+    const conflict = (p.pinnedPolicies ?? []).some((route) =>
+      route.selectors.includes("domain:ai.example") && route.endpointKey !== this.endpointKeys[0]);
+    return {
+      direct: 2, proxy: 1, block: 0, pinnedCount: p.subscription ? 1 : 0,
+      privateLanDirect: false, quicReject: true,
+      domainStrategy: "ipIfNonMatch", domainMatcher: null,
+      endpointBypassCount: 1, hasGeoipOverride: true, hasGeositeOverride: true,
+      hasDns: true, hasSockopts: true,
+      trafficRuleCount: 2, interfaceRouteCount: 1, dnsServerCount: 1, dnsHostCount: 1,
+      dnsRewriteRuleCount: 3, tunDnsServerCount: 2, tunMtu: 8500,
+      connectionIdleSecs: 120, directDomainStrategy: "ForceIPv4",
+      dnsEnableParallelQuery: false, hasDnsOutbound: true,
+      backupCount: p.subscription ? 2 : null,
+      skipped: ["wrapperInbound"],
+      refused: path.includes("unsupported") ? ["unsupportedRule"]
+        : conflict ? ["conflictingPinnedRoute"] : [],
     };
   }
 
@@ -162,7 +279,48 @@ export class SandboxBackend {
   }
 
   private statuses(): TunnelStatus[] {
-    return this.profiles.map((p) => ({ profileId: p.id, state: this.running.has(p.id) ? "running" : "stopped", message: null }));
+    return this.profiles.map((p) => {
+      const running = this.running.has(p.id);
+      const sub = p.subscription;
+      const keys = sub ? [...new Set([
+        sub.activeKey ?? this.endpointKeys[sub.activeIndex],
+        ...(sub.backupKeys ?? []).map((node) => node.key),
+        ...this.poolMembers(p).map((node) => node.key),
+      ])].filter((key) => this.endpointKeys.includes(key)).slice(0, 8) : [];
+      const multinode = (sub?.backupKeys?.length ?? 0) > 0 ||
+        this.poolMembers(p).length > 0 ||
+        (p.pinnedPolicies?.length ?? 0) > 0 || Boolean(p.xrayDns?.outboundKey);
+      const failover = running && sub && multinode
+        ? {
+            primaryKey: keys[0],
+            activeKey: keys[1] ?? keys[0],
+            autoReturnPrimary: sub.autoReturnPrimary ?? true,
+            failoverActive: keys.length > 1,
+            nodes: keys.map((key, index) => ({
+              key, healthy: index > 0 || keys.length === 1,
+              lastProbeUnix: Math.floor(Date.now() / 1000) - 30,
+              latencyMs: index > 0 || keys.length === 1 ? 62 : null,
+            })),
+          } : null;
+      // Recovery diagnostics the daemon reports while a daemon-managed xray
+      // tunnel runs — bounded, sanitized fields only.
+      const watchdog = running && p.backend === "xray" && p.xrayMode === "tun"
+        ? {
+            uplink: true,
+            egressSignature: "6f34752319a0e831",
+            lastEgressChangeUnix: Math.floor(Date.now() / 1000) - 3600,
+            httpsStallStreak: 0,
+            httpsLatencyMs: 240,
+            dnsStallStreak: 0,
+            pinnedStalled: [],
+            xrayUdpSockets: 312,
+            connStorm: null,
+            lastRecoveryUnix: null,
+            anomalies: [],
+          }
+        : null;
+      return { profileId: p.id, state: running ? "running" as const : "stopped" as const, message: null, failover, watchdog };
+    });
   }
 
   private interfaces(): NetworkInterface[] {
@@ -277,6 +435,10 @@ export class SandboxBackend {
         if (!p.id || !p.name?.trim()) throw new Error("Profile name is required");
         const existing = this.profiles.find((e) => e.id === p.id);
         if (existing) this.stopped(existing);
+        // Mirrors the Tauri command: failover settings are owned by their own
+        // commands, a generic form save never drops them.
+        p.subscription = existing?.subscription ?? p.subscription;
+        p.pinnedPolicies = existing?.pinnedPolicies ?? p.pinnedPolicies;
         if (command === "save_vless_profile") { p.configPath = `/sandbox/${p.id}.json`; this.allocateProxyPorts(p); }
         if (command === "save_wireguard_profile") p.configPath = `/sandbox/${p.id}.conf`;
         this.profiles = [...this.profiles.filter((e) => e.id !== p.id), p];
@@ -324,16 +486,157 @@ export class SandboxBackend {
       }
       case "get_subscription_endpoints": {
         const p = this.find(args.profileId);
-        return this.endpoints.map((name, i) => ({
-          name,
-          active: p.subscription?.activeIndex === i,
-          protocol: i === 0 ? "VLESS · Reality" : i === 1 ? "VLESS · TLS" : "Hysteria2",
-        }));
+        const backups = new Set((p.subscription?.backupKeys ?? []).map((ref) => ref.key));
+        const listed = new Set(this.endpointKeys);
+        const missing = (p.subscription?.backupKeys ?? [])
+          .filter((ref) => !listed.has(ref.key))
+          .map((ref) => ({
+            key: ref.key, name: ref.name, active: false,
+            protocol: null, isBackup: true, isMissing: true,
+          }));
+        return [
+          ...this.endpoints.map((name, i) => ({
+            key: this.endpointKeys[i],
+            name,
+            active: p.subscription?.activeIndex === i,
+            protocol: i === 0 ? "VLESS · Reality" : i === 1 ? "VLESS · TLS" : "Hysteria2",
+            isBackup: backups.has(this.endpointKeys[i]),
+            isMissing: false,
+            inPool: this.poolMembers(p).some((node) => node.key === this.endpointKeys[i]),
+          })),
+          ...missing,
+        ];
       }
       case "switch_subscription_endpoint": {
         const p = this.find(args.profileId); this.stopped(p);
-        if (!p.subscription || !Number.isInteger(args.endpointIndex) || Number(args.endpointIndex) < 0 || Number(args.endpointIndex) >= this.endpoints.length) throw new Error("Invalid endpoint index");
-        p.subscription.activeIndex = Number(args.endpointIndex); return this.profiles;
+        const index = this.endpointKeys.indexOf(String(args.endpointKey));
+        if (!p.subscription || index < 0) throw new Error("Invalid endpoint key");
+        p.subscription.activeIndex = index;
+        p.subscription.activeKey = this.endpointKeys[index];
+        return this.profiles;
+      }
+      case "set_subscription_backups": {
+        const p = this.find(args.profileId);
+        if (!p.subscription) throw new Error("Not a subscription profile");
+        const keys = (args.backupKeys as string[] ?? []);
+        p.subscription.backupKeys = keys.map((key) => {
+          const index = this.endpointKeys.indexOf(key);
+          const known = p.subscription!.backupKeys?.find((ref) => ref.key === key);
+          return { key, name: index >= 0 ? this.endpoints[index] : known?.name ?? key };
+        });
+        return this.profiles;
+      }
+      case "set_subscription_auto_return": {
+        const p = this.find(args.profileId);
+        if (!p.subscription) throw new Error("Not a subscription profile");
+        p.subscription.autoReturnPrimary = Boolean(args.enabled);
+        return this.profiles;
+      }
+      case "set_pinned_routes": {
+        const p = this.find(args.profileId);
+        if (!p.subscription) throw new Error("Not a subscription profile");
+        const listed = new Set(this.endpointKeys);
+        p.pinnedPolicies = ((args.routes as PinnedRoute[]) ?? []).map((route) => ({
+          ...route,
+          missing: !listed.has(route.endpointKey),
+        }));
+        return this.profiles;
+      }
+      case "set_subscription_node_pool": {
+        const p = this.find(args.profileId);
+        if (!p.subscription) throw new Error("Not a subscription profile");
+        const pool = (args.pool ?? null) as NodePoolSettings | null;
+        if (pool && (pool.filters.length < 1 || pool.filters.length > 8 ||
+          pool.filters.some((filter) => filter.nameContains.length > 4 ||
+            filter.nameContains.some((term) => !term.trim() || Array.from(term).length > 64) ||
+            (pool.verifyExitCountry ? !/^[A-Za-z]{2}$/.test(filter.exitCountry ?? "")
+              : Boolean(filter.exitCountry) || filter.nameContains.length === 0)))) {
+          throw new Error("Invalid pool filters");
+        }
+        if (JSON.stringify(pool) !== JSON.stringify(p.subscription.nodePool ?? null)) {
+          p.subscription.poolKeys = [];
+        }
+        p.subscription.nodePool = pool;
+        if (!pool) p.subscription.poolKeys = [];
+        return this.profiles;
+      }
+      case "rebuild_subscription_node_pool":
+        return this.rebuildPool(this.find(args.profileId));
+      case "verify_subscription_exits": {
+        const p = this.find(args.profileId);
+        const sub = p.subscription;
+        if (!sub) throw new Error("Not a subscription profile");
+        const chain = [...new Set([
+          sub.activeKey ?? this.endpointKeys[sub.activeIndex],
+          ...(sub.backupKeys ?? []).map((node) => node.key),
+          ...this.poolMembers(p).map((node) => node.key),
+        ])].filter((key) => this.endpointKeys.includes(key)).slice(0, 8);
+        return chain.map((key) => {
+          const index = this.endpointKeys.indexOf(key);
+          const name = this.endpoints[index];
+          const named = this.flagCountry(name);
+          const exit = this.exitCountries[index];
+          return {
+            key, name, role: key === (sub.activeKey ?? this.endpointKeys[sub.activeIndex])
+              ? "primary" : sub.backupKeys?.some((node) => node.key === key) ? "backup" : "pool",
+            namedCountry: named, exitCountry: exit, exitIp: `198.51.100.${10 + index}`,
+            mismatch: named !== null && named !== exit, error: null,
+          };
+        });
+      }
+      case "preview_xray_policy_migration": {
+        const p = this.find(args.profileId); this.stopped(p);
+        if (p.backend !== "xray") throw new Error("Policy migration requires an Xray profile");
+        return this.migrationPreview(p, String(args.path ?? ""));
+      }
+      case "apply_xray_policy_migration": {
+        const p = this.find(args.profileId); this.stopped(p);
+        if (p.backend !== "xray") throw new Error("Policy migration requires an Xray profile");
+        const preview = this.migrationPreview(p, String(args.path ?? ""));
+        if (preview.refused.length) throw new Error("Policy migration refused unsupported or conflicting settings");
+        p.domainPolicies = [
+          { domains: ["domain:home.example", "domain:gov.example"], target: "direct" },
+          { domains: ["domain:video.example"], target: "proxy" },
+        ];
+        p.privateLanDirect = false;
+        p.xrayQuicReject = true;
+        p.xrayDomainStrategy = "ipIfNonMatch";
+        p.xraySockopts = { tcpKeepAliveIdle: 30, tcpKeepAliveInterval: 10,
+          tcpUserTimeout: 20000, tcpNoDelay: true };
+        p.xrayTrafficRules = [
+          { ips: ["203.0.113.53"], port: 53, network: "tcp,udp", target: "direct" },
+          { ips: ["203.0.113.54"], port: 853, network: "tcp", target: "direct" },
+        ];
+        p.xrayInterfaceRoutes = [{ selectors: ["domain:mesh.example", "10.9.0.0/16"],
+          interfaceName: "qa-mesh", domainStrategy: "ForceIPv4" }];
+        p.xrayConnectionIdleSecs = 120;
+        p.xrayTunMtu = 8500;
+        p.xrayTunDnsServers = ["1.1.1.1", "8.8.8.8"];
+        p.xrayDirectDomainStrategy = "ForceIPv4";
+        p.endpointBypasses = ["10.8.0.20"];
+        p.xrayGeoipUrl = "https://example.invalid/synthetic/geoip.dat";
+        p.xrayGeositeUrl = "https://example.invalid/synthetic/geosite.dat";
+        p.xrayDns = {
+          servers: [{ address: "1.1.1.1", port: null, domains: [], skipFallback: false, route: "proxy" }],
+          hosts: { "synthetic.test": ["203.0.113.80"] }, fakeDns: false,
+          queryStrategy: "useIpv4", enableParallelQuery: false,
+          outboundKey: p.subscription ? this.endpointKeys[1] : null,
+          outbound: { rewriteAddress: "9.9.9.9", rewriteNetwork: "udp", rewritePort: 53,
+            rules: [{ action: "return", qType: "65,28", rCode: 5 },
+              { action: "hijack", qType: "1", domain: ["domain:synthetic.test"] },
+              { action: "direct" }] },
+        };
+        if (p.subscription) {
+          p.subscription.backupKeys = [2, 7].map((index) => ({
+            key: this.endpointKeys[index], name: this.endpoints[index],
+          }));
+          const route = { selectors: ["domain:ai.example"], endpointKey: this.endpointKeys[0] };
+          if (!p.pinnedPolicies?.some((existing) => existing.endpointKey === route.endpointKey &&
+            existing.selectors.includes("domain:ai.example"))) {
+            p.pinnedPolicies = [...(p.pinnedPolicies ?? []), route];
+          }
+        }
+        return this.profiles;
       }
       case "set_subscription_refresh_interval": {
         const p = this.find(args.profileId);
@@ -344,7 +647,8 @@ export class SandboxBackend {
         const p = this.find(args.id); this.stopped(p);
         if (!p.subscription) throw new Error("Not a subscription profile");
         p.subscription.lastRefreshAtUnix = Math.floor(Date.now() / 1000);
-        return { endpointCount: this.endpoints.length, activeIndex: p.subscription.activeIndex, skippedCount: 0, fallbackUsed: false, cleanupFailed: false };
+        const poolReport = p.subscription.nodePool ? this.rebuildPool(p) : null;
+        return { endpointCount: this.endpoints.length, activeIndex: p.subscription.activeIndex, skippedCount: 0, fallbackUsed: false, cleanupFailed: false, poolReport };
       }
       case "measure_subscription_endpoint_delay": {
         // Deterministic synthetic latency with a real wait, so the browser
@@ -386,15 +690,15 @@ export class SandboxBackend {
       }
       case "get_backend_availability": return (["wireGuard", "openVpn", "xray"] as const).map((backend): BackendAvailability => {
         if (backend === "xray" && this.xrayManaged) {
-          return { backend, available: true, path: "/usr/lib/network-orchestrator/xray/v26.3.27/xray", source: "managed", version: "v26.3.27", message: "Simulated managed package; nothing is launched." };
+          return { backend, available: true, path: "/usr/lib/network-orchestrator/xray/v26.10.31/xray", source: "managed", version: "v26.10.31", message: "Simulated managed package; nothing is launched." };
         }
         if (backend === "xray") {
           return { backend, available: false, path: this.backendPaths.get(backend) ?? null, source: this.backendPaths.has(backend) ? "configured" : null, version: null, message: "Xray unavailable; TUN requires verified package Xray and network daemon." };
         }
         return { backend, available: true, path: this.backendPaths.get(backend) ?? `/sandbox/bin/${backend}`, source: this.backendPaths.has(backend) ? "configured" : "autoDetected", version: null, message: "Simulated executable; nothing is launched." };
       });
-      case "get_managed_xray_offer": return { version: "v26.3.27", sourceUrl: "https://github.com/XTLS/Xray-core/releases/download/v26.3.27/Xray-linux-64.zip", sha256: "23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae", maxDownloadBytes: 64 * 1024 * 1024 };
-      case "install_managed_xray": this.xrayManaged = true; return "/usr/lib/network-orchestrator/xray/v26.3.27/xray";
+      case "get_managed_xray_offer": return { version: "v26.10.31", sourceUrl: "https://github.com/XTLS/Xray-core/releases/download/v26.10.31/Xray-linux-64.zip", sha256: "e4bd9119f50ae7c41658b1abd0679ae06f98bd864a2907ff33f2f2cf7081b214", maxDownloadBytes: 64 * 1024 * 1024 };
+      case "install_managed_xray": this.xrayManaged = true; return "/usr/lib/network-orchestrator/xray/v26.10.31/xray";
       case "remove_managed_xray": this.xrayManaged = false; this.backendPaths.delete("xray"); return null;
       case "cancel_managed_xray_install": return null;
       case "set_backend_executable": this.backendPaths.set(String(args.backend), String(args.path)); return null;

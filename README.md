@@ -60,6 +60,114 @@ daemon plus `wireguard-tools` or `openvpn`; per-link DNS needs
 No backend is silently downloaded or updated; the Profiles tab shows which
 backends were found.
 
+### Linux Xray subscriptions: backups and pinned nodes
+
+One Xray TUN can use a primary subscription server, an ordered chain of
+backups, and independent nodes for domain rules. In Profiles, use the
+endpoint-row controls to add/reorder backups and the **Pinned to a node**
+section to assign domain selectors. These settings are shared with `netorch`:
+
+```bash
+netorch endpoints work
+netorch backup set work "Germany" "Finland"
+netorch backup show work
+netorch route pin work --via "Netherlands" --selector domain:example.com
+netorch route show work
+netorch up work
+netorch status work
+```
+
+Servers may be selected by number, name, or a unique name fragment.
+`backup add|rm|clear` edits the chain; `route unpin` removes a pin.
+Settings saved while connected take effect on reconnect.
+
+The daemon probes each candidate through that node using HTTPS
+(`https://connectivitycheck.gstatic.com/generate_204` by default).
+It prefers the primary, tries backups in their saved order, and automatically
+returns when the primary recovers. `backup auto work off` keeps a healthy
+backup instead. Probes contact an external service and reveal the node's
+exit IP to it. Two consecutive failed/successful observations change a known
+node's health; checks are bounded but switching is not instantaneous.
+Existing connections may break when an exit changes.
+
+Pinned traffic never falls back to another node or direct. A missing pinned
+server stays configured and blocks its selectors; missing backup servers
+are retained but skipped. If all default-path candidates fail, that traffic
+is blocked; explicit direct rules still remain direct. This is not an
+OS-level kill switch when the whole tunnel is stopped.
+
+#### Filtered backup pools and exit-country checks
+
+Pools are opt-in and come after explicit backups in the eight-node default
+chain. Primary, manual backups, domain pins and the fixed DNS node are never
+automatically recruited into a pool.
+
+```bash
+netorch backup pool set work 'CA:Canada|Канада' 'FI:'
+netorch backup pool rebuild work
+netorch backup pool show work
+netorch backup verify work
+netorch backup pool clear work
+```
+
+`CC:words` matches any supplied name term and requires the measured country;
+`CC:` accepts any name with that measured exit country. A flag or country in a
+server name is only a hint, not verification. Name-only selection is explicit:
+`netorch backup pool set work --no-verify 'Canada|Канада'`.
+It does not require Xray or make country requests.
+
+Verified rebuilds and `backup verify` run temporary unprivileged loopback Xray
+processes and contact `api.country.is` / `ipinfo.io` through each candidate.
+Those services see its exit IP; no host routes are changed. Rebuilds bound
+candidate count, concurrency, response size and duration. Enabled pools also
+rebuild after subscription refresh. An outage retains eligible previous
+members, but a positively wrong country or a newly explicit choice removes a
+member. Clearing the pool leaves manual backups and pins unchanged.
+
+#### Importing an existing Xray policy
+
+```bash
+netorch migrate preview work --from "$HOME/vpn/config.json"
+netorch migrate apply work --from "$HOME/vpn/config.json"
+netorch route quic work on
+```
+
+The app exposes the same operations under **Backup pool** and **Import local
+Xray policy**. Disconnect before applying. Import reads the source without
+changing it; previews show counts, supported settings and refusal categories,
+not configuration contents or credentials.
+
+The importer maps nodes against the subscription and preserves the selected
+primary. It transfers representable domain/IP rules, fixed domain and DNS
+egress, DNS rewriting/scheduling, IP/port guards, interface-bound policies,
+connection idle and socket settings, TUN MTU/DNS and custom geodata URLs.
+A source default balancer becomes an ordered explicit backup chain rather than
+least-ping load balancing. Existing pins are retained; conflicting pins and
+unrepresentable conditions block the entire apply. Dedicated
+`proxy-ru` / `proxy-nl` / `direct` wrapper listeners are not imported.
+
+Linux's pinned Xray is **26.10.31**, including DNS rewrite support. Its bundled
+GeoIP Lite / GeoSite Standard data differs from older full country databases;
+custom imported geodata URLs remain explicit overrides.
+Use TLS or Reality for public VLESS endpoints; unencrypted VLESS test peers
+must use private addresses with this backend.
+
+#### Recovery and QUIC
+
+The daemon observes the physical gateway, device and selected source. An
+unchanged DHCP renewal does not reset established connections; a real underlay
+change rebinds owned endpoint bypasses and restarts only its managed child.
+Offline recovery waits for the uplink. Bounded HTTPS/DNS probes, fixed-pin
+health, owned-child UDP socket counts and inner application connection storms
+are visible in the profile and CLI status. DNS-only failures and connection
+storms are diagnostic, not reasons to reset a healthy HTTPS path.
+
+`route quic … on` installs an owned, tunnel-scoped UDP/443 **REJECT** using
+`nftables`, so clients can immediately fall back to TCP. `off` removes that rule;
+it does not install a silent drop. Disconnect removes only the daemon's table.
+
+
+
 ## Features (MVP-0–4)
 
 - **Network Explorer** — interface inventory (addresses, DNS, MTU, state),

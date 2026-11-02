@@ -5,10 +5,15 @@
 use super::args::{RouteCommand, RuleArgs};
 use super::commands::Output;
 use super::ctx::Ctx;
+use super::endpoints;
 use super::library::require_user;
-use net_manager_core::models::{DomainPolicy, DomainRouteTarget, Profile, TunnelBackend};
+use net_manager_core::models::{
+    DomainPolicy, DomainRouteTarget, PinnedRoute, Profile, TunnelBackend, TunnelState,
+};
 use net_manager_core::route_check::{check_route, GeoDbs, GeoIpDb, GeoSiteDb};
+use net_manager_core::subscription;
 use net_manager_core::xray::{self, ProfileRoutingOptions};
+use net_manager_engine::linux_engine::LinuxEngine;
 use serde_json::{json, Value};
 use std::net::IpAddr;
 use std::path::Path;
@@ -16,7 +21,7 @@ use std::path::Path;
 /// Where the daemon's package keeps the pinned Xray and its geo lists.
 const XRAY_DIR: &str = "/usr/lib/network-orchestrator/xray";
 /// The core's `LINUX_XRAY_VERSION`, which only exists in Linux builds.
-const XRAY_VERSION: &str = "v26.3.27";
+const XRAY_VERSION: &str = "v26.10.31";
 const MAX_GEO_ASSET_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Xray takes the first matching rule, so blocks win over proxy over direct.
@@ -42,6 +47,17 @@ pub fn run(ctx: &Ctx, command: RouteCommand) -> Result<Output, String> {
             &profile,
             &Path::new(XRAY_DIR).join(XRAY_VERSION),
         ),
+        RouteCommand::Pin {
+            profile,
+            via,
+            selector,
+        } => pin(ctx, &profile, &via, &selector),
+        RouteCommand::Unpin {
+            profile,
+            via,
+            selector,
+        } => unpin(ctx, &profile, &via, &selector),
+        RouteCommand::Quic { profile, enabled } => quic(ctx, &profile, enabled),
     }
 }
 
@@ -69,6 +85,11 @@ fn rules_json(profile: &Profile) -> Value {
         "proxy": selectors_of(&profile.domain_policies, DomainRouteTarget::Proxy),
         "direct": selectors_of(&profile.domain_policies, DomainRouteTarget::Direct),
         "privateLanDirect": profile.private_lan_direct,
+        "quicReject": profile.xray_quic_reject,
+        "pinned": profile.pinned_policies.iter().map(|route| {
+            json!({"endpointKey": route.endpoint_key,
+                "missing": route.missing, "selectors": route.selectors})
+        }).collect::<Vec<_>>(),
     })
 }
 
@@ -98,6 +119,28 @@ fn rules_text(rules: &Value) -> String {
         "\n  lan-direct  {}",
         rules["privateLanDirect"].as_bool().unwrap_or(false)
     ));
+    out.push_str(&format!(
+        "\n  quic-reject {}",
+        rules["quicReject"].as_bool().unwrap_or(false)
+    ));
+    for pinned in rules["pinned"].as_array().into_iter().flatten() {
+        let selectors: Vec<&str> = pinned["selectors"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        out.push_str(&format!(
+            "\n  pinned {}  {}{}",
+            pinned["endpointKey"].as_str().unwrap_or_default(),
+            selectors.join(", "),
+            if pinned["missing"].as_bool().unwrap_or(false) {
+                "  (node gone from the subscription)"
+            } else {
+                ""
+            }
+        ));
+    }
     out
 }
 
@@ -157,6 +200,23 @@ fn hints(selectors: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// A selector already pinned to one node cannot join a routing rule: both
+/// decisions are first-match, and the pinned one is fail-closed.
+fn check_not_pinned(profile: &Profile, selectors: &[String]) -> Result<(), String> {
+    for selector in selectors {
+        if let Some(route) = profile
+            .pinned_policies
+            .iter()
+            .find(|route| route.selectors.contains(selector))
+        {
+            return Err(format!(
+                "{selector} is pinned to {}; unpin it first (`netorch route unpin`)",
+                route.endpoint_key
+            ));
+        }
+    }
+    Ok(())
+}
 /// The selectors of one list given on the command line, checked and unique.
 struct Wanted {
     target: DomainRouteTarget,
@@ -222,6 +282,7 @@ fn set(ctx: &Ctx, query: &str, rules: &RuleArgs, lan_direct: bool) -> Result<Out
         ..
     } in wanted(rules)?
     {
+        check_not_pinned(&profile, &domains)?;
         notes.extend(hints(&domains));
         if !domains.is_empty() {
             policies.push(DomainPolicy { domains, target });
@@ -260,6 +321,7 @@ fn edit(ctx: &Ctx, query: &str, rules: &RuleArgs, how: Edit) -> Result<Output, S
             let present = selectors_of(&policies, target).contains(&selector);
             match how {
                 Edit::Add => {
+                    check_not_pinned(&profile, std::slice::from_ref(&selector))?;
                     if let Some((other, _)) = holder {
                         return Err(format!(
                             "{selector} is already in the {other} list; remove it there first"
@@ -292,6 +354,209 @@ fn edit(ctx: &Ctx, query: &str, rules: &RuleArgs, how: Edit) -> Result<Output, S
     save(ctx, profile, policies, notes)
 }
 
+/// The node a pin targets: a server of the subscription (number, name part)
+/// or a raw key — a node that left the list may still be pinned so its
+/// selectors wake up when it comes back.
+fn pin_key(ctx: &Ctx, profile: &Profile, via: &str) -> Result<(String, String), String> {
+    if profile.subscription.is_none() {
+        return Err("Pinned rules need a subscription profile".into());
+    }
+    let rows = endpoints::list_rows(ctx, profile)?;
+    let key = endpoints::backup_key(&rows, via)?;
+    let name = rows
+        .iter()
+        .find(|row| row.key == key)
+        .map(|row| row.name.clone())
+        .unwrap_or_else(|| key.clone());
+    Ok((key, name))
+}
+
+fn save_pins(ctx: &Ctx, profile: &Profile, routes: Vec<PinnedRoute>) -> Result<(), String> {
+    subscription::set_pinned_routes(&ctx.vault(), &ctx.store(), &profile.id, routes)
+        .map_err(|error| match error.kind() {
+            std::io::ErrorKind::InvalidInput => error.to_string(),
+            _ => "The pinned rules could not be saved. Check file permissions.".into(),
+        })
+        .map(|_| ())
+}
+
+/// Whether the tunnel is up: changes are stored either way, the notice tells
+/// the user a reconnect puts them into effect. A daemon error counts as
+/// "unknown" → treat as running so the notice is always safe.
+fn running(ctx: &Ctx, profile: &Profile) -> bool {
+    !LinuxEngine::handles(profile)
+        || ctx
+            .engine
+            .status(profile)
+            .map(|status| status.state != TunnelState::Stopped)
+            .unwrap_or(true)
+}
+
+/// The notice that a stored change reaches the tunnel only on reconnect.
+fn apply_note(running: bool) -> &'static str {
+    if running {
+        "\nSaved; reconnect to apply (`netorch down` then `netorch up`)."
+    } else {
+        ""
+    }
+}
+
+/// Pins selectors to one node: while that node is down or gone from the
+/// subscription the selectors are blocked — never sent direct or through
+/// another server.
+fn pin(ctx: &Ctx, query: &str, via: &str, selectors: &[String]) -> Result<Output, String> {
+    require_user(ctx)?;
+    let profile = xray_profile(ctx, query)?;
+    let (key, name) = pin_key(ctx, &profile, via)?;
+    let mut checked = Vec::new();
+    for selector in selectors {
+        let selector = valid_selector(selector)?;
+        if is_address(&selector) || selector.starts_with("geoip:") {
+            return Err(format!(
+                "Pinned rules take domain selectors only ({selector}); send addresses \
+                 through --proxy/--direct/--block instead"
+            ));
+        }
+        if !checked.contains(&selector) {
+            checked.push(selector);
+        }
+    }
+    let mut routes = profile.pinned_policies.clone();
+    for selector in &checked {
+        if let Some(other) = routes
+            .iter()
+            .find(|route| route.endpoint_key != key && route.selectors.contains(selector))
+        {
+            return Err(format!(
+                "{selector} is pinned to {}; remove it there first (`netorch route unpin`)",
+                other.endpoint_key
+            ));
+        }
+        if profile
+            .domain_policies
+            .iter()
+            .any(|policy| policy.domains.contains(selector))
+        {
+            return Err(format!(
+                "{selector} is already a routing rule; remove it there first (`netorch route rm`)"
+            ));
+        }
+    }
+    match routes.iter_mut().find(|route| route.endpoint_key == key) {
+        Some(route) => {
+            for selector in &checked {
+                if !route.selectors.contains(selector) {
+                    route.selectors.push(selector.clone());
+                }
+            }
+        }
+        None => routes.push(PinnedRoute {
+            selectors: checked.clone(),
+            endpoint_key: key,
+            missing: false,
+        }),
+    }
+    let running = running(ctx, &profile);
+    save_pins(ctx, &profile, routes)?;
+    Ok((
+        json!({"id": profile.id, "server": name, "selectors": checked,
+            "requiresReconnect": running}),
+        format!(
+            "{} now go through {} of \"{}\", nowhere else{}",
+            checked.join(", "),
+            name,
+            profile.name,
+            apply_note(running)
+        ),
+    ))
+}
+
+/// Removes pinned selectors — or the whole pinned route when none are named.
+fn unpin(ctx: &Ctx, query: &str, via: &str, selectors: &[String]) -> Result<Output, String> {
+    require_user(ctx)?;
+    let profile = xray_profile(ctx, query)?;
+    let (key, name) = pin_key(ctx, &profile, via)?;
+    let mut routes = profile.pinned_policies.clone();
+    let Some(position) = routes.iter().position(|route| route.endpoint_key == key) else {
+        return Err(format!("Nothing is pinned to {name}"));
+    };
+    if selectors.is_empty() {
+        routes.remove(position);
+    } else {
+        let mut removed = Vec::new();
+        for selector in selectors {
+            let selector = selector.trim();
+            if !routes[position].selectors.iter().any(|s| s == selector) {
+                return Err(format!("{selector} is not pinned to {name}"));
+            }
+            removed.push(selector.to_string());
+        }
+        routes[position]
+            .selectors
+            .retain(|selector| !removed.contains(selector));
+        if routes[position].selectors.is_empty() {
+            routes.remove(position);
+        }
+    }
+    let running = running(ctx, &profile);
+    save_pins(ctx, &profile, routes)?;
+    Ok((
+        json!({"id": profile.id, "server": name, "requiresReconnect": running}),
+        format!(
+            "Unpinned {} of \"{}\"{}",
+            name,
+            profile.name,
+            apply_note(running)
+        ),
+    ))
+}
+
+/// `route quic`: the daemon's kernel-level QUIC handling for the tunnel.
+/// `on` answers outbound UDP/443 with a rejection so browsers fall back to
+/// TCP at once; `off` removes this rule without changing other routing policy.
+/// A profile setting, applied at connect — a running tunnel is unaffected
+/// until it reconnects.
+fn quic(ctx: &Ctx, query: &str, enabled: Option<super::args::BoolOnOff>) -> Result<Output, String> {
+    let profile = xray_profile(ctx, query)?;
+    let Some(enabled) = enabled else {
+        return Ok((
+            json!({"id": profile.id, "quicReject": profile.xray_quic_reject}),
+            format!(
+                "QUIC reject is {} for \"{}\"",
+                if profile.xray_quic_reject {
+                    "on"
+                } else {
+                    "off"
+                },
+                profile.name
+            ),
+        ));
+    };
+    require_user(ctx)?;
+    let on = matches!(enabled, super::args::BoolOnOff::On);
+    let running = running(ctx, &profile);
+    ctx.store()
+        .update_profile(&profile.id, |current| {
+            if current.backend != TunnelBackend::Xray {
+                return Err(std::io::Error::other(
+                    "Profile is no longer an Xray profile",
+                ));
+            }
+            current.xray_quic_reject = on;
+            Ok(())
+        })
+        .map_err(|_| "The QUIC rejection setting could not be saved".to_string())?;
+    Ok((
+        json!({"id": profile.id, "quicReject": on, "requiresReconnect": running}),
+        format!(
+            "QUIC reject is {} for \"{}\"{}",
+            if on { "on" } else { "off" },
+            profile.name,
+            apply_note(running)
+        ),
+    ))
+}
+
 fn load_asset<T>(dir: &Path, name: &str, parse: fn(&[u8]) -> std::io::Result<T>) -> Option<T> {
     let path = dir.join(name);
     let meta = std::fs::metadata(&path).ok()?;
@@ -310,15 +575,51 @@ fn check(ctx: &Ctx, target: &str, query: &str, geo_dir: &Path) -> Result<Output,
         geo_site: geo_site.as_ref(),
         geo_ip: geo_ip.as_ref(),
     };
-    let options = ProfileRoutingOptions {
-        private_lan_direct: profile.private_lan_direct,
-        domain_strategy: profile.xray_domain_strategy,
-        domain_matcher: profile.xray_domain_matcher,
-        dns: profile.xray_dns.clone(),
-    };
+    let options = ProfileRoutingOptions::from(&profile);
     let result = check_route(&profile.domain_policies, &options, target, &geo)
         .map_err(|error| error.to_string())?;
-    let value = serde_json::to_value(&result).map_err(|_| "The route check failed".to_string())?;
+    let mut value =
+        serde_json::to_value(&result).map_err(|_| "The route check failed".to_string())?;
+    let mut uncertain_pin = false;
+    for route in &profile.pinned_policies {
+        let pinned = check_route(
+            &[DomainPolicy {
+                domains: route.selectors.clone(),
+                target: DomainRouteTarget::Proxy,
+            }],
+            &ProfileRoutingOptions::default(),
+            &result.target,
+            &geo,
+        )
+        .map_err(|error| error.to_string())?;
+        if pinned.matched_selector.is_some() {
+            value =
+                serde_json::to_value(&pinned).map_err(|_| "The route check failed".to_string())?;
+            value
+                .as_object_mut()
+                .expect("route result")
+                .remove("policyIndex");
+            value["endpointKey"] = json!(route.endpoint_key);
+            value["source"] = json!("pinned");
+            value["outbound"] = if route.missing {
+                json!("block")
+            } else {
+                json!(net_manager_core::xray::pin_tag(&route.endpoint_key))
+            };
+            break;
+        }
+        uncertain_pin |=
+            pinned.certainty == net_manager_core::route_check::RouteCheckCertainty::Probable;
+    }
+    if uncertain_pin {
+        value["certainty"] = json!("probable");
+        value["notes"]
+            .as_array_mut()
+            .expect("route notes")
+            .push(json!(
+                "An earlier pinned selector could not be evaluated locally"
+            ));
+    }
     let text = describe_check(&value);
     Ok((value, text))
 }

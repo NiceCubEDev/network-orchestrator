@@ -3945,6 +3945,95 @@ a:focus-visible,
   padding: 0 var(--sp-1);
 }
 
+/* ── Linux multinode: failover chain + fail-closed node pins ────────── */
+.endpoint-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+}
+
+.endpoint-row .endpoint-item {
+  flex: 1;
+  min-width: 0;
+}
+
+.endpoint-actions {
+  display: inline-flex;
+  flex-shrink: 0;
+}
+
+.icon-btn {
+  padding: var(--sp-1);
+  line-height: 0;
+  color: var(--text-muted);
+}
+
+.icon-btn:hover:not(:disabled) {
+  color: var(--text-primary);
+}
+
+.endpoint-failover {
+  padding: var(--sp-1) var(--sp-2);
+  font-size: var(--fs-xs);
+  color: var(--text-secondary);
+}
+
+.pinned-section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  padding: 0 var(--sp-1);
+}
+
+.pinned-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+
+.pinned-list li {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: var(--fs-xs);
+}
+
+.pinned-node {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  color: var(--text-secondary);
+}
+
+.pinned-selectors {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-muted);
+}
+
+.pinned-add {
+  display: flex;
+  gap: var(--sp-2);
+  align-items: center;
+}
+
+.pinned-add select {
+  flex-shrink: 0;
+  max-width: 40%;
+}
+
+.pinned-add input {
+  flex: 1;
+  min-width: 0;
+}
+
 .sub-announce {
   border: 1px solid var(--info-border);
   background-color: var(--info-bg);
