@@ -16,6 +16,7 @@ import type {
 } from "../../types";
 import Modal from "../Modal";
 import { useToast } from "../ui/Toast";
+import ServiceChecksSection from "./ServiceChecksSection";
 
 interface Props {
   profile: Profile;
@@ -42,7 +43,6 @@ const ANOMALY_KEYS: Record<string, TranslationKey> = {
   "egress-observation-unavailable": "Physical uplink observation is unavailable.",
   "https-stalled": "HTTPS through the tunnel has stalled.",
   "dns-stalled": "DNS through the tunnel has stalled.",
-  "pinned-path-stalled": "A pinned node has stopped answering its probes.",
   "udp-socket-limit": "The owned Xray process exceeded its UDP socket limit.",
   "connection-storm": "An application is opening an unusual number of connections.",
   "socket-observation-unavailable": "The owned process socket inventory is unavailable.",
@@ -70,7 +70,8 @@ export default function LinuxXrayPolicySection({
     path: string;
     preview: XrayPolicyPreview;
   } | null>(null);
-  const blocked = busy || operation !== null;
+  const [serviceBusy, setServiceBusy] = useState(false);
+  const blocked = busy || operation !== null || serviceBusy;
   const stopped = status.state === "stopped";
   const watchdog = status.watchdog;
   useEffect(() => { if (status.state === "stopped") setReconnect(false); }, [status.state]);
@@ -393,6 +394,11 @@ export default function LinuxXrayPolicySection({
           )}
         </>
       )}
+      {profile.subscription && (
+        <ServiceChecksSection profile={profile} status={status} endpoints={endpoints}
+          busy={busy || operation !== null} onSaved={onSaved}
+          onBusyChange={(next) => { setServiceBusy(next); onBusyChange(next); }} />
+      )}
 
       <span className="section-label">{t("Import local Xray policy")}</span>
       <span className="row-hint">{t("Choose a local Xray JSON file. Preview reads it without changing the source or starting a tunnel. Unsupported semantics block apply. No raw config or credentials are displayed.")}</span>
@@ -421,12 +427,6 @@ export default function LinuxXrayPolicySection({
               {row("Xray UDP sockets", watchdog.anomalies.includes("socket-observation-unavailable")
                 ? unknown : watchdog.xrayUdpSockets)}
               {row("Last recovery", date(watchdog.lastRecoveryUnix))}
-              {watchdog.pinnedStalled.length > 0 && (
-                <div className="runtime-notice">
-                  {t("Stalled pinned nodes")}:{" "}
-                  {watchdog.pinnedStalled.slice(0, 8).map(nameOf).join(", ")}
-                </div>
-              )}
               {watchdog.connStorm && (
                 <div className="runtime-notice">
                   {t("{count} connections to {destination} · process {process}", {

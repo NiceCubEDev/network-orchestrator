@@ -2897,6 +2897,7 @@ dependencies = [
  "libc",
  "net-route",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "sha2",

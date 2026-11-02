@@ -34,6 +34,8 @@ pub mod peer;
 pub mod quic_reject;
 #[cfg(target_os = "linux")]
 pub mod server;
+#[cfg(target_os = "linux")]
+pub mod service_checks;
 pub mod settings;
 pub mod tailscale;
 pub mod validate;

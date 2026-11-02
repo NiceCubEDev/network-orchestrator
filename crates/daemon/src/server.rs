@@ -813,6 +813,17 @@ async fn handle<A: Authorizer>(
             .await?;
             to_value(&status)
         }
+        method::XRAY_SERVICE_CHECKS => {
+            let params: net_manager_core::daemon_protocol::XrayServiceChecksParams =
+                from_value(request.params)
+                    .map_err(|_| invalid("invalid service check parameters".into()))?;
+            validate_owner(&format!("xray:{}", params.profile_id)).map_err(invalid)?;
+            let result = with_core(ctx, move |core| {
+                core.set_xray_service_checks(uid, &params.profile_id, params.checks)
+            })
+            .await?;
+            to_value(&result)
+        }
         method::XRAY_RELOAD => {
             let params: XrayConnectParams = from_value(request.params)
                 .map_err(|_| invalid("invalid Xray reload parameters".into()))?;

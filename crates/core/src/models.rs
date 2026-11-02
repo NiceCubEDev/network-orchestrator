@@ -537,6 +537,55 @@ impl XrayDnsConfig {
     }
 }
 
+/// Explicit user-owned target; never derive a service URL from routing selectors.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ServiceCheck {
+    pub id: String,
+    pub name: String,
+    pub url: String,
+    pub endpoint_key: String,
+    #[serde(default)]
+    pub background: bool,
+}
+
+impl std::fmt::Debug for ServiceCheck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServiceCheck")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("url", &"[REDACTED]")
+            .field("endpoint_key", &self.endpoint_key)
+            .field("background", &self.background)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ServiceCheckOutcome {
+    Http,
+    Timeout,
+    TlsError,
+    TransportError,
+    Unavailable,
+}
+
+/// Transport diagnostics only: an HTTP response does not prove API authorization.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceCheckResult {
+    pub id: String,
+    pub name: String,
+    pub endpoint_key: String,
+    pub outcome: ServiceCheckOutcome,
+    pub http_status: Option<u16>,
+    pub latency_ms: Option<u64>,
+    pub checked_at_unix: u64,
+    pub consecutive_failures: u32,
+    pub degraded: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Profile {
@@ -553,6 +602,8 @@ pub struct Profile {
     /// fail-closed: selectors exit through the named node or are dropped.
     #[serde(default)]
     pub pinned_policies: Vec<PinnedRoute>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub xray_service_checks: Vec<ServiceCheck>,
     #[serde(default)]
     pub private_lan_direct: bool,
     #[serde(default)]
@@ -723,6 +774,7 @@ impl Default for Profile {
             tunnel_dns_domains: Vec::new(),
             tunnel_networks: Vec::new(),
             pinned_policies: Vec::new(),
+            xray_service_checks: Vec::new(),
         }
     }
 }
@@ -887,7 +939,8 @@ pub struct WatchdogStatus {
     pub https_stall_streak: u32,
     pub https_latency_ms: Option<u32>,
     pub dns_stall_streak: u32,
-    pub pinned_stalled: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub service_checks: Vec<ServiceCheckResult>,
     pub xray_udp_sockets: u32,
     pub conn_storm: Option<ConnStorm>,
     pub last_recovery_unix: Option<u64>,

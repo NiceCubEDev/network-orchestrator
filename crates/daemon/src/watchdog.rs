@@ -43,7 +43,6 @@ pub struct WatchdogSpec {
     pub tun_name: String,
     pub tun_addr: IpAddr,
     pub mark: u32,
-    pub pin_probes: Vec<(String, u16)>,
     pub probe_url: Option<String>,
     pub dns_servers: Vec<IpAddr>,
 }
@@ -51,7 +50,6 @@ pub struct WatchdogSpec {
 pub enum RecoveryReason {
     Egress,
     HttpsStall,
-    PinStall(String),
     UdpLeak,
 }
 #[derive(Debug, Clone, Copy, Default)]
@@ -64,8 +62,6 @@ enum ProbeOutcome {
 
 struct RecoveryState {
     status: WatchdogStatus,
-    pin_keys: Vec<String>,
-    pin_streaks: Vec<u32>,
     probe_after: Instant,
     pending_egress: bool,
     pending_stall: Option<RecoveryReason>,
@@ -76,11 +72,9 @@ struct RecoveryState {
     resources_unavailable: bool,
 }
 impl RecoveryState {
-    fn new(now: Instant, keys: Vec<String>) -> Self {
+    fn new(now: Instant) -> Self {
         Self {
             status: WatchdogStatus::default(),
-            pin_streaks: vec![0; keys.len()],
-            pin_keys: keys,
             probe_after: now + SETTLE_DELAY,
             pending_egress: false,
             pending_stall: None,
@@ -108,14 +102,12 @@ impl RecoveryState {
             self.status.https_stall_streak = 0;
             self.status.dns_stall_streak = 0;
             self.status.https_latency_ms = None;
-            self.pin_streaks.fill(0);
         }
     }
     fn observe(
         &mut self,
         https: ProbeOutcome,
         dns: ProbeOutcome,
-        pin: Option<(usize, bool, bool)>,
         node_reachable: bool,
         resources: Option<SocketReport>,
     ) {
@@ -141,16 +133,6 @@ impl RecoveryState {
             }
             ProbeOutcome::Skipped => {}
         }
-        if let Some((index, healthy, reachable)) = pin {
-            self.pin_streaks[index] = if healthy {
-                0
-            } else {
-                self.pin_streaks[index].saturating_add(1)
-            };
-            if self.pin_streaks[index] >= STALL_LIMIT && reachable {
-                self.pending_stall = Some(RecoveryReason::PinStall(self.pin_keys[index].clone()));
-            }
-        }
         self.resources_unavailable = resources.is_none();
         if let Some(resources) = resources {
             self.status.xray_udp_sockets = resources.udp_sockets;
@@ -159,13 +141,6 @@ impl RecoveryState {
                 self.pending_stall = Some(RecoveryReason::UdpLeak);
             }
         }
-        self.status.pinned_stalled = self
-            .pin_keys
-            .iter()
-            .zip(&self.pin_streaks)
-            .filter(|(_, streak)| **streak >= 2)
-            .map(|(key, _)| key.clone())
-            .collect();
     }
     fn recovery(&mut self, now: Instant) -> Option<RecoveryReason> {
         if self.status.uplink != Some(true) {
@@ -204,21 +179,15 @@ impl RecoveryState {
         self.status.https_stall_streak = 0;
         self.status.dns_stall_streak = 0;
         self.status.https_latency_ms = None;
-        self.pin_streaks.fill(0);
-        self.status.pinned_stalled.clear();
     }
     fn cancel_cleared_request(
         &mut self,
         reason: &RecoveryReason,
         https: ProbeOutcome,
-        pin: Option<(usize, bool, bool)>,
         udp_sockets: Option<u32>,
     ) -> bool {
         let cleared = match reason {
             RecoveryReason::HttpsStall => matches!(https, ProbeOutcome::Healthy(_)),
-            RecoveryReason::PinStall(key) => pin.is_some_and(|(index, healthy, _)| {
-                healthy && self.pin_keys.get(index) == Some(key)
-            }),
             RecoveryReason::UdpLeak => udp_sockets.is_some_and(|count| count <= UDP_LIMIT),
             RecoveryReason::Egress => false,
         };
@@ -241,9 +210,6 @@ impl RecoveryState {
         }
         if self.status.dns_stall_streak >= STALL_LIMIT {
             anomalies.push("dns-stalled".into());
-        }
-        if !self.status.pinned_stalled.is_empty() {
-            anomalies.push("pinned-path-stalled".into());
         }
         if self.status.xray_udp_sockets > UDP_LIMIT {
             anomalies.push("udp-socket-limit".into());
@@ -376,38 +342,23 @@ fn probe_host(url: &str) -> Option<String> {
     }
     Some(host.to_string())
 }
-fn https_client(
-    interface: Option<&str>,
-    port: Option<u16>,
-) -> io::Result<reqwest::blocking::Client> {
-    let mut builder = reqwest::blocking::Client::builder()
+fn https_client(interface: &str) -> io::Result<reqwest::blocking::Client> {
+    let builder = reqwest::blocking::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(PROBE_TIMEOUT)
         .timeout(PROBE_TIMEOUT)
-        .pool_max_idle_per_host(0);
-    if let Some(interface) = interface {
-        builder = builder.interface(interface);
-    }
-    if let Some(port) = port {
-        builder = builder.proxy(
-            reqwest::Proxy::all(format!("socks5h://127.0.0.1:{port}"))
-                .map_err(|_| io::Error::other("probe proxy unavailable"))?,
-        );
-    }
+        .pool_max_idle_per_host(0)
+        .interface(interface);
     builder
         .build()
         .map_err(|_| io::Error::other("HTTPS prober unavailable"))
 }
-fn https(client: &reqwest::blocking::Client, url: &str, path_probe: bool) -> ProbeOutcome {
+fn https(client: &reqwest::blocking::Client, url: &str) -> ProbeOutcome {
     let started = Instant::now();
     let result = (|| -> Option<()> {
         let response = client.get(url).send().ok()?;
-        if if path_probe {
-            !response.status().is_success()
-        } else {
-            response.status().is_server_error()
-        } {
+        if !response.status().is_success() {
             return None;
         }
         // A bounded prefix is enough to prove the TLS/HTTP path, not the
@@ -459,12 +410,6 @@ fn dns_probe(interface: &str, server: IpAddr, hostname: &str) -> ProbeOutcome {
     }
 }
 
-struct PinProbe {
-    key: String,
-    client: reqwest::blocking::Client,
-    url: Option<String>,
-    node: Option<SocketAddr>,
-}
 fn node_address(outbound: &Value) -> Option<SocketAddr> {
     if outbound["protocol"] != "vless" {
         return None;
@@ -474,33 +419,6 @@ fn node_address(outbound: &Value) -> Option<SocketAddr> {
         server["address"].as_str()?.parse().ok()?,
         u16::try_from(server["port"].as_u64()?).ok()?,
     ))
-}
-fn pin_url(config: &Value, key: &str) -> Option<String> {
-    let tag = net_manager_core::xray::pin_tag(key);
-    for rule in config.pointer("/routing/rules")?.as_array()? {
-        if rule["outboundTag"].as_str() != Some(&tag) {
-            continue;
-        }
-        for selector in rule["domain"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-        {
-            let domain = selector
-                .strip_prefix("domain:")
-                .or_else(|| selector.strip_prefix("full:"))
-                .unwrap_or(selector);
-            if domain.contains('.')
-                && domain
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
-            {
-                return checked_probe_url(&format!("https://{domain}/")).ok();
-            }
-        }
-    }
-    None
 }
 fn tcp_reachable(
     network: &WatchdogNetwork,
@@ -583,19 +501,6 @@ fn run(
                 })
         })
         .collect();
-    let mut pins = Vec::with_capacity(spec.pin_probes.len());
-    for (key, port) in &spec.pin_probes {
-        let tag = net_manager_core::xray::pin_tag(key);
-        pins.push(PinProbe {
-            key: key.clone(),
-            client: https_client(None, Some(*port))?,
-            url: pin_url(&config, key).or_else(|| spec.probe_url.clone()),
-            node: outbounds
-                .iter()
-                .find(|outbound| outbound["tag"].as_str() == Some(&tag))
-                .and_then(node_address),
-        });
-    }
     let dns_servers: Vec<IpAddr> = if spec.dns_servers.is_empty() {
         config
             .pointer("/dns/servers")
@@ -628,14 +533,11 @@ fn run(
     let client = spec
         .probe_url
         .as_ref()
-        .map(|_| https_client(Some(&spec.tun_name), None))
+        .map(|_| https_client(&spec.tun_name))
         .transpose()?;
     let hostname = spec.probe_url.as_deref().and_then(probe_host);
     let mut tracker = EgressTracker::new();
-    let mut state = RecoveryState::new(
-        Instant::now(),
-        pins.iter().map(|pin| pin.key.clone()).collect(),
-    );
+    let mut state = RecoveryState::new(Instant::now());
     let mut next_egress = Instant::now();
     let mut next_probe = Instant::now();
     let mut rotation = 0usize;
@@ -667,11 +569,10 @@ fn run(
             let online = state.status.uplink == Some(true) && authorized.load(Ordering::Relaxed);
             let mut https_result = ProbeOutcome::Skipped;
             let mut dns_result = ProbeOutcome::Skipped;
-            let mut pin_result = None;
             let mut node_reachable = false;
             if online {
                 if let (Some(client), Some(url)) = (&client, &spec.probe_url) {
-                    https_result = https(client, url, true);
+                    https_result = https(client, url);
                 }
                 if stop.load(Ordering::Relaxed) {
                     break;
@@ -681,22 +582,6 @@ fn run(
                     dns_servers.get(rotation % dns_servers.len().max(1)),
                 ) {
                     dns_result = dns_probe(&spec.tun_name, *server, name);
-                }
-                if stop.load(Ordering::Relaxed) {
-                    break;
-                }
-                if let Some(pin) = pins.get(rotation % pins.len().max(1)) {
-                    if let Some(url) = &pin.url {
-                        let healthy =
-                            matches!(https(&pin.client, url, false), ProbeOutcome::Healthy(_));
-                        let reachable = !healthy
-                            && pin.node.zip(tracker.signature()).is_some_and(
-                                |(node, signature)| {
-                                    tcp_reachable(network, node, spec.mark, signature)
-                                },
-                            );
-                        pin_result = Some((rotation % pins.len(), healthy, reachable));
-                    }
                 }
                 if stop.load(Ordering::Relaxed) {
                     break;
@@ -729,16 +614,10 @@ fn run(
                 continue;
             }
             let udp_sockets = resources.as_ref().map(|report| report.udp_sockets);
-            state.observe(
-                https_result,
-                dns_result,
-                pin_result,
-                node_reachable,
-                resources,
-            );
+            state.observe(https_result, dns_result, node_reachable, resources);
             if let Ok(mut published) = shared.lock() {
                 if published.request.as_ref().is_some_and(|reason| {
-                    state.cancel_cleared_request(reason, https_result, pin_result, udp_sockets)
+                    state.cancel_cleared_request(reason, https_result, udp_sockets)
                 }) {
                     published.request = None;
                 }
@@ -984,13 +863,12 @@ mod tests {
     #[test]
     fn node_outage_does_not_restart_xray_but_stalled_process_does_with_cooldown() {
         let now = Instant::now();
-        let mut state = RecoveryState::new(now, Vec::new());
+        let mut state = RecoveryState::new(now);
         online(&mut state, now);
         for _ in 0..3 {
             state.observe(
                 ProbeOutcome::Stalled,
                 ProbeOutcome::Skipped,
-                None,
                 false,
                 Some(SocketReport::default()),
             );
@@ -999,7 +877,6 @@ mod tests {
         state.observe(
             ProbeOutcome::Stalled,
             ProbeOutcome::Skipped,
-            None,
             true,
             Some(SocketReport::default()),
         );
@@ -1007,7 +884,6 @@ mod tests {
         state.observe(
             ProbeOutcome::Stalled,
             ProbeOutcome::Skipped,
-            None,
             true,
             Some(SocketReport::default()),
         );
@@ -1018,46 +894,9 @@ mod tests {
         );
     }
     #[test]
-    fn healthy_reserve_cannot_mask_a_stalled_pin_and_dead_pin_does_not_restart() {
-        let now = Instant::now();
-        let mut state = RecoveryState::new(now, vec!["0123456789abcdef".into()]);
-        online(&mut state, now);
-        for _ in 0..3 {
-            state.observe(
-                ProbeOutcome::Healthy(2),
-                ProbeOutcome::Skipped,
-                Some((0, false, false)),
-                true,
-                Some(SocketReport::default()),
-            );
-        }
-        assert_eq!(state.status.pinned_stalled, ["0123456789abcdef"]);
-        assert_eq!(state.status.https_stall_streak, 0);
-        assert_eq!(state.recovery(now), None);
-        state.observe(
-            ProbeOutcome::Healthy(2),
-            ProbeOutcome::Skipped,
-            Some((0, false, true)),
-            true,
-            Some(SocketReport::default()),
-        );
-        assert_eq!(
-            state.recovery(now),
-            Some(RecoveryReason::PinStall("0123456789abcdef".into()))
-        );
-        state.observe(
-            ProbeOutcome::Healthy(2),
-            ProbeOutcome::Skipped,
-            Some((0, true, true)),
-            true,
-            Some(SocketReport::default()),
-        );
-        assert!(state.status.pinned_stalled.is_empty());
-    }
-    #[test]
     fn offline_guard_defers_egress_recovery_and_churn_is_rate_limited() {
         let now = Instant::now();
-        let mut state = RecoveryState::new(now, Vec::new());
+        let mut state = RecoveryState::new(now);
         let signature = EgressSignature { paths: Vec::new() };
         state.egress(EgressEvent::Changed, Some(&signature), now, 1000);
         state.egress(EgressEvent::Lost, None, now, 1001);
@@ -1075,14 +914,13 @@ mod tests {
     #[test]
     fn crash_acknowledgment_does_not_spend_the_stall_recovery_budget() {
         let now = Instant::now();
-        let mut state = RecoveryState::new(now, Vec::new());
+        let mut state = RecoveryState::new(now);
         online(&mut state, now);
         state.acknowledge(now);
         for _ in 0..STALL_LIMIT {
             state.observe(
                 ProbeOutcome::Stalled,
                 ProbeOutcome::Skipped,
-                None,
                 true,
                 Some(SocketReport::default()),
             );
@@ -1095,28 +933,23 @@ mod tests {
     #[test]
     fn fresh_positive_proof_cancels_only_its_own_stall_without_spending_cooldown() {
         let now = Instant::now();
-        let mut state = RecoveryState::new(
-            now,
-            vec!["1111111111111111".into(), "2222222222222222".into()],
-        );
+        let mut state = RecoveryState::new(now);
         online(&mut state, now);
         for _ in 0..STALL_LIMIT {
             state.observe(
                 ProbeOutcome::Stalled,
                 ProbeOutcome::Skipped,
-                None,
                 true,
                 Some(SocketReport::default()),
             );
         }
         let reason = state.recovery(now).unwrap();
-        assert!(!state.cancel_cleared_request(&reason, ProbeOutcome::Skipped, None, Some(0)));
-        assert!(state.cancel_cleared_request(&reason, ProbeOutcome::Healthy(2), None, Some(0)));
+        assert!(!state.cancel_cleared_request(&reason, ProbeOutcome::Skipped, Some(0)));
+        assert!(state.cancel_cleared_request(&reason, ProbeOutcome::Healthy(2), Some(0)));
         for _ in 0..STALL_LIMIT {
             state.observe(
                 ProbeOutcome::Stalled,
                 ProbeOutcome::Skipped,
-                None,
                 true,
                 Some(SocketReport::default()),
             );
@@ -1125,30 +958,16 @@ mod tests {
             state.recovery(now + Duration::from_secs(5)),
             Some(RecoveryReason::HttpsStall)
         );
-        let pinned = RecoveryReason::PinStall("1111111111111111".into());
-        assert!(!state.cancel_cleared_request(
-            &pinned,
-            ProbeOutcome::Healthy(1),
-            Some((1, true, true)),
-            None
-        ));
-        assert!(state.cancel_cleared_request(
-            &pinned,
-            ProbeOutcome::Skipped,
-            Some((0, true, true)),
-            None
-        ));
         assert!(!state.cancel_cleared_request(
             &RecoveryReason::Egress,
             ProbeOutcome::Healthy(1),
-            None,
             Some(0)
         ));
     }
     #[test]
     fn crash_respawn_satisfies_deferred_egress_but_not_a_newer_change() {
         let now = Instant::now();
-        let mut state = RecoveryState::new(now, Vec::new());
+        let mut state = RecoveryState::new(now);
         let signature = EgressSignature { paths: Vec::new() };
         state.egress(EgressEvent::Changed, Some(&signature), now, 1000);
         assert_eq!(state.recovery(now), Some(RecoveryReason::Egress));
@@ -1175,12 +994,11 @@ mod tests {
     #[test]
     fn resource_thresholds_and_anomalies_clear_after_recovery() {
         let now = Instant::now();
-        let mut state = RecoveryState::new(now, Vec::new());
+        let mut state = RecoveryState::new(now);
         online(&mut state, now);
         state.observe(
             ProbeOutcome::Skipped,
             ProbeOutcome::Stalled,
-            None,
             false,
             Some(SocketReport {
                 udp_sockets: UDP_LIMIT,
@@ -1191,7 +1009,6 @@ mod tests {
         state.observe(
             ProbeOutcome::Skipped,
             ProbeOutcome::Stalled,
-            None,
             false,
             Some(SocketReport {
                 udp_sockets: UDP_LIMIT + 1,
@@ -1204,7 +1021,6 @@ mod tests {
         state.observe(
             ProbeOutcome::Healthy(5),
             ProbeOutcome::Healthy(2),
-            None,
             false,
             Some(SocketReport::default()),
         );

@@ -40,6 +40,7 @@ pub mod route_conditions;
 pub mod route_intents;
 pub mod route_plan;
 pub mod route_state;
+pub mod service_checks;
 pub mod subscription;
 pub mod system_proxy;
 pub mod vpn;

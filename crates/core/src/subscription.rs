@@ -1291,7 +1291,7 @@ impl Drop for TemporaryXray {
 /// free loopback SOCKS port, wait for the listener and return a proxied
 /// client. The caller retains ownership across timeouts and awaits stop before
 /// returning; Drop still kills on cancellation. Errors never echo configuration.
-/// Shared by delay and exit-country probes.
+/// Shared by delay, exit-country and explicit service probes.
 pub(crate) async fn temporary_socks_client(
     build_config: impl FnOnce(u16) -> Result<serde_json::Value, String>,
     mut command: tokio::process::Command,
@@ -1353,6 +1353,7 @@ pub(crate) async fn temporary_socks_client(
         .no_proxy()
         .proxy(proxy)
         .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
         .timeout(timeout)
         .build()
         .map_err(|_| "failed to build delay probe client".to_string())?;

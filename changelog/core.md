@@ -10,6 +10,20 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+### Added
+
+- Persisted user-owned HTTPS service-check specifications with empty/off defaults,
+  protected profile validation and URL-redacted debug output. Bounded manual HEAD
+  probes use only the current explicitly pinned subscription endpoint, never
+  routing-derived targets, redirects, credentials or direct fallback.
+- Typed, URL-free HTTP/timeout/TLS/transport/unavailable observations and a
+  three-failure diagnostic streak, independent of tunnel recovery.
+
+### Changed
+
+- Replace inferred pinned-path status with explicit `serviceChecks` readings.
+  Subscription refresh and ordinary profile edits retain service-check settings.
+
 ## [0.11.0] - 2026-11-02
 
 ### Added

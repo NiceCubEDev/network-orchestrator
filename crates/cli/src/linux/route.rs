@@ -372,7 +372,27 @@ fn pin_key(ctx: &Ctx, profile: &Profile, via: &str) -> Result<(String, String), 
 }
 
 fn save_pins(ctx: &Ctx, profile: &Profile, routes: Vec<PinnedRoute>) -> Result<(), String> {
-    subscription::set_pinned_routes(&ctx.vault(), &ctx.store(), &profile.id, routes)
+    let candidate = if profile
+        .xray_service_checks
+        .iter()
+        .any(|check| check.background)
+    {
+        let mut candidate = profile.clone();
+        candidate.pinned_policies = routes.clone();
+        net_manager_core::profiles::validate_profile(&candidate)
+            .map_err(|_| "The pinned-route configuration is invalid".to_string())?;
+        super::checks::sync_background(ctx, &candidate, &candidate.xray_service_checks)?;
+        Some(candidate)
+    } else {
+        None
+    };
+    let saved = subscription::set_pinned_routes(&ctx.vault(), &ctx.store(), &profile.id, routes);
+    if saved.is_err() {
+        if let Some(candidate) = candidate {
+            super::checks::sync_background(ctx, &candidate, &[])?;
+        }
+    }
+    saved
         .map_err(|error| match error.kind() {
             std::io::ErrorKind::InvalidInput => error.to_string(),
             _ => "The pinned rules could not be saved. Check file permissions.".into(),

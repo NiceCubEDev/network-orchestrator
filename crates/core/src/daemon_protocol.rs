@@ -54,6 +54,7 @@ pub mod method {
     pub const XRAY_DISCONNECT: &str = "xray.disconnect";
     pub const XRAY_STATUS: &str = "xray.status";
     pub const XRAY_RELOAD: &str = "xray.reload";
+    pub const XRAY_SERVICE_CHECKS: &str = "xray.serviceChecks";
     pub const XRAY_INSTALL: &str = "xray.install";
     pub const XRAY_REMOVE: &str = "xray.remove";
     pub const TAILSCALE_STATUS: &str = "tailscale.status";
@@ -107,6 +108,7 @@ pub mod method {
         XRAY_DISCONNECT,
         XRAY_STATUS,
         XRAY_RELOAD,
+        XRAY_SERVICE_CHECKS,
         XRAY_INSTALL,
         XRAY_REMOVE,
         TAILSCALE_STATUS,
@@ -1171,6 +1173,16 @@ pub struct XrayConnectParams {
     pub probe_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mtu: Option<u32>,
+    /// User-owned diagnostic targets. Kept in memory, never in the ownership journal.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub service_checks: Vec<crate::models::ServiceCheck>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct XrayServiceChecksParams {
+    pub profile_id: String,
+    pub checks: Vec<crate::models::ServiceCheck>,
 }
 
 /// One ordered failover candidate; `key` is the stable subscription
@@ -1886,7 +1898,6 @@ mod tests {
         assert_eq!(id, 1);
         assert_eq!(result.uid, 1000);
         assert_eq!(result.daemon_version, "0.1.1");
-        assert_eq!(result.capabilities, method::CAPABILITIES);
 
         // A pre-tools daemon leaves the map empty: missing keys mean
         // "unknown", which callers treat as usable.

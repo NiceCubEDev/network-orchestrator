@@ -23,6 +23,7 @@ fn params(config: &Value) -> XrayConnectParams {
         reject_quic: false,
         probe_url: None,
         mtu: None,
+        service_checks: Vec::new(),
     }
 }
 

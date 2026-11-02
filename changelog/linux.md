@@ -10,6 +10,22 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+### Added
+
+- `netorch checks list|add|remove|background|run` and a per-profile service
+  availability editor. Users supply the HTTPS targets and explicit node pins;
+  opening or saving the editor sends no service request.
+- Opt-in diagnostic-only checks every 60 seconds while a TUN profile is active.
+  Any HTTP response is transport evidence, not authenticated API success.
+  Results and transition logs omit URLs; disabling/removing checks cancels the
+  worker without reloading Xray, changing pins or selecting a fallback.
+
+### Changed
+
+- Stop inferring pinned service targets from routing domains and remove
+  pin-specific restart requests. Global tunnel/failover health and underlay
+  recovery remain separate from service-specific availability.
+
 ## [0.11.0] - 2026-11-02
 
 Core 0.11.0.

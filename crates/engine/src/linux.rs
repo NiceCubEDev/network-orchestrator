@@ -268,6 +268,12 @@ pub fn prepare_linux_xray_tun_params(
                 .unwrap_or_else(|| net_manager_core::subscription::DELAY_PROBE_URL.to_string()),
         ),
         mtu: profile.xray_tun_mtu,
+        service_checks: profile
+            .xray_service_checks
+            .iter()
+            .filter(|check| check.background)
+            .cloned()
+            .collect(),
     };
     check_xray_frame_size(&params)?;
     Ok(params)

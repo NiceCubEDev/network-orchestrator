@@ -3,6 +3,7 @@ import type {
   ConfigAnalysis, DomainPolicy, NetIntentView, NetworkInterface, NodePoolSettings, PinnedRoute,
   PoolProbeEntry, Profile, ProfileInspection, RouteEntry, RouteMap, TunnelStatus, VpnAuthMode,
   XrayPolicyPreview,
+  ServiceCheck, ServiceCheckOutcome, ServiceCheckResult,
 } from "../types.ts";
 
 // This module intentionally has no I/O imports, fetch, or process calls.
@@ -18,6 +19,7 @@ function profile(id: string, name: string, backend: Profile["backend"], cidr?: s
     useSystemProxy: false, proxyBypass: [], subscription: null,
     xrayMode: "socks", xrayTunInterface: null, xrayTunIp: null,
     pinnedPolicies: [],
+    xrayServiceChecks: [],
     endpointBypasses,
     // Linux TUN flag; the fixture profiles are SOCKS so it stays off.
     xrayQuicReject: false,
@@ -37,6 +39,232 @@ function iface(name: string, index: number, physical: boolean, state: NetworkInt
 }
 
 export class SandboxBackend {
+  private serviceResults = new Map<string, ServiceCheckResult[]>();
+  private serviceDue = new Map<string, number>();
+  private serviceAttempts = new Map<string, Map<string, number>>();
+
+  private serviceBindings(p: Profile): Set<string> {
+    return new Set([
+      ...(p.pinnedPolicies ?? []).map((route) => route.endpointKey),
+      p.xrayDns?.outboundKey,
+    ].filter((key): key is string => Boolean(key)));
+  }
+
+  private validateServiceSpecs(p: Profile, value: unknown): ServiceCheck[] {
+    const invalid = () => new Error("Invalid service-check settings");
+    if (!Array.isArray(value) || value.length > 16) throw invalid();
+    if (value.length && (p.backend !== "xray" || !p.subscription)) {
+      throw invalid();
+    }
+
+    const ids = new Set<string>();
+    return value.map((raw: unknown) => {
+      if (!raw || typeof raw !== "object") throw invalid();
+      const item = raw as Record<string, unknown>;
+      const { id, name, url, endpointKey } = item;
+      const background = item.background ?? false;
+
+      if (
+        typeof id !== "string" ||
+        !/^[A-Za-z0-9_-]{1,64}$/.test(id) ||
+        ids.has(id) ||
+        typeof name !== "string" ||
+        !name.trim() ||
+        [...name].length > 80 ||
+        /[\p{Cc}]/u.test(name) ||
+        typeof url !== "string" ||
+        new TextEncoder().encode(url).length > 2048 ||
+        typeof endpointKey !== "string" ||
+        !/^[0-9a-f]{16}$/.test(endpointKey) ||
+        typeof background !== "boolean"
+      ) throw invalid();
+
+      let parsed: URL;
+      try {
+        parsed = new URL(url);
+      } catch {
+        throw invalid();
+      }
+      if (
+        /[\s\\]/u.test(url) ||
+        !url.split("://")[1]?.split(/[/?#]/u)[0] ||
+        url.split("://")[1]?.split(/[/?#]/u)[0]?.includes("@") ||
+        parsed.port === "0" ||
+        parsed.protocol !== "https:" ||
+        !parsed.hostname ||
+        parsed.username ||
+        parsed.password ||
+        url.includes("#")
+      ) throw invalid();
+
+      ids.add(id);
+      return { id, name, url, endpointKey, background };
+    });
+  }
+
+  private serviceSnapshot(p: Profile): string {
+    return JSON.stringify([
+      p.backend,
+      p.configPath,
+      p.xrayServiceChecks ?? [],
+      p.pinnedPolicies ?? [],
+      p.xrayDns?.outboundKey ?? null,
+      p.xraySockopts ?? null,
+      p.subscription?.activeKey ?? null,
+    ]);
+  }
+
+  private resetServiceWorker(p: Profile, now = Date.now()): void {
+    this.serviceDue.delete(p.id);
+    this.serviceResults.delete(p.id);
+    this.serviceAttempts.delete(p.id);
+    if (
+      this.running.has(p.id) &&
+      p.backend === "xray" &&
+      p.subscription &&
+      p.xrayMode === "tun" &&
+      (p.xrayServiceChecks ?? []).some((check) => check.background)
+    ) {
+      // Never sample on save/connect. First eligibility is one interval later.
+      this.serviceDue.set(p.id, now + 60_000);
+    }
+  }
+
+  private clearServiceState(profileId: string): void {
+    this.serviceDue.delete(profileId);
+    this.serviceResults.delete(profileId);
+    this.serviceAttempts.delete(profileId);
+  }
+
+  private sampleService(
+    p: Profile,
+    check: ServiceCheck,
+    channel: "manual" | "background",
+    now: number,
+    previous?: ServiceCheckResult,
+  ): ServiceCheckResult {
+    let outcome: ServiceCheckOutcome = "unavailable";
+    let httpStatus: number | null = null;
+    let latencyMs: number | null = null;
+
+    const available =
+      p.backend === "xray" &&
+      Boolean(p.subscription) &&
+      this.serviceBindings(p).has(check.endpointKey) &&
+      this.endpointKeys.includes(check.endpointKey);
+
+    if (available) {
+      let attempts = this.serviceAttempts.get(p.id);
+      if (!attempts) {
+        attempts = new Map();
+        this.serviceAttempts.set(p.id, attempts);
+      }
+      const identity = `${channel}:${check.id}`;
+      const attempt = attempts.get(identity) ?? 0;
+      attempts.set(identity, attempt + 1);
+
+      // Stateful, URL-independent observations. 403/503 remain HTTP proof;
+      // three successive non-HTTP failures demonstrate degradation.
+      const outcomes: readonly ServiceCheckOutcome[] = [
+        "http", "http", "http",
+        "timeout", "tlsError", "transportError", "http",
+      ];
+      const statuses: readonly (number | null)[] = [
+        204, 403, 503, null, null, null, 302,
+      ];
+      const index = attempt % outcomes.length;
+      outcome = outcomes[index];
+      httpStatus = statuses[index];
+      latencyMs = outcome === "http" ? 42 + index * 7 : null;
+    }
+
+    const consecutiveFailures =
+      outcome === "http" || outcome === "unavailable"
+        ? 0
+        : (previous?.consecutiveFailures ?? 0) + 1;
+
+    return {
+      id: check.id,
+      name: check.name,
+      endpointKey: check.endpointKey,
+      outcome,
+      httpStatus,
+      latencyMs,
+      checkedAtUnix: Math.floor(now / 1000),
+      consecutiveFailures,
+      degraded: consecutiveFailures >= 3,
+    };
+  }
+
+  private tickServiceChecks(p: Profile, now: number): void {
+    const due = this.serviceDue.get(p.id);
+    if (due === undefined || now < due) return;
+
+    if (
+      !this.running.has(p.id) ||
+      p.backend !== "xray" ||
+      !p.subscription ||
+      p.xrayMode !== "tun"
+    ) {
+      this.serviceDue.delete(p.id);
+      this.serviceResults.delete(p.id);
+      return;
+    }
+
+    const previous = this.serviceResults.get(p.id) ?? [];
+    const results = (p.xrayServiceChecks ?? [])
+      .filter((check) => check.background)
+      .map((check) => this.sampleService(
+        p,
+        check,
+        "background",
+        now,
+        previous.find((result) =>
+          result.id === check.id &&
+          result.endpointKey === check.endpointKey),
+      ));
+    this.serviceResults.set(p.id, results);
+
+    // Skip missed intervals; never manufacture catch-up rounds.
+    this.serviceDue.set(p.id, now + 60_000);
+  }
+
+  private async runServiceChecks(
+    p: Profile,
+    value: unknown,
+  ): Promise<ServiceCheckResult[]> {
+    const checks = structuredClone(p.xrayServiceChecks ?? []);
+    if (
+      value !== undefined &&
+      value !== null &&
+      (!Array.isArray(value) || value.some((id) => typeof id !== "string"))
+    ) throw new Error("Invalid service-check selection");
+
+    const selected = value === undefined || value === null
+      ? null
+      : new Set(value as string[]);
+    if (selected && [...selected].some(
+      (id) => !checks.some((check) => check.id === id),
+    )) throw new Error("Unknown service check");
+
+    const targets = checks.filter((check) =>
+      selected === null || selected.has(check.id));
+    if (targets.length === 0) return [];
+
+    const snapshot = this.serviceSnapshot(p);
+    const profileId = p.id;
+    await Promise.resolve();
+
+    const current = this.profiles.find((item) => item.id === profileId);
+    if (!current || this.serviceSnapshot(current) !== snapshot) {
+      throw new Error("Service-check configuration changed; run again");
+    }
+
+    // Manual runs are fresh observations, not background streak updates.
+    const now = Date.now();
+    return targets.map((check) =>
+      this.sampleService(current, check, "manual", now));
+  }
   private intents: NetIntentView[] = [
     {
       id: "office-via-openvpn",
@@ -281,6 +509,7 @@ export class SandboxBackend {
   private statuses(): TunnelStatus[] {
     return this.profiles.map((p) => {
       const running = this.running.has(p.id);
+      this.tickServiceChecks(p, Date.now());
       const sub = p.subscription;
       const keys = sub ? [...new Set([
         sub.activeKey ?? this.endpointKeys[sub.activeIndex],
@@ -312,7 +541,7 @@ export class SandboxBackend {
             httpsStallStreak: 0,
             httpsLatencyMs: 240,
             dnsStallStreak: 0,
-            pinnedStalled: [],
+            serviceChecks: this.serviceResults.get(p.id) ?? [],
             xrayUdpSockets: 312,
             connStorm: null,
             lastRecoveryUnix: null,
@@ -425,9 +654,15 @@ export class SandboxBackend {
         if (p.backend === "none" && !p.routes.length) throw new Error("Static-routes profile has no routes");
         if (p.backend === "openVpn" && command === "connect_profile") throw "OpenVPN credentials required";
         this.running.add(p.id);
+        this.resetServiceWorker(p);
         return this.statuses().find((s) => s.profileId === p.id);
       }
-      case "disconnect_profile": this.running.delete(this.find(args.id).id); return this.statuses().find((s) => s.profileId === args.id);
+      case "disconnect_profile": {
+        const p = this.find(args.id);
+        this.running.delete(p.id);
+        this.clearServiceState(p.id);
+        return this.statuses().find((status) => status.profileId === p.id);
+      }
       case "save_profile":
       case "save_vless_profile":
       case "save_wireguard_profile": {
@@ -439,12 +674,23 @@ export class SandboxBackend {
         // commands, a generic form save never drops them.
         p.subscription = existing?.subscription ?? p.subscription;
         p.pinnedPolicies = existing?.pinnedPolicies ?? p.pinnedPolicies;
+        p.xrayServiceChecks = p.backend === "xray"
+          ? structuredClone(existing?.backend === "xray" ? existing.xrayServiceChecks ?? [] : p.xrayServiceChecks ?? [])
+          : [];
+        this.validateServiceSpecs(p, p.xrayServiceChecks);
         if (command === "save_vless_profile") { p.configPath = `/sandbox/${p.id}.json`; this.allocateProxyPorts(p); }
         if (command === "save_wireguard_profile") p.configPath = `/sandbox/${p.id}.conf`;
         this.profiles = [...this.profiles.filter((e) => e.id !== p.id), p];
+        this.resetServiceWorker(p);
         return this.profiles;
       }
-      case "delete_profile": this.stopped(this.find(args.id)); this.profiles = this.profiles.filter((p) => p.id !== args.id); return this.profiles;
+      case "delete_profile": {
+        const p = this.find(args.id);
+        this.stopped(p);
+        this.clearServiceState(p.id);
+        this.profiles = this.profiles.filter((item) => item.id !== p.id);
+        return this.profiles;
+      }
       case "inspect_profiles": return this.profiles.map((p) => this.inspect(p));
       case "inspect_profile_by_id": return this.inspect(this.find(args.id));
       case "diagnose_profile": {
@@ -540,7 +786,23 @@ export class SandboxBackend {
           ...route,
           missing: !listed.has(route.endpointKey),
         }));
+        this.resetServiceWorker(p);
         return this.profiles;
+      }
+      case "set_xray_service_checks": {
+        const p = this.find(args.profileId);
+        const checks = this.validateServiceSpecs(p, args.checks);
+        const bound = this.serviceBindings(p);
+        if (checks.some((check) => !bound.has(check.endpointKey) &&
+          !p.xrayServiceChecks?.some((old) => old.id === check.id && old.endpointKey === check.endpointKey))) {
+          throw new Error("The selected endpoint is not explicitly pinned");
+        }
+        p.xrayServiceChecks = checks;
+        this.resetServiceWorker(p);
+        return this.profiles;
+      }
+      case "run_xray_service_checks": {
+        return this.runServiceChecks(this.find(args.profileId), args.checkIds);
       }
       case "set_subscription_node_pool": {
         const p = this.find(args.profileId);

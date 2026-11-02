@@ -36,6 +36,9 @@ pub enum Command {
     /// app's direct/proxy/blocked lists and node pins)
     #[command(subcommand)]
     Migrate(MigrateCommand),
+    /// User-configured HTTPS checks through explicitly pinned endpoints
+    #[command(subcommand)]
+    Checks(ChecksCommand),
 
     /// Show which connections are running
     Status { target: Option<String> },
@@ -79,6 +82,57 @@ pub enum Command {
     /// Background process that keeps a connection up (started by `up`)
     #[command(hide = true)]
     Hold { target: String },
+}
+
+#[derive(Subcommand)]
+pub enum ChecksCommand {
+    /// List saved checks without contacting their destinations
+    List { profile: String },
+
+    /// Save a check; this does not contact its destination
+    Add {
+        profile: String,
+
+        /// Explicitly pinned endpoint: number, name, unique fragment, or key
+        #[arg(long, value_name = "NODE")]
+        via: String,
+
+        /// Display label, not a URL
+        #[arg(long)]
+        name: String,
+
+        /// HTTPS destination; do not supply credentials, tokens, or webhooks
+        #[arg(long, value_name = "HTTPS_URL")]
+        url: String,
+
+        /// Opt in to periodic background diagnostics
+        #[arg(long)]
+        background: bool,
+    },
+
+    /// Remove a saved check and stop its background diagnostic
+    Remove { profile: String, id: String },
+
+    /// Enable or disable a saved check's background diagnostic
+    Background {
+        profile: String,
+        id: String,
+        #[arg(value_parser = clap::value_parser!(BoolOnOff))]
+        enabled: BoolOnOff,
+    },
+
+    /// Run saved checks now; omit --id to run all
+    Run {
+        profile: String,
+        #[arg(long = "id", value_name = "ID")]
+        ids: Vec<String>,
+    },
+}
+
+impl std::fmt::Debug for ChecksCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ChecksCommand(<redacted>)")
+    }
 }
 
 #[derive(Subcommand, Debug)]

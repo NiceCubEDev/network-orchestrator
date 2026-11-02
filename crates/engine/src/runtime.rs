@@ -389,6 +389,10 @@ fn request_tunnel(
         macos_data_root: Some(root.to_string_lossy().into_owned()),
         role: profile.tunnel_role,
         failover: None,
+        reject_quic: false,
+        probe_url: None,
+        mtu: None,
+        service_checks: Vec::new(),
     };
     client
         .call::<_, XrayConnectResult>(method::XRAY_CONNECT, params)

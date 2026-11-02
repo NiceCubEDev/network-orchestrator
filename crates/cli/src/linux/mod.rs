@@ -7,6 +7,7 @@
 
 mod args;
 mod auth;
+mod checks;
 mod commands;
 mod compat;
 mod ctx;
@@ -21,7 +22,21 @@ use clap::{CommandFactory, Parser};
 use std::process::ExitCode;
 
 pub fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let checks_invocation = std::env::args_os().any(|arg| arg == std::ffi::OsStr::new("checks"));
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error)
+            if checks_invocation
+                && !matches!(
+                    error.kind(),
+                    clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+                ) =>
+        {
+            eprintln!("netorch: invalid checks arguments; use `netorch checks --help`");
+            return ExitCode::from(2);
+        }
+        Err(error) => error.exit(),
+    };
     if let Command::Completions { shell } = &cli.command {
         clap_complete::generate(
             *shell,
@@ -110,6 +125,7 @@ fn run(ctx: &ctx::Ctx, command: Command, json: bool) -> Result<commands::Output,
         Command::Route(command) => route::run(ctx, command),
         Command::Backup(command) => endpoints::backup(ctx, command),
         Command::Migrate(command) => migrate::run(ctx, command),
+        Command::Checks(command) => checks::run(ctx, command),
         Command::Refresh { target } => endpoints::refresh(ctx, &target),
         Command::Test(args) => endpoints::test(
             ctx,

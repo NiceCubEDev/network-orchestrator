@@ -6,9 +6,7 @@ use net_manager_core::config_vault::{ConfigImport, ConfigVault};
 use net_manager_core::models::*;
 use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, TcpListener};
-use std::path::Path;
-#[cfg(test)]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, Manager, State};
 
@@ -144,6 +142,16 @@ fn preserve_canonical_subscription(profile: &mut Profile, stored: Option<&Profil
 fn preserve_pinned_policies(profile: &mut Profile, stored: Option<&Profile>) {
     profile.pinned_policies = if profile.backend == TunnelBackend::Xray {
         stored.map_or_else(Vec::new, |profile| profile.pinned_policies.clone())
+    } else {
+        Vec::new()
+    };
+}
+
+fn preserve_service_checks(profile: &mut Profile, stored: Option<&Profile>) {
+    profile.xray_service_checks = if profile.backend == TunnelBackend::Xray {
+        stored
+            .filter(|stored| stored.backend == TunnelBackend::Xray)
+            .map_or_else(Vec::new, |stored| stored.xray_service_checks.clone())
     } else {
         Vec::new()
     };
@@ -352,6 +360,7 @@ pub(crate) async fn save_profile(
     let stored = existing_profile_for_update(&document, &profile.id).cloned();
     preserve_canonical_subscription(&mut profile, stored.as_ref());
     preserve_pinned_policies(&mut profile, stored.as_ref());
+    preserve_service_checks(&mut profile, stored.as_ref());
     preserve_migrated_xray_settings(&mut profile, stored.as_ref());
     preserve_generated_xray_source(&mut profile, stored.as_ref());
     #[cfg(target_os = "linux")]
@@ -465,6 +474,7 @@ pub(crate) async fn save_vless_profile(
     let stored = existing_profile_for_update(&document, &profile.id).cloned();
     preserve_canonical_subscription(&mut profile, stored.as_ref());
     preserve_pinned_policies(&mut profile, stored.as_ref());
+    preserve_service_checks(&mut profile, stored.as_ref());
     preserve_migrated_xray_settings(&mut profile, stored.as_ref());
     validate_xray_routing(&profile)?;
     if let Some(existing) = &stored {
@@ -559,6 +569,7 @@ pub(crate) async fn save_wireguard_profile(
     let stored = existing_profile_for_update(&document, &profile.id).cloned();
     preserve_canonical_subscription(&mut profile, stored.as_ref());
     preserve_pinned_policies(&mut profile, stored.as_ref());
+    preserve_service_checks(&mut profile, stored.as_ref());
     preserve_migrated_xray_settings(&mut profile, stored.as_ref());
     if let Some(existing) = &stored {
         #[cfg(target_os = "linux")]
@@ -1301,14 +1312,268 @@ pub(crate) async fn set_pinned_routes(
     if profile.backend != TunnelBackend::Xray {
         return Err("node-pinned rules need an Xray subscription".into());
     }
-    let doc = net_manager_core::subscription::set_pinned_routes(
+    let candidate = if profile
+        .xray_service_checks
+        .iter()
+        .any(|check| check.background)
+    {
+        let mut candidate = profile.clone();
+        candidate.pinned_policies = routes.clone();
+        net_manager_core::profiles::validate_profile(&candidate)
+            .map_err(|_| "The pinned-route configuration is invalid".to_string())?;
+        #[cfg(target_os = "linux")]
+        acknowledge_service_checks(&candidate, &candidate.xray_service_checks).await?;
+        Some(candidate)
+    } else {
+        None
+    };
+    let saved = net_manager_core::subscription::set_pinned_routes(
         &state.config_vault,
         &state.profiles,
         &profile_id,
         routes,
-    )
-    .map_err(|e| e.to_string())?;
+    );
+    #[cfg(target_os = "linux")]
+    if saved.is_err() {
+        if let Some(candidate) = candidate {
+            acknowledge_service_checks(&candidate, &[]).await?;
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = candidate;
+    let doc = saved.map_err(|e| e.to_string())?;
     Ok(redact_profiles_for_ipc(doc.profiles))
+}
+
+fn require_service_check_user() -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            return Err("Run service-check operations as your own user, without sudo".into());
+        }
+    }
+    Ok(())
+}
+
+fn service_check_profile(state: &AppState, profile_id: &str) -> Result<Profile, String> {
+    let profile = find_profile(&state.profiles, profile_id)
+        .map_err(|_| "The requested profile could not be selected".to_string())?;
+    if profile.backend != TunnelBackend::Xray {
+        return Err("Service checks require an Xray profile".into());
+    }
+    Ok(profile)
+}
+
+fn service_check_endpoints(
+    state: &AppState,
+    profile: &Profile,
+) -> Result<Vec<net_manager_core::config_vault::SubscriptionEndpoint>, String> {
+    if profile.subscription.is_none() {
+        return Ok(Vec::new());
+    }
+    state
+        .config_vault
+        .read_subscription_endpoints(&profile.id)
+        .map_err(|_| "The saved endpoint list could not be read".to_string())
+}
+
+#[cfg(target_os = "linux")]
+async fn acknowledge_service_checks(
+    profile: &Profile,
+    checks: &[ServiceCheck],
+) -> Result<(), String> {
+    use net_manager_core::daemon_protocol::{
+        method, XrayProfileParams, XrayServiceChecksParams, XrayStatusResult,
+    };
+
+    if profile.xray_mode != XrayMode::Tun
+        || (!profile
+            .xray_service_checks
+            .iter()
+            .any(|check| check.background)
+            && !checks.iter().any(|check| check.background))
+    {
+        return Ok(());
+    }
+
+    let runtime_checks = checks
+        .iter()
+        .filter(|check| {
+            check.background
+                && net_manager_core::service_checks::service_check_is_bound(
+                    profile,
+                    &check.endpoint_key,
+                )
+        })
+        .cloned()
+        .collect();
+
+    let client = crate::daemon_client::DaemonClient::system();
+    if client
+        .request::<_, Vec<ServiceCheckResult>>(
+            method::XRAY_SERVICE_CHECKS,
+            XrayServiceChecksParams {
+                profile_id: profile.id.clone(),
+                checks: runtime_checks,
+            },
+        )
+        .await
+        .is_ok()
+    {
+        return Ok(());
+    }
+
+    let stopped = client
+        .request::<_, XrayStatusResult>(
+            method::XRAY_STATUS,
+            XrayProfileParams {
+                profile_id: profile.id.clone(),
+            },
+        )
+        .await
+        .is_ok_and(|status| status.state == TunnelState::Stopped);
+
+    if stopped {
+        Ok(())
+    } else {
+        Err("The daemon did not confirm the diagnostic change; configuration was not saved".into())
+    }
+}
+
+#[tauri::command]
+pub(crate) async fn set_xray_service_checks(
+    profile_id: String,
+    checks: Vec<ServiceCheck>,
+    state: State<'_, AppState>,
+) -> Result<Vec<Profile>, String> {
+    require_service_check_user()?;
+    let _guard = SUBSCRIPTION_REFRESH_LOCK.lock().await;
+    let expected = service_check_profile(state.inner(), &profile_id)?;
+    let expected_endpoints = service_check_endpoints(state.inner(), &expected)?;
+
+    net_manager_core::service_checks::validate_service_checks(&checks)
+        .map_err(|_| "The service-check configuration is invalid".to_string())?;
+
+    // Preserve existing dangling choices, but do not allow the dedicated
+    // editor to recruit an unpinned endpoint for a new or retargeted check.
+    for check in &checks {
+        let retained = expected
+            .xray_service_checks
+            .iter()
+            .any(|previous| previous.id == check.id && previous.endpoint_key == check.endpoint_key);
+        if !retained
+            && !net_manager_core::service_checks::service_check_is_bound(
+                &expected,
+                &check.endpoint_key,
+            )
+        {
+            return Err("The selected endpoint is not explicitly pinned".into());
+        }
+    }
+
+    let mut candidate = expected.clone();
+    candidate.xray_service_checks = checks.clone();
+    net_manager_core::profiles::validate_profile(&candidate)
+        .map_err(|_| "The profile cannot accept this configuration".to_string())?;
+
+    #[cfg(target_os = "linux")]
+    acknowledge_service_checks(&expected, &checks).await?;
+
+    let saved_document = state.profiles.update_profile(&profile_id, |current| {
+        if *current != expected {
+            return Err(std::io::Error::other("selection changed"));
+        }
+        if current.subscription.is_some()
+            && state
+                .config_vault
+                .read_subscription_endpoints(&current.id)?
+                != expected_endpoints
+        {
+            return Err(std::io::Error::other("selection changed"));
+        }
+        current.xray_service_checks = checks;
+        Ok(())
+    });
+    let document = match saved_document {
+        Ok(document) => document,
+        Err(_) => {
+            #[cfg(target_os = "linux")]
+            let stopped = acknowledge_service_checks(
+                if expected
+                    .xray_service_checks
+                    .iter()
+                    .any(|check| check.background)
+                {
+                    &expected
+                } else {
+                    &candidate
+                },
+                &[],
+            )
+            .await
+            .is_ok();
+            #[cfg(not(target_os = "linux"))]
+            let stopped = true;
+            return Err(if stopped {
+                "Checks were not saved; background diagnostics are stopped."
+            } else {
+                "Checks were not saved; the daemon did not confirm background cancellation."
+            }
+            .into());
+        }
+    };
+
+    Ok(redact_profiles_for_ipc(document.profiles))
+}
+
+#[tauri::command]
+pub(crate) async fn run_xray_service_checks(
+    profile_id: String,
+    check_ids: Option<Vec<String>>,
+    state: State<'_, AppState>,
+) -> Result<Vec<ServiceCheckResult>, String> {
+    require_service_check_user()?;
+
+    let (expected, expected_endpoints) = {
+        let _guard = SUBSCRIPTION_REFRESH_LOCK.lock().await;
+        let profile = service_check_profile(state.inner(), &profile_id)?;
+        let endpoints = service_check_endpoints(state.inner(), &profile)?;
+        (profile, endpoints)
+    };
+
+    // Do not hold the save/refresh lock during network work: background
+    // opt-out must remain able to cancel its independent worker.
+    let executable = std::sync::OnceLock::<Result<PathBuf, String>>::new();
+    let results = net_manager_core::service_checks::check_profile_services(
+        &state.config_vault,
+        &expected,
+        check_ids.as_deref(),
+        || {
+            let path = executable
+                .get_or_init(|| {
+                    state
+                        .resolve_backend_executable(TunnelBackend::Xray)
+                        .map(|resolved| resolved.path)
+                        .map_err(|_| "Xray executable unavailable".to_string())
+                })
+                .as_ref()
+                .map_err(Clone::clone)?;
+            Ok(tokio::process::Command::new(path))
+        },
+    )
+    .await
+    .map_err(|_| "The service checks could not be completed".to_string())?;
+
+    let _guard = SUBSCRIPTION_REFRESH_LOCK.lock().await;
+    let current = service_check_profile(state.inner(), &profile_id)?;
+    if current != expected
+        || service_check_endpoints(state.inner(), &current)? != expected_endpoints
+    {
+        return Err("The profile or endpoint selection changed; run the checks again".into());
+    }
+
+    Ok(results)
 }
 
 /// The opt-in filtered pool: filters plus the country-proof flag; `None`

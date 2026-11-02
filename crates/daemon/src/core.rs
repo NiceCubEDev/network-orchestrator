@@ -1287,6 +1287,7 @@ mod openvpn_tests {
             xray_restarts: HashMap::new(),
             failovers: HashMap::new(),
             watchdogs: HashMap::new(),
+            service_checks: HashMap::new(),
             watchdog_network: None,
             quic_reject: None,
             cond_eval: HashMap::new(),
@@ -1632,6 +1633,8 @@ pub struct DaemonCore {
     /// this mutex; core only consumes their shared status.
     failovers: HashMap<(u32, String), crate::failover::FailoverSupervisor>,
     watchdogs: HashMap<(u32, String), crate::watchdog::WatchdogSupervisor>,
+    /// User URLs exist only in the diagnostic worker, never in owned resources.
+    service_checks: HashMap<(u32, String), crate::service_checks::ServiceCheckSupervisor>,
     watchdog_network: Option<crate::watchdog::WatchdogNetwork>,
     quic_reject: Option<Box<dyn crate::quic_reject::QuicRejectExecutor>>,
     /// Last evaluation of each conditional rule `(uid, rule id)`: which
@@ -1796,6 +1799,7 @@ impl DaemonCore {
             xray_restarts: HashMap::new(),
             failovers: HashMap::new(),
             watchdogs: HashMap::new(),
+            service_checks: HashMap::new(),
             watchdog_network: None,
             quic_reject: None,
             cond_eval: HashMap::new(),
@@ -1843,6 +1847,7 @@ impl DaemonCore {
             xray_restarts: HashMap::new(),
             failovers: HashMap::new(),
             watchdogs: HashMap::new(),
+            service_checks: HashMap::new(),
             watchdog_network: None,
             quic_reject: None,
             cond_eval: HashMap::new(),
@@ -1888,6 +1893,7 @@ impl DaemonCore {
             xray_restarts: HashMap::new(),
             failovers: HashMap::new(),
             watchdogs: HashMap::new(),
+            service_checks: HashMap::new(),
             watchdog_network: None,
             quic_reject: None,
             cond_eval: HashMap::new(),
@@ -1927,6 +1933,7 @@ impl DaemonCore {
             xray_restarts: HashMap::new(),
             failovers: HashMap::new(),
             watchdogs: HashMap::new(),
+            service_checks: HashMap::new(),
             watchdog_network: None,
             quic_reject: None,
             cond_eval: HashMap::new(),
@@ -1970,6 +1977,7 @@ impl DaemonCore {
             xray_restarts: HashMap::new(),
             failovers: HashMap::new(),
             watchdogs: HashMap::new(),
+            service_checks: HashMap::new(),
             watchdog_network: None,
             quic_reject: None,
             cond_eval: HashMap::new(),
@@ -2018,6 +2026,7 @@ impl DaemonCore {
             xray_restarts: HashMap::new(),
             failovers: HashMap::new(),
             watchdogs: HashMap::new(),
+            service_checks: HashMap::new(),
             watchdog_network: None,
             quic_reject: Some(Box::new(crate::quic_reject::TrustedQuicReject)),
             cond_eval: HashMap::new(),
@@ -2144,6 +2153,16 @@ impl DaemonCore {
         self.tunnel_failed.remove(&(uid, owner.clone()));
         self.start_failover(uid, &owner, &plan);
         self.ensure_watchdog(index);
+        if self
+            .set_xray_service_checks(
+                uid,
+                &plan.profile_id,
+                std::mem::take(&mut plan.service_checks),
+            )
+            .is_err()
+        {
+            eprintln!("network-orchestrator-daemon: service diagnostics unavailable");
+        }
         Ok(self.xray_status(uid, &plan.profile_id))
     }
 
@@ -2165,6 +2184,61 @@ impl DaemonCore {
                 eprintln!("network-orchestrator-daemon: failover supervisor failed to start: {err}")
             }
         }
+    }
+
+    /// Replace only the caller's diagnostic worker; no recovery or route access.
+    pub fn set_xray_service_checks(
+        &mut self,
+        uid: u32,
+        profile_id: &str,
+        checks: Vec<net_manager_core::models::ServiceCheck>,
+    ) -> io::Result<Vec<net_manager_core::models::ServiceCheckResult>> {
+        let owner = format!("xray:{profile_id}");
+        validate_owner(&owner).map_err(invalid_input)?;
+        net_manager_core::service_checks::validate_service_checks(&checks)?;
+        let key = (uid, owner);
+        let process = self.position(uid, &key.1).and_then(|index| {
+            self.journal.entries[index]
+                .resources
+                .iter()
+                .find_map(|resource| match resource {
+                    OwnedResource::XrayProcess(process) => Some(process),
+                    _ => None,
+                })
+        });
+        let ports = process.map(|process| {
+            process
+                .pinned_keys
+                .iter()
+                .enumerate()
+                .map(|(index, key)| {
+                    (
+                        key.clone(),
+                        crate::xray::xray_pin_probe_port(process.transport_mark, index),
+                    )
+                })
+                .collect::<HashMap<_, _>>()
+        });
+        // Cancel first: an opt-out must not depend on starting a replacement.
+        self.service_checks.remove(&key);
+        let Some(ports) = ports else {
+            return Ok(Vec::new());
+        };
+        if !checks.iter().any(|check| check.background) {
+            return Ok(Vec::new());
+        }
+        let network = self.watchdog_network.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "service diagnostics unavailable",
+            )
+        })?;
+        if let Some(worker) =
+            crate::service_checks::ServiceCheckSupervisor::spawn(checks, &ports, &network.runtime)
+        {
+            self.service_checks.insert(key, worker);
+        }
+        Ok(Vec::new())
     }
 
     pub fn set_watchdog_network(&mut self, network: crate::watchdog::WatchdogNetwork) {
@@ -2216,17 +2290,6 @@ impl DaemonCore {
                     .as_ref()
                     .map(|failover| failover.probe_url.clone())
             }),
-            pin_probes: process
-                .pinned_keys
-                .iter()
-                .enumerate()
-                .map(|(index, key)| {
-                    (
-                        key.clone(),
-                        crate::xray::xray_pin_probe_port(process.transport_mark, index),
-                    )
-                })
-                .collect(),
         };
         if let Ok(watchdog) = crate::watchdog::WatchdogSupervisor::spawn(spec, network) {
             self.watchdogs.insert(key, watchdog);
@@ -2318,6 +2381,7 @@ impl DaemonCore {
         self.ensure_xray_reload_compatible(index, &plan, &process)?;
         self.failovers.remove(&(uid, owner.clone()));
         self.watchdogs.remove(&(uid, owner.clone()));
+        self.service_checks.remove(&(uid, owner.clone()));
         let runner = self.xray.as_mut().ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotConnected, "Xray executor is unavailable")
         })?;
@@ -2354,6 +2418,16 @@ impl DaemonCore {
         // supervisor (with the new probe set) re-installs it.
         self.start_failover(uid, &owner, &plan);
         self.ensure_watchdog(index);
+        if self
+            .set_xray_service_checks(
+                uid,
+                &plan.profile_id,
+                std::mem::take(&mut plan.service_checks),
+            )
+            .is_err()
+        {
+            eprintln!("network-orchestrator-daemon: service diagnostics unavailable");
+        }
         self.tunnel_failed.remove(&(uid, owner));
         Ok(self.xray_status(uid, &plan.profile_id))
     }
@@ -2760,6 +2834,13 @@ impl DaemonCore {
         } else {
             (None, None)
         };
+        let mut watchdog = self
+            .watchdogs
+            .get(&(uid, owner.clone()))
+            .map(|watchdog| watchdog.status());
+        if let Some(checks) = self.service_checks.get(&(uid, owner.clone())) {
+            watchdog.get_or_insert_with(Default::default).service_checks = checks.status();
+        }
         XrayStatusResult {
             profile_id: profile_id.to_owned(),
             state,
@@ -2776,10 +2857,7 @@ impl DaemonCore {
                 .is_some_and(|process| process.full.as_ref().is_some_and(|full| full.ipv4)),
             ipv6_covered: process
                 .is_some_and(|process| process.full.as_ref().is_some_and(|full| full.ipv6)),
-            watchdog: self
-                .watchdogs
-                .get(&(uid, owner.clone()))
-                .map(|watchdog| watchdog.status()),
+            watchdog,
             failover: self
                 .failovers
                 .get(&(uid, owner))
@@ -6342,6 +6420,8 @@ impl DaemonCore {
         let entry = self.journal.entries[index].clone();
         self.failovers.remove(&(entry.uid, entry.owner.clone()));
         self.watchdogs.remove(&(entry.uid, entry.owner.clone()));
+        self.service_checks
+            .remove(&(entry.uid, entry.owner.clone()));
         let process = entry
             .resources
             .iter()
@@ -6950,6 +7030,7 @@ mod xray_core_tests {
             reject_quic: false,
             probe_url: None,
             mtu: None,
+            service_checks: Vec::new(),
         }
     }
 

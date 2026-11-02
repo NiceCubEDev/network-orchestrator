@@ -684,6 +684,7 @@ export default function ProfileFormModal({
       // Linux multinode: the failover editor owns these; carry them back so a
       // form save cannot drop them (the backend re-restores either way).
       pinnedPolicies: isXray ? current.pinnedPolicies : [],
+      xrayServiceChecks: isXray ? current.preservedProfile?.xrayServiceChecks ?? [] : [],
     };
     setSaving(true);
     try {

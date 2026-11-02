@@ -148,6 +148,28 @@ export interface PinnedRoute {
   missing?: boolean;
 }
 
+export interface ServiceCheck {
+  id: string;
+  name: string;
+  url: string;
+  endpointKey: string;
+  background: boolean;
+}
+
+export type ServiceCheckOutcome = "http" | "timeout" | "tlsError" | "transportError" | "unavailable";
+
+export interface ServiceCheckResult {
+  id: string;
+  name: string;
+  endpointKey: string;
+  outcome: ServiceCheckOutcome;
+  httpStatus: number | null;
+  latencyMs: number | null;
+  checkedAtUnix: number;
+  consecutiveFailures: number;
+  degraded: boolean;
+}
+
 /** A remembered node reference in `backupKeys`: key plus last known name. */
 export interface EndpointRef {
   key: string;
@@ -399,8 +421,8 @@ export interface WatchdogStatus {
   httpsStallStreak: number;
   httpsLatencyMs: number | null;
   dnsStallStreak: number;
-  /** Keys of pinned nodes whose probes stalled. */
-  pinnedStalled: string[];
+  /** Explicit opt-in service diagnostics; absent means no readings. */
+  serviceChecks?: ServiceCheckResult[];
   /** UDP sockets xray holds — a leak foreshadows port exhaustion. */
   xrayUdpSockets: number;
   connStorm: ConnStorm | null;
@@ -471,6 +493,7 @@ export interface Profile {
   xrayMode: XrayMode;
   /** Linux: domain selectors fail-closed to a specific subscription node. */
   pinnedPolicies?: PinnedRoute[];
+  xrayServiceChecks?: ServiceCheck[];
   /** macOS: a secondary connection carries only `tunnelNetworks`. */
   tunnelRole?: "primary" | "secondary";
   tunnelNetworks?: string[];

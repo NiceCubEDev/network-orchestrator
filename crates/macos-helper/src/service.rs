@@ -186,6 +186,7 @@ fn owned_entry(kind: Kind, record: Record) -> OwnedEntry {
             reject_quic: false,
             probe_url: None,
             pinned_keys: Vec::new(),
+            mtu: None,
         }),
         Kind::WireGuard => OwnedResource::WireGuardLink(WireGuardLinkResource {
             name,

@@ -39,13 +39,16 @@ impl ProfileStore {
             }
             Err(err) => return Err(err),
         };
-        let document: ProfileDocument = serde_json::from_str(&raw)
-            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+        let document: ProfileDocument =
+            serde_json::from_str(&raw).map_err(|_| invalid_data("invalid profile document"))?;
         if document.version != PROFILE_DOCUMENT_VERSION {
             return Err(invalid_data(format!(
                 "unsupported profile document version {}",
                 document.version
             )));
+        }
+        for profile in &document.profiles {
+            crate::service_checks::validate_profile_service_checks(profile)?;
         }
         Ok(document)
     }
@@ -59,6 +62,9 @@ impl ProfileStore {
     }
 
     fn save_locked(&self, document: &ProfileDocument) -> io::Result<()> {
+        for profile in &document.profiles {
+            crate::service_checks::validate_profile_service_checks(profile)?;
+        }
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
             crate::config_security::protect_path(parent)?;
@@ -275,6 +281,7 @@ pub fn validate_profile(profile: &Profile) -> io::Result<()> {
             }
         }
     }
+    crate::service_checks::validate_profile_service_checks(profile)?;
     if profile.backend != TunnelBackend::Xray && !profile.domain_policies.is_empty() {
         return Err(invalid_data(
             "domain policies are only supported for Xray profiles",
@@ -407,6 +414,33 @@ mod tests {
             auto_connect: true,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn service_checks_refuse_non_https_destinations_before_persistence() {
+        let mut profile = wg_profile();
+        profile.backend = TunnelBackend::Xray;
+        profile.config_path = PathBuf::from("service-checks.json");
+        let mut value = serde_json::to_value(profile).unwrap();
+        value["xrayServiceChecks"] = serde_json::json!([{
+            "id": "service-example",
+            "name": "Example availability",
+            "url": "http://example.test/",
+            "endpointKey": "1111111111111111",
+            "background": false
+        }]);
+        value["subscription"] = serde_json::json!({
+            "url": "https://subscription.example.test/synthetic",
+            "hwid": "",
+            "endpointCount": 1,
+            "activeIndex": 0
+        });
+        value["xrayServiceChecks"][0]["url"] = serde_json::json!("https://example.test/");
+        let valid: Profile = serde_json::from_value(value.clone()).unwrap();
+        validate_profile(&valid).unwrap();
+        value["xrayServiceChecks"][0]["url"] = serde_json::json!("http://example.test/");
+        let invalid: Profile = serde_json::from_value(value).unwrap();
+        assert!(validate_profile(&invalid).is_err());
     }
 
     #[test]

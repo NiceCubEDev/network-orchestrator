@@ -43,6 +43,7 @@ pub struct XrayPlan {
     pub reject_quic: bool,
     pub probe_url: Option<String>,
     pub pinned_keys: Vec<String>,
+    pub service_checks: Vec<net_manager_core::models::ServiceCheck>,
     /// Inline caller-provided `geoip.dat`/`geosite.dat` contents; decoded
     /// into the root-owned staging dir before spawn (the sandboxed unit
     /// cannot see caller paths).
@@ -1018,6 +1019,7 @@ pub fn prepare_xray(uid: u32, params: XrayConnectParams, mark: u32) -> io::Resul
     {
         return Err(rejected());
     }
+    net_manager_core::service_checks::validate_service_checks(&params.service_checks)?;
     let mut seen = HashSet::new();
     for route in &params.routes {
         if route.via.is_some()
@@ -1295,6 +1297,7 @@ pub fn prepare_xray(uid: u32, params: XrayConnectParams, mark: u32) -> io::Resul
         reject_quic: params.reject_quic,
         probe_url,
         pinned_keys,
+        service_checks: params.service_checks,
         geo_assets: params.geo_assets,
     })
 }
@@ -1536,6 +1539,7 @@ mod tests {
             reject_quic: false,
             probe_url: None,
             mtu: None,
+            service_checks: Vec::new(),
         }
     }
 

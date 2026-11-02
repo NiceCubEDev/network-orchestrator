@@ -172,7 +172,6 @@ pub fn xray_tun_health(status: &XrayStatusResult) -> ProtocolHealth {
                 if watchdog.uplink == Some(false)
                     || watchdog.https_stall_streak >= 3
                     || watchdog.dns_stall_streak >= 3
-                    || !watchdog.pinned_stalled.is_empty()
                     || !watchdog.anomalies.is_empty() =>
             {
                 (
@@ -1282,12 +1281,6 @@ mod tests {
             ProtocolHealthState::Degraded
         );
         monitored.watchdog.as_mut().unwrap().https_stall_streak = 0;
-        monitored.watchdog.as_mut().unwrap().pinned_stalled = vec!["0123456789abcdef".into()];
-        assert_eq!(
-            xray_tun_health(&monitored).state,
-            ProtocolHealthState::Degraded
-        );
-        monitored.watchdog.as_mut().unwrap().pinned_stalled.clear();
         monitored.watchdog.as_mut().unwrap().uplink = Some(false);
         assert_eq!(
             xray_tun_health(&monitored).state,

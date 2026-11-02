@@ -94,6 +94,21 @@ impl LinuxEngine {
             .map_err(daemon_error)
     }
 
+    /// Reconfigure diagnostics only; never reload the child or alter routing.
+    pub fn set_xray_service_checks(
+        &self,
+        profile_id: &str,
+        checks: Vec<net_manager_core::models::ServiceCheck>,
+    ) -> Result<Vec<net_manager_core::models::ServiceCheckResult>, String> {
+        self.ask(
+            method::XRAY_SERVICE_CHECKS,
+            net_manager_core::daemon_protocol::XrayServiceChecksParams {
+                profile_id: profile_id.to_owned(),
+                checks,
+            },
+        )
+    }
+
     /// Whether the daemon handles this profile; everything else (static
     /// routes, a local Xray proxy) runs in the client process.
     pub fn handles(profile: &Profile) -> bool {
