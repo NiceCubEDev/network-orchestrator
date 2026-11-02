@@ -404,7 +404,11 @@ print("ok   DNS tunnel disconnect removed ownership", flush=True)
 print("\n=== WireGuard secondary role: listed networks and split DNS only", flush=True)
 secondary_params = {
     "profileId": "wg-secondary",
-    "config": dns_config,
+    # The original Docker default is restored: the synthetic 198.18.0.1
+    # endpoint was reachable only through the temporary server default.
+    "config": dns_config.replace(
+        "Endpoint = 198.18.0.1:51820", f"Endpoint = {server_ip}:51820"
+    ),
     "routes": [{"destination": "10.77.0.0/24", "metric": 5}],
     "role": "secondary",
     "dnsDomains": ["test"],
