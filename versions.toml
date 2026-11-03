@@ -8,7 +8,7 @@ version = "0.13.0"
 
 [macos]
 # The macOS app, its helper and bridge, and netorch for macOS.
-version = "0.10.1"
+version = "0.10.2"
 
 [linux]
 # The Linux app, the network daemon and netorch for Linux.

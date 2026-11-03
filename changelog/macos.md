@@ -10,6 +10,10 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+## [0.10.2] - 2026-11-03
+
+Core 0.13.0.
+
 ### Changed
 
 - Keep shared Xray request, status and ownership models compatible with named
