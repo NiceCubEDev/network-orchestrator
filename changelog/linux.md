@@ -10,6 +10,12 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+### Fixed
+
+- Accept geosite category names containing `!` (for example,
+  `category-ai-chat-!cn`) at the daemon boundary, matching generated profile
+  rules. External asset selectors and path traversal remain rejected.
+
 ## [0.13.0] - 2026-11-03
 
 Core 0.13.0.

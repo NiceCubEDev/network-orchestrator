@@ -867,9 +867,9 @@ fn routing_selector(key: &str, item: &str) -> io::Result<()> {
                 let (name, attr) = (parts.next().unwrap_or_default(), parts.next());
                 !name.is_empty()
                     && name.len() <= 64
-                    && name
-                        .bytes()
-                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+                    && name.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'!')
+                    })
                     && attr.is_none_or(|attr| {
                         !attr.is_empty()
                             && attr.len() <= 64
@@ -1800,7 +1800,7 @@ mod tests {
             assert!(with_rule(rule.clone()).is_err(), "{rule}");
         }
         for rule in [
-            json!({"type":"field","domain":["example.com","domain:a.test","full:b.test","keyword:ads","regexp:^c\\.test$","geosite:category-ads_all"],"outboundTag":"proxy"}),
+            json!({"type":"field","domain":["example.com","domain:a.test","full:b.test","keyword:ads","regexp:^c\\.test$","geosite:category-ads_all","geosite:category-ai-chat-!cn"],"outboundTag":"proxy"}),
             json!({"type":"field","ip":["geoip:private","geoip:us","geoip:direct","geoip:custom_cat","10.0.0.0/8","::1/128","192.0.2.1"],"outboundTag":"direct"}),
         ] {
             assert!(with_rule(rule.clone()).is_ok(), "{rule}");
