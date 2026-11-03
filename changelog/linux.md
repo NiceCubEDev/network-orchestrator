@@ -10,6 +10,10 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-11-03
+
+Core 0.13.0.
+
 ### Added
 
 - `netorch proxy set|list|remove` and `netorch proxy [--profile PROFILE] NAME --
