@@ -1,6 +1,7 @@
 //! Command line of `netorch` on Linux.
 use clap::{Args, Parser, Subcommand};
 use clap_complete::Shell;
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -39,6 +40,8 @@ pub enum Command {
     /// User-configured HTTPS checks through explicitly pinned endpoints
     #[command(subcommand)]
     Checks(ChecksCommand),
+    /// Named proxy exits: run one command through a chosen path of a tunnel
+    Proxy(ProxyArgs),
 
     /// Show which connections are running
     Status { target: Option<String> },
@@ -365,6 +368,80 @@ pub struct UpArgs {
     pub passphrase_stdin: bool,
 }
 
+/// `netorch proxy`: named per-command exits of a connected Xray TUN profile.
+/// With `--profile` (before the exit name) a name that exists on several
+/// profiles is picked without asking.
+#[derive(Args, Debug)]
+pub struct ProxyArgs {
+    /// Profile of the exit, when its name is not unique across profiles
+    #[arg(long, value_name = "PROFILE")]
+    pub profile: Option<String>,
+    #[command(subcommand)]
+    pub command: ProxyCommand,
+}
+
+#[derive(Subcommand)]
+pub enum ProxyCommand {
+    /// List the named exits of the saved profiles (offline)
+    List {
+        /// Show only this profile
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+    },
+    /// Create or replace a named exit; the command runs only at launch
+    #[command(group(
+        clap::ArgGroup::new("target")
+            .args(["rules", "via", "pool", "direct"])
+            .required(true)
+    ))]
+    Set {
+        /// Exit name: 1-32 of a-z 0-9 - _, starting with a letter or digit
+        name: String,
+        /// Saved Xray profile the exit belongs to
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+        /// The profile's own routing rules decide, like the main connection
+        #[arg(long)]
+        rules: bool,
+        /// Always exit through one server: number, name part or 16-hex key
+        #[arg(long, value_name = "NODE")]
+        via: Option<String>,
+        /// Exit through these servers in order, moving on when one fails
+        #[arg(long, value_name = "NODE", num_args = 1..)]
+        pool: Option<Vec<String>>,
+        /// Bypass the tunnel entirely: the command connects directly
+        #[arg(long)]
+        direct: bool,
+        /// Hosts, domains, IPs or CIDRs (comma-separated) that skip the exit
+        #[arg(long, value_name = "ITEM,...", value_delimiter = ',')]
+        no_proxy: Vec<String>,
+    },
+    /// Delete a named exit
+    Remove {
+        name: String,
+        /// Saved profile the exit belongs to
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+    },
+    /// `netorch proxy [--profile PROFILE] NAME -- COMMAND [ARGS...]`
+    #[command(external_subcommand)]
+    Run(Vec<OsString>),
+}
+
+impl std::fmt::Debug for ProxyCommand {
+    /// The arguments of `proxy NAME -- COMMAND` may carry secrets; only the
+    /// variant is shown, the captured argv never.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let variant = match self {
+            ProxyCommand::List { .. } => "List",
+            ProxyCommand::Set { .. } => "Set",
+            ProxyCommand::Remove { .. } => "Remove",
+            ProxyCommand::Run(_) => "Run",
+        };
+        write!(f, "ProxyCommand::{variant}(<redacted>)")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,5 +456,137 @@ mod tests {
     fn down_all_and_a_target_exclude_each_other() {
         assert!(Cli::try_parse_from(["netorch", "down", "--all", "x"]).is_err());
         assert!(Cli::try_parse_from(["netorch", "down", "--all"]).is_ok());
+    }
+
+    fn proxy_run(argv: &[&str]) -> Vec<OsString> {
+        match Cli::try_parse_from(argv).map(|cli| cli.command) {
+            Ok(Command::Proxy(args)) => match args.command {
+                ProxyCommand::Run(args) => args,
+                _ => panic!("expected the external run variant"),
+            },
+            Err(error) => panic!("{argv:?} did not parse: {error}"),
+            _ => panic!("expected the proxy command"),
+        }
+    }
+
+    #[test]
+    fn proxy_run_captures_the_separator_and_argv_verbatim() {
+        // The external capture keeps the literal `--` and every argument of
+        // the command, options included; the exit name comes first.
+        assert_eq!(
+            proxy_run(&[
+                "netorch",
+                "proxy",
+                "nl",
+                "--",
+                "curl",
+                "-sS",
+                "example.test"
+            ]),
+            ["nl", "--", "curl", "-sS", "example.test"]
+        );
+        assert_eq!(
+            proxy_run(&["netorch", "proxy", "direct", "--", "prog", "--flag", "--"]),
+            ["direct", "--", "prog", "--flag", "--"]
+        );
+    }
+
+    #[test]
+    fn proxy_run_takes_profile_before_the_name() {
+        let cli =
+            Cli::try_parse_from(["netorch", "proxy", "--profile", "work", "nl", "--", "curl"])
+                .unwrap();
+        match cli.command {
+            Command::Proxy(args) => {
+                assert_eq!(args.profile.as_deref(), Some("work"));
+                match args.command {
+                    ProxyCommand::Run(args) => assert_eq!(args, ["nl", "--", "curl"]),
+                    _ => panic!("expected the run variant"),
+                }
+            }
+            _ => panic!("expected the proxy command"),
+        }
+        // `--profile` after the name belongs to the command, not netorch.
+        assert_eq!(
+            proxy_run(&["netorch", "proxy", "nl", "--profile", "x", "--", "curl"]),
+            ["nl", "--profile", "x", "--", "curl"]
+        );
+        // An unknown option before `--` is captured verbatim too: nothing
+        // netorch does not know may change the launched command.
+        assert_eq!(
+            proxy_run(&["netorch", "proxy", "nl", "-x", "--", "curl"]),
+            ["nl", "-x", "--", "curl"]
+        );
+    }
+
+    #[test]
+    fn proxy_run_requires_a_command_after_the_separator() {
+        // `proxy nl` alone parses but is refused at launch; `proxy` alone is
+        // rejected by clap because a subcommand is required.
+        assert_eq!(proxy_run(&["netorch", "proxy", "nl"]), ["nl"]);
+        assert!(Cli::try_parse_from(["netorch", "proxy"]).is_err());
+    }
+
+    #[test]
+    fn proxy_set_accepts_profile_after_the_name() {
+        let cli = Cli::try_parse_from([
+            "netorch",
+            "proxy",
+            "set",
+            "nl",
+            "--profile",
+            "work",
+            "--pool",
+            "a",
+            "b",
+            "--no-proxy",
+            "x.test,10.0.0.0/8",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Proxy(args) => match args.command {
+                ProxyCommand::Set {
+                    name,
+                    profile,
+                    pool,
+                    no_proxy,
+                    ..
+                } => {
+                    assert_eq!(name, "nl");
+                    assert_eq!(profile.as_deref(), Some("work"));
+                    assert_eq!(pool.unwrap(), ["a", "b"]);
+                    assert_eq!(no_proxy, ["x.test", "10.0.0.0/8"]);
+                }
+                _ => panic!("expected the set variant"),
+            },
+            _ => panic!("expected the proxy command"),
+        }
+    }
+
+    #[test]
+    fn proxy_set_requires_exactly_one_target() {
+        assert!(Cli::try_parse_from(["netorch", "proxy", "set", "n", "--profile", "p"]).is_err());
+        assert!(Cli::try_parse_from([
+            "netorch",
+            "proxy",
+            "set",
+            "n",
+            "--profile",
+            "p",
+            "--rules",
+            "--direct"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "netorch",
+            "proxy",
+            "set",
+            "n",
+            "--profile",
+            "p",
+            "--via",
+            "node"
+        ])
+        .is_ok());
     }
 }

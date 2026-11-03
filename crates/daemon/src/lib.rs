@@ -30,6 +30,7 @@ pub mod openvpn;
 pub mod openvpn_process;
 #[cfg(target_os = "linux")]
 pub mod peer;
+pub mod proxy_exits;
 #[cfg(target_os = "linux")]
 pub mod quic_reject;
 #[cfg(target_os = "linux")]

@@ -109,6 +109,19 @@ impl LinuxEngine {
         )
     }
 
+    /// Read actual listeners only; this never connects, reloads or mutates routing.
+    pub fn named_proxy_exits(
+        &self,
+        profile_id: &str,
+    ) -> Result<Vec<net_manager_core::daemon_protocol::ProxyExitStatus>, String> {
+        self.ask(
+            method::XRAY_PROXY_EXITS,
+            XrayProfileParams {
+                profile_id: profile_id.to_owned(),
+            },
+        )
+    }
+
     /// Whether the daemon handles this profile; everything else (static
     /// routes, a local Xray proxy) runs in the client process.
     pub fn handles(profile: &Profile) -> bool {

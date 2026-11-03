@@ -49,6 +49,7 @@ impl ProfileStore {
         }
         for profile in &document.profiles {
             crate::service_checks::validate_profile_service_checks(profile)?;
+            crate::proxy_exits::validate_profile_proxy_exits(profile)?;
         }
         Ok(document)
     }
@@ -64,6 +65,7 @@ impl ProfileStore {
     fn save_locked(&self, document: &ProfileDocument) -> io::Result<()> {
         for profile in &document.profiles {
             crate::service_checks::validate_profile_service_checks(profile)?;
+            crate::proxy_exits::validate_profile_proxy_exits(profile)?;
         }
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
@@ -282,6 +284,7 @@ pub fn validate_profile(profile: &Profile) -> io::Result<()> {
         }
     }
     crate::service_checks::validate_profile_service_checks(profile)?;
+    crate::proxy_exits::validate_profile_proxy_exits(profile)?;
     if profile.backend != TunnelBackend::Xray && !profile.domain_policies.is_empty() {
         return Err(invalid_data(
             "domain policies are only supported for Xray profiles",
@@ -441,6 +444,215 @@ mod tests {
         value["xrayServiceChecks"][0]["url"] = serde_json::json!("http://example.test/");
         let invalid: Profile = serde_json::from_value(value).unwrap();
         assert!(validate_profile(&invalid).is_err());
+    }
+
+    #[test]
+    fn named_proxy_exits_refuse_executable_configuration() {
+        let mut profile = wg_profile();
+        profile.backend = TunnelBackend::Xray;
+        profile.config_path = PathBuf::from("named-proxy.json");
+        let mut value = serde_json::to_value(profile).unwrap();
+        value["xrayProxyExits"] = serde_json::json!([{
+            "name": "default",
+            "target": {"kind": "rules"},
+            "noProxy": [],
+            "command": ["sh", "-c", "exit 0"]
+        }]);
+        assert!(serde_json::from_value::<Profile>(value).is_err());
+    }
+
+    fn subscription_meta() -> crate::models::SubscriptionMeta {
+        serde_json::from_value(serde_json::json!({
+            "url": "https://subscription.example.test/synthetic",
+            "hwid": "",
+            "endpointCount": 2,
+            "activeIndex": 0
+        }))
+        .unwrap()
+    }
+
+    fn xray_sub_profile() -> Profile {
+        let mut profile = wg_profile();
+        profile.id = "proxy-host".into();
+        profile.backend = TunnelBackend::Xray;
+        profile.config_path = PathBuf::from("proxy-host.json");
+        profile.subscription = Some(subscription_meta());
+        profile
+    }
+
+    #[test]
+    fn named_proxy_exits_persist_and_validate_boundaries() {
+        use crate::models::{NamedProxyExit, ProxyTarget};
+
+        // A valid mixed spec survives a store round trip with order intact.
+        let dir = unique_dir("named-exits");
+        let store = ProfileStore::new(dir.join("profiles.json"));
+        let mut profile = xray_sub_profile();
+        profile.xray_proxy_exits = vec![
+            NamedProxyExit {
+                name: "work".into(),
+                target: ProxyTarget::Node {
+                    endpoint_key: "1111111111111111".into(),
+                },
+                no_proxy: vec!["intranet.corp".into(), "10.0.0.0/8".into()],
+            },
+            NamedProxyExit {
+                name: "media-pool".into(),
+                target: ProxyTarget::Pool {
+                    endpoint_keys: vec!["2222222222222222".into(), "3333333333333333".into()],
+                },
+                no_proxy: Vec::new(),
+            },
+            NamedProxyExit {
+                name: "direct".into(),
+                target: ProxyTarget::Direct,
+                no_proxy: Vec::new(),
+            },
+        ];
+        store.upsert(profile).unwrap();
+        let stored = store.load().unwrap().profiles.remove(0);
+        assert_eq!(stored.xray_proxy_exits.len(), 3);
+        assert_eq!(stored.xray_proxy_exits[0].name, "work");
+        assert_eq!(stored.xray_proxy_exits[0].no_proxy.len(), 2);
+        assert!(matches!(
+            stored.xray_proxy_exits[1].target,
+            ProxyTarget::Pool { .. }
+        ));
+
+        // Rejected on upsert (validated before persistence): bad or
+        // reserved names, duplicates, malformed key rules.
+        let mut bad = xray_sub_profile();
+        for name in ["list", "set", "remove", "help", "UPPER", "-lead", "a b"] {
+            bad.xray_proxy_exits = vec![NamedProxyExit {
+                name: name.into(),
+                target: ProxyTarget::Direct,
+                no_proxy: Vec::new(),
+            }];
+            assert!(
+                store.upsert(bad.clone()).is_err(),
+                "name {name:?} must be rejected"
+            );
+        }
+        bad.xray_proxy_exits = vec![
+            NamedProxyExit {
+                name: "a".into(),
+                target: ProxyTarget::Direct,
+                no_proxy: Vec::new(),
+            },
+            NamedProxyExit {
+                name: "a".into(),
+                target: ProxyTarget::Rules,
+                no_proxy: Vec::new(),
+            },
+        ];
+        assert!(store.upsert(bad.clone()).is_err(), "duplicate names");
+        for target in [
+            ProxyTarget::Node {
+                endpoint_key: "nothex".into(),
+            },
+            ProxyTarget::Node {
+                endpoint_key: "AAAAAAAAAAAAAAAA".into(),
+            },
+            ProxyTarget::Pool {
+                endpoint_keys: Vec::new(),
+            },
+            ProxyTarget::Pool {
+                endpoint_keys: vec!["1111111111111111".into(), "1111111111111111".into()],
+            },
+            ProxyTarget::Pool {
+                endpoint_keys: (0..9).map(|i| format!("{i:016x}")).collect(),
+            },
+        ] {
+            bad.xray_proxy_exits = vec![NamedProxyExit {
+                name: "ok".into(),
+                target,
+                no_proxy: Vec::new(),
+            }];
+            assert!(store.upsert(bad.clone()).is_err(), "bad target rejected");
+        }
+        for entry in [
+            "",
+            "has space",
+            "user@host",
+            "host?query",
+            "a,b",
+            "semi;colon",
+        ] {
+            bad.xray_proxy_exits = vec![NamedProxyExit {
+                name: "ok".into(),
+                target: ProxyTarget::Direct,
+                no_proxy: vec![entry.into()],
+            }];
+            assert!(
+                store.upsert(bad.clone()).is_err(),
+                "noProxy {entry:?} must be rejected"
+            );
+        }
+        // 17 exits exceed the listener slot budget.
+        bad.xray_proxy_exits = (0..crate::proxy_exits::MAX_PROXY_EXITS + 1)
+            .map(|i| NamedProxyExit {
+                name: format!("exit{i}"),
+                target: ProxyTarget::Direct,
+                no_proxy: Vec::new(),
+            })
+            .collect();
+        assert!(store.upsert(bad.clone()).is_err(), "exit count budget");
+        // A 34th distinct pin key exceeds the daemon pin-listener budget.
+        let mut over = xray_sub_profile();
+        over.pinned_policies = (0..32)
+            .map(|i| crate::models::PinnedRoute {
+                selectors: vec![format!("domain:{i}.test")],
+                endpoint_key: format!("{i:016x}"),
+                missing: false,
+            })
+            .collect();
+        over.xray_dns.outbound_key = Some("eeeeeeeeeeeeeeee".into());
+        over.xray_proxy_exits = vec![NamedProxyExit {
+            name: "spare".into(),
+            target: ProxyTarget::Node {
+                endpoint_key: "ffffffffffffffff".into(),
+            },
+            no_proxy: Vec::new(),
+        }];
+        assert!(store.upsert(over).is_err(), "33-key pin budget");
+
+        // Node/pool exits need subscription metadata; rules/direct do not.
+        let mut plain = xray_sub_profile();
+        plain.subscription = None;
+        plain.xray_proxy_exits = vec![NamedProxyExit {
+            name: "work".into(),
+            target: ProxyTarget::Node {
+                endpoint_key: "1111111111111111".into(),
+            },
+            no_proxy: Vec::new(),
+        }];
+        assert!(
+            store.upsert(plain.clone()).is_err(),
+            "node without subscription"
+        );
+        plain.xray_proxy_exits = vec![
+            NamedProxyExit {
+                name: "lax".into(),
+                target: ProxyTarget::Rules,
+                no_proxy: Vec::new(),
+            },
+            NamedProxyExit {
+                name: "out".into(),
+                target: ProxyTarget::Direct,
+                no_proxy: Vec::new(),
+            },
+        ];
+        store.upsert(plain).unwrap();
+        // Non-Xray backends cannot carry exits at all.
+        let mut wg = wg_profile();
+        wg.id = "wg-exits".into();
+        wg.xray_proxy_exits = vec![NamedProxyExit {
+            name: "lax".into(),
+            target: ProxyTarget::Direct,
+            no_proxy: Vec::new(),
+        }];
+        assert!(store.upsert(wg).is_err(), "non-Xray exits rejected");
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

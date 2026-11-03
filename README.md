@@ -96,6 +96,63 @@ are retained but skipped. If all default-path candidates fail, that traffic
 is blocked; explicit direct rules still remain direct. This is not an
 OS-level kill switch when the whole tunnel is stopped.
 
+#### Named per-command proxy exits (Linux)
+
+Names are saved in the netorch profile, not executable hooks in an imported
+Xray config. Choose ordinary profile rules, a fixed subscription node, an
+independent ordered pool, or the daemon's marked direct outbound:
+
+```bash
+netorch proxy set default --profile work --rules
+netorch proxy set nl --profile work --via "Netherlands"
+netorch proxy set ru --profile work --pool "Moscow" "Saint Petersburg"
+netorch proxy set direct --profile work --direct
+netorch proxy list --profile work
+netorch up work
+netorch proxy nl -- curl https://example.com
+netorch proxy ru -- curl https://example.com
+netorch proxy direct -- curl https://example.com
+netorch proxy --profile work default -- curl https://example.com
+netorch proxy remove nl --profile work
+```
+
+Use your own endpoint names, numbers or stable keys. Exit names are arbitrary
+lowercase ASCII letters/digits/`-`/`_`, 1–32 characters, starting with a letter
+or digit; `list`, `set`, `remove` and `help` are reserved. A profile supports
+16 exits and each pool 1–8 unique, ordered nodes. Duplicate names across
+profiles require `--profile` before the exit name.
+
+Configuration and listing work offline. Launch requires an already connected
+Xray **TUN** profile and an updated Linux daemon supporting `xray.proxyExits`.
+Adding/changing listeners requires an explicit disconnect/reconnect; launch
+never starts, reloads or restarts the VPN. A stale or removed saved exit refuses
+before running the command. Node/pool settings retain missing keys and block
+instead of choosing an unconfigured endpoint. Pools probe their own members
+with the profile's HTTPS probe target, prefer the first healthy member and
+return to it after recovery; an all-down pool blocks, even if the main exit is
+healthy. They do not change the default exit. Explicit named nodes are excluded
+from automatic main-pool recruitment, but may still be selected as primary or
+manual backups.
+
+`--rules` retains profile routing, including blocks. Fixed node, pool and direct
+exits override those routing rules, including blocks, for their own listeners.
+`direct` uses marked daemon sockets to bypass this profile's TUN; it does not
+merely clear proxy variables or promise to bypass another VPN/firewall.
+
+Commands are executed as the invoking user with their original argument vector,
+terminal, exit status and signals; no shell is inserted. Both case spellings of
+`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and `NO_PROXY` are replaced. HTTP(S) uses
+the exit's loopback HTTP proxy; SOCKS uses `socks5h` for proxy-side name resolution.
+The bypass list is empty by default, even when the parent has `NO_PROXY=*`.
+To explicitly exempt destinations, save the exit with
+`--no-proxy 'internal.example,10.0.0.0/8'`; changing only that list applies to the
+next command without reconnecting. These exceptions use normal system routing,
+which can still traverse the TUN.
+
+This is **not process network isolation**: programs must honor proxy environment
+variables, and arbitrary UDP is not covered. The loopback listeners are
+unauthenticated and usable by other local processes while the profile is active.
+
 #### Filtered backup pools and exit-country checks
 
 Pools are opt-in and come after explicit backups in the eight-node default

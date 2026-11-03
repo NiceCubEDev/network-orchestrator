@@ -34,6 +34,7 @@ pub mod openvpn_management;
 pub mod policy;
 pub mod profile_import;
 pub mod profiles;
+pub mod proxy_exits;
 pub mod recovery;
 pub mod route_check;
 pub mod route_conditions;

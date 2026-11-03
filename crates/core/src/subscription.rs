@@ -754,6 +754,7 @@ pub fn list_endpoints(
         .iter()
         .map(|backup| backup.key.as_str())
         .collect();
+    let named = profile.named_exit_keys();
     let pooled: std::collections::HashSet<&str> = subscription
         .pool_keys
         .iter()
@@ -766,6 +767,7 @@ pub fn list_endpoints(
                     .iter()
                     .any(|pin| pin.endpoint_key == member.key)
                 && profile.xray_dns.outbound_key.as_deref() != Some(member.key.as_str())
+                && !named.contains(member.key.as_str())
         })
         .map(|member| member.key.as_str())
         .collect();
@@ -930,6 +932,7 @@ pub fn failover_plan(
         .and_then(|key| key_index(&endpoints, key))
         .ok_or_else(|| invalid("The selected endpoint left the subscription"))?;
     let mut nodes = vec![endpoints[primary_index].clone()];
+    let named = profile.named_exit_keys();
     for backup in subscription
         .backup_keys
         .iter()
@@ -940,6 +943,7 @@ pub fn failover_plan(
                     .iter()
                     .any(|pin| pin.endpoint_key == node.key)
                 && profile.xray_dns.outbound_key.as_deref() != Some(node.key.as_str())
+                && !named.contains(node.key.as_str())
         }))
     {
         if nodes.len() == MAX_FAILOVER_NODES {
@@ -1680,6 +1684,69 @@ mod tests {
             .map(|index| format!("{index:016x}"))
             .collect::<Vec<_>>();
         assert!(set_backup_endpoints(&vault, &store, "panel", &keys).is_err());
+    }
+
+    #[test]
+    fn named_proxy_keys_leave_the_auto_pool_but_keep_manual_backups() {
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, store) = import_panel(dir.path(), &["Primary", "Named", "Reserve"]);
+        let endpoints = vault.read_subscription_endpoints("panel").unwrap();
+        let named_key = endpoint_key(&endpoints[1].url);
+        let reserve_key = endpoint_key(&endpoints[2].url);
+        // The auto pool holds both nodes plus a manual backup on one of
+        // them; the named exit pins the same node the backup uses.
+        set_backup_endpoints(&vault, &store, "panel", std::slice::from_ref(&named_key)).unwrap();
+        store
+            .update_profile("panel", |profile| {
+                let subscription = profile.subscription.as_mut().unwrap();
+                subscription.node_pool = Some(NodePoolSettings {
+                    filters: vec![NodePoolFilter {
+                        name_contains: Vec::new(),
+                        exit_country: Some("NL".into()),
+                    }],
+                    verify_exit_country: false,
+                });
+                subscription.pool_keys = vec![
+                    EndpointRef {
+                        key: named_key.clone(),
+                        name: "Named".into(),
+                    },
+                    EndpointRef {
+                        key: reserve_key.clone(),
+                        name: "Reserve".into(),
+                    },
+                ];
+                profile.xray_proxy_exits = vec![NamedProxyExit {
+                    name: "work".into(),
+                    target: ProxyTarget::Pool {
+                        endpoint_keys: vec![named_key.clone()],
+                    },
+                    no_proxy: Vec::new(),
+                }];
+                Ok(())
+            })
+            .unwrap();
+        let profile = store.load().unwrap().profiles.remove(0);
+        let (candidates, _) = failover_plan(&vault, &profile).unwrap();
+        let keys: Vec<String> = candidates
+            .iter()
+            .map(|node| endpoint_key(&node.url))
+            .collect();
+        // Primary + the manual backup stay; the named key is never also an
+        // auto-pool member while an unrelated pooled node still joins.
+        assert_eq!(
+            keys.iter().map(String::as_str).collect::<Vec<_>>(),
+            [
+                endpoint_key(&endpoints[0].url).as_str(),
+                named_key.as_str(),
+                reserve_key.as_str()
+            ]
+        );
+        let rows = list_endpoints(&vault, &store, "panel").unwrap();
+        let named_row = rows.iter().find(|row| row.key == named_key).unwrap();
+        let reserve_row = rows.iter().find(|row| row.key == reserve_key).unwrap();
+        assert!(!named_row.in_pool);
+        assert!(reserve_row.in_pool);
     }
 
     #[test]

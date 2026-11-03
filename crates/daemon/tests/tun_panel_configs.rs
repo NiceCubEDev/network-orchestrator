@@ -24,6 +24,7 @@ fn params(config: &Value) -> XrayConnectParams {
         probe_url: None,
         mtu: None,
         service_checks: Vec::new(),
+        proxy_exits: Vec::new(),
     }
 }
 

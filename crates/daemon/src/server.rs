@@ -813,6 +813,15 @@ async fn handle<A: Authorizer>(
             .await?;
             to_value(&status)
         }
+        method::XRAY_PROXY_EXITS => {
+            let params: XrayProfileParams = params(request.params)?;
+            validate_owner(&format!("xray:{}", params.profile_id)).map_err(invalid)?;
+            let exits = with_core(ctx, move |core| {
+                core.xray_proxy_exits(uid, &params.profile_id)
+            })
+            .await?;
+            to_value(&exits)
+        }
         method::XRAY_SERVICE_CHECKS => {
             let params: net_manager_core::daemon_protocol::XrayServiceChecksParams =
                 from_value(request.params)

@@ -15,6 +15,7 @@ mod endpoints;
 mod hold;
 mod library;
 mod migrate;
+mod proxy;
 mod route;
 
 use args::{Cli, Command};
@@ -22,17 +23,22 @@ use clap::{CommandFactory, Parser};
 use std::process::ExitCode;
 
 pub fn main() -> ExitCode {
-    let checks_invocation = std::env::args_os().any(|arg| arg == std::ffi::OsStr::new("checks"));
+    let private_command = std::env::args_os().find_map(|arg| match arg.to_str() {
+        Some("checks") => Some("checks"),
+        Some("proxy") => Some("proxy"),
+        _ => None,
+    });
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(error)
-            if checks_invocation
+            if private_command.is_some()
                 && !matches!(
                     error.kind(),
                     clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
                 ) =>
         {
-            eprintln!("netorch: invalid checks arguments; use `netorch checks --help`");
+            let command = private_command.unwrap_or("proxy");
+            eprintln!("netorch: invalid {command} arguments; use `netorch {command} --help`");
             return ExitCode::from(2);
         }
         Err(error) => error.exit(),
@@ -96,6 +102,10 @@ fn needs_daemon(command: &Command) -> bool {
             | Command::Use { .. }
             | Command::Refresh { .. }
             | Command::Rm { .. }
+            | Command::Proxy(args::ProxyArgs {
+                command: args::ProxyCommand::Run(_),
+                ..
+            })
     )
 }
 
@@ -126,6 +136,7 @@ fn run(ctx: &ctx::Ctx, command: Command, json: bool) -> Result<commands::Output,
         Command::Backup(command) => endpoints::backup(ctx, command),
         Command::Migrate(command) => migrate::run(ctx, command),
         Command::Checks(command) => checks::run(ctx, command),
+        Command::Proxy(args) => proxy::run(ctx, args, json),
         Command::Refresh { target } => endpoints::refresh(ctx, &target),
         Command::Test(args) => endpoints::test(
             ctx,

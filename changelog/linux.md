@@ -10,6 +10,21 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+### Added
+
+- `netorch proxy set|list|remove` and `netorch proxy [--profile PROFILE] NAME --
+  COMMAND` for user-defined rules/node/pool/direct exits of a connected Xray
+  TUN profile. Configuration is offline; launches verify actual daemon bindings
+  and never start/reload the tunnel. Stale exits refuse before execution.
+- Independent ordered pool controllers with fail-closed missing/all-down
+  members, and marked direct sockets that bypass the owned TUN. Commands retain
+  literal arguments, terminal, native signals and exit status through `exec`;
+  inherited HTTP/SOCKS proxy and no-proxy variables are replaced.
+- Disposable real-CLI coverage of full-TUN direct bypass, pool affinity and
+  isolation, failed exits, explicit bypass exceptions, command lifetime and
+  listener cleanup. Loopback listeners remain unauthenticated; environment
+  proxies are not process network isolation or arbitrary UDP routing.
+
 ## [0.12.0] - 2026-11-02
 
 Core 0.12.0.

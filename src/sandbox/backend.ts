@@ -20,6 +20,7 @@ function profile(id: string, name: string, backend: Profile["backend"], cidr?: s
     xrayMode: "socks", xrayTunInterface: null, xrayTunIp: null,
     pinnedPolicies: [],
     xrayServiceChecks: [],
+    xrayProxyExits: [],
     endpointBypasses,
     // Linux TUN flag; the fixture profiles are SOCKS so it stays off.
     xrayQuicReject: false,
@@ -48,6 +49,15 @@ export class SandboxBackend {
       ...(p.pinnedPolicies ?? []).map((route) => route.endpointKey),
       p.xrayDns?.outboundKey,
     ].filter((key): key is string => Boolean(key)));
+  }
+
+  /** Endpoint keys named proxy exits pin explicitly — kept out of the
+   * automatic pool like pins and the DNS egress key. */
+  private namedExitKeys(p: Profile): Set<string> {
+    return new Set((p.xrayProxyExits ?? []).flatMap((exit) =>
+      exit.target.kind === "node" ? [exit.target.endpointKey]
+        : exit.target.kind === "pool" ? exit.target.endpointKeys
+          : []));
   }
 
   private validateServiceSpecs(p: Profile, value: unknown): ServiceCheck[] {
@@ -409,6 +419,7 @@ export class SandboxBackend {
       ...(sub.backupKeys ?? []).map((node) => node.key),
       ...(profile.pinnedPolicies ?? []).map((route) => route.endpointKey),
       profile.xrayDns?.outboundKey,
+      ...this.namedExitKeys(profile),
     ]);
     return (sub.poolKeys ?? []).filter((node) => !explicit.has(node.key));
   }
@@ -427,7 +438,8 @@ export class SandboxBackend {
     if (!subscription || !pool) throw new Error("Set backup-pool filters before rebuilding the pool");
     const primary = subscription.activeKey ?? this.endpointKeys[subscription.activeIndex];
     const explicit = new Set([primary, ...(subscription.backupKeys ?? []).map((node) => node.key),
-      ...(p.pinnedPolicies ?? []).map((route) => route.endpointKey), p.xrayDns?.outboundKey]);
+      ...(p.pinnedPolicies ?? []).map((route) => route.endpointKey), p.xrayDns?.outboundKey,
+      ...this.namedExitKeys(p)]);
     const capacity = Math.max(0, 8 - 1 - (subscription.backupKeys?.length ?? 0));
     let selected = 0;
     let candidates = 0;
@@ -674,6 +686,9 @@ export class SandboxBackend {
         // commands, a generic form save never drops them.
         p.subscription = existing?.subscription ?? p.subscription;
         p.pinnedPolicies = existing?.pinnedPolicies ?? p.pinnedPolicies;
+        p.xrayProxyExits = p.backend === "xray"
+          ? structuredClone(existing?.backend === "xray" ? existing.xrayProxyExits ?? [] : p.xrayProxyExits ?? [])
+          : [];
         p.xrayServiceChecks = p.backend === "xray"
           ? structuredClone(existing?.backend === "xray" ? existing.xrayServiceChecks ?? [] : p.xrayServiceChecks ?? [])
           : [];

@@ -1631,7 +1631,7 @@ pub struct DaemonCore {
     xray_restarts: HashMap<(u32, String), u32>,
     /// Live failover supervisors per xray owner: probe threads run outside
     /// this mutex; core only consumes their shared status.
-    failovers: HashMap<(u32, String), crate::failover::FailoverSupervisor>,
+    failovers: HashMap<(u32, String), crate::failover::FailoverSupervisors>,
     watchdogs: HashMap<(u32, String), crate::watchdog::WatchdogSupervisor>,
     /// User URLs exist only in the diagnostic worker, never in owned resources.
     service_checks: HashMap<(u32, String), crate::service_checks::ServiceCheckSupervisor>,
@@ -2128,6 +2128,7 @@ impl DaemonCore {
                 reject_quic: plan.reject_quic,
                 probe_url: plan.probe_url.clone(),
                 pinned_keys: plan.pinned_keys.clone(),
+                proxy_exits: plan.proxy_exits.clone(),
                 mtu: Some(plan.mtu),
             })],
         });
@@ -2170,20 +2171,16 @@ impl DaemonCore {
     /// plan. A spawn failure degrades to the balancer's safe default —
     /// `unavailable` — rather than failing the connect.
     fn start_failover(&mut self, uid: u32, owner: &str, plan: &crate::xray::XrayPlan) {
-        self.failovers.remove(&(uid, owner.to_string()));
-        let Some(failover) = &plan.failover else {
-            return;
-        };
-        match crate::failover::FailoverSupervisor::spawn(failover.clone(), plan.api_port, |index| {
-            crate::xray::xray_probe_port(plan.mark, index)
-        }) {
-            Ok(supervisor) => {
-                self.failovers.insert((uid, owner.to_string()), supervisor);
-            }
-            Err(err) => {
-                eprintln!("network-orchestrator-daemon: failover supervisor failed to start: {err}")
-            }
-        }
+        let key = (uid, owner.to_owned());
+        self.failovers.remove(&key);
+        let supervisors = crate::failover::FailoverSupervisors::spawn(
+            plan.failover.as_ref(),
+            &plan.proxy_exits,
+            plan.probe_url.as_deref(),
+            &plan.pinned_keys,
+            plan.mark,
+        );
+        self.failovers.insert(key, supervisors);
     }
 
     /// Replace only the caller's diagnostic worker; no recovery or route access.
@@ -2324,25 +2321,18 @@ impl DaemonCore {
         }) else {
             return;
         };
-        let Some(failover) = process.failover.clone() else {
-            return;
-        };
         let key = (entry.uid, entry.owner.clone());
         if self.failovers.contains_key(&key) {
             return;
         }
-        match crate::failover::FailoverSupervisor::spawn(
-            failover,
-            crate::xray::xray_api_port(process.transport_mark),
-            |index| crate::xray::xray_probe_port(process.transport_mark, index),
-        ) {
-            Ok(supervisor) => {
-                self.failovers.insert(key, supervisor);
-            }
-            Err(err) => {
-                eprintln!("network-orchestrator-daemon: failover supervisor failed to start: {err}")
-            }
-        }
+        let supervisors = crate::failover::FailoverSupervisors::spawn(
+            process.failover.as_ref(),
+            &process.proxy_exits,
+            process.probe_url.as_deref(),
+            &process.pinned_keys,
+            process.transport_mark,
+        );
+        self.failovers.insert(key, supervisors);
     }
 
     /// Hot-reload the staged Xray config of an already connected profile:
@@ -2452,6 +2442,7 @@ impl DaemonCore {
             || plan.full_ipv6 != process.full.as_ref().is_some_and(|full| full.ipv6)
             || plan.reject_quic != process.reject_quic
             || process.mtu.is_some_and(|mtu| mtu != plan.mtu)
+            || plan.proxy_exits != process.proxy_exits
         {
             return Err(incompatible());
         }
@@ -2788,6 +2779,48 @@ impl DaemonCore {
         result
     }
 
+    /// Resolve only the authenticated caller's live listeners, without stats
+    /// subprocesses, recovery, reload or network changes.
+    pub fn xray_proxy_exits(
+        &mut self,
+        uid: u32,
+        profile_id: &str,
+    ) -> io::Result<Vec<net_manager_core::daemon_protocol::ProxyExitStatus>> {
+        let unavailable = || {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "The Xray profile is not running; connect it before launching a proxy command",
+            )
+        };
+        let owner = format!("xray:{profile_id}");
+        let index = self.position(uid, &owner).ok_or_else(unavailable)?;
+        let entry = &self.journal.entries[index];
+        if entry.state != OwnedState::Applied {
+            return Err(unavailable());
+        }
+        let process = entry
+            .resources
+            .iter()
+            .find_map(|resource| match resource {
+                OwnedResource::XrayProcess(process) => Some(process),
+                _ => None,
+            })
+            .ok_or_else(unavailable)?;
+        if !self
+            .xray
+            .as_mut()
+            .is_some_and(|runner| runner.health(&process.name).unwrap_or(false))
+        {
+            return Err(unavailable());
+        }
+        self.failovers
+            .get(&(uid, owner))
+            .map(|supervisors| {
+                supervisors.exit_statuses(&process.proxy_exits, process.transport_mark)
+            })
+            .ok_or_else(unavailable)
+    }
+
     pub fn xray_status(&mut self, uid: u32, profile_id: &str) -> XrayStatusResult {
         let owner = format!("xray:{profile_id}");
         let entry = self
@@ -2834,11 +2867,20 @@ impl DaemonCore {
         } else {
             (None, None)
         };
-        let mut watchdog = self
-            .watchdogs
-            .get(&(uid, owner.clone()))
-            .map(|watchdog| watchdog.status());
-        if let Some(checks) = self.service_checks.get(&(uid, owner.clone())) {
+        let key = (uid, owner);
+        let proxy_exits = if state == TunnelState::Running {
+            process
+                .and_then(|process| {
+                    self.failovers.get(&key).map(|supervisors| {
+                        supervisors.exit_statuses(&process.proxy_exits, process.transport_mark)
+                    })
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let mut watchdog = self.watchdogs.get(&key).map(|watchdog| watchdog.status());
+        if let Some(checks) = self.service_checks.get(&key) {
             watchdog.get_or_insert_with(Default::default).service_checks = checks.status();
         }
         XrayStatusResult {
@@ -2858,10 +2900,11 @@ impl DaemonCore {
             ipv6_covered: process
                 .is_some_and(|process| process.full.as_ref().is_some_and(|full| full.ipv6)),
             watchdog,
+            proxy_exits,
             failover: self
                 .failovers
-                .get(&(uid, owner))
-                .map(|supervisor| supervisor.status()),
+                .get(&key)
+                .and_then(|supervisors| supervisors.status()),
         }
     }
 
@@ -7031,6 +7074,7 @@ mod xray_core_tests {
             probe_url: None,
             mtu: None,
             service_checks: Vec::new(),
+            proxy_exits: Vec::new(),
         }
     }
 
@@ -7481,6 +7525,46 @@ mod xray_core_tests {
     }
 
     #[test]
+    fn reload_cannot_retarget_a_running_named_listener() {
+        let events = Events::default();
+        let dir =
+            std::env::temp_dir().join(format!("netmgr-xray-proxy-binding-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut core = DaemonCore::open_with_xray(
+            JournalStore::new(dir.join("state.json")),
+            Box::new(Routes(events.clone())),
+            Box::new(Links),
+            Box::new(Tun(events.clone())),
+            Box::new(Flaky::new(events.clone())),
+        )
+        .unwrap();
+        let mut connected = params();
+        connected.proxy_exits = serde_json::from_value(json!([
+            {"name":"office","target":{"kind":"direct"}}
+        ]))
+        .unwrap();
+        core.connect_xray(1000, connected.clone()).unwrap();
+        connected.proxy_exits[0].target = net_manager_core::models::ProxyTarget::Rules;
+        assert_eq!(
+            core.reload_xray(1000, connected).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert!(!events
+            .list()
+            .iter()
+            .any(|event| event.starts_with("reload:")));
+        let status = core.xray_status(1000, "home");
+        assert_eq!(status.state, TunnelState::Running);
+        assert_eq!(
+            status.proxy_exits[0].target,
+            net_manager_core::models::ProxyTarget::Direct
+        );
+        core.disconnect_xray(1000, "home").unwrap();
+        assert!(core.xray_status(1000, "home").proxy_exits.is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn reload_without_a_connected_profile_is_not_found() {
         let events = Events::default();
         let dir =
@@ -7816,6 +7900,7 @@ mod xray_core_tests {
                             probe_url: None,
                             pinned_keys: Vec::new(),
                             mtu: None,
+                            proxy_exits: Vec::new(),
                         }),
                         OwnedResource::Address(WireGuardAddressResource {
                             interface_index: 42,

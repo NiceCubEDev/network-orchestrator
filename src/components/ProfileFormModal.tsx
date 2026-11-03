@@ -685,6 +685,8 @@ export default function ProfileFormModal({
       // form save cannot drop them (the backend re-restores either way).
       pinnedPolicies: isXray ? current.pinnedPolicies : [],
       xrayServiceChecks: isXray ? current.preservedProfile?.xrayServiceChecks ?? [] : [],
+      // `netorch proxy` owns named exits; carry them back unchanged.
+      xrayProxyExits: isXray ? current.preservedProfile?.xrayProxyExits ?? [] : [],
     };
     setSaving(true);
     try {

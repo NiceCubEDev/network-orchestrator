@@ -55,6 +55,7 @@ pub mod method {
     pub const XRAY_STATUS: &str = "xray.status";
     pub const XRAY_RELOAD: &str = "xray.reload";
     pub const XRAY_SERVICE_CHECKS: &str = "xray.serviceChecks";
+    pub const XRAY_PROXY_EXITS: &str = "xray.proxyExits";
     pub const XRAY_INSTALL: &str = "xray.install";
     pub const XRAY_REMOVE: &str = "xray.remove";
     pub const TAILSCALE_STATUS: &str = "tailscale.status";
@@ -109,6 +110,7 @@ pub mod method {
         XRAY_STATUS,
         XRAY_RELOAD,
         XRAY_SERVICE_CHECKS,
+        XRAY_PROXY_EXITS,
         XRAY_INSTALL,
         XRAY_REMOVE,
         TAILSCALE_STATUS,
@@ -1176,6 +1178,9 @@ pub struct XrayConnectParams {
     /// User-owned diagnostic targets. Kept in memory, never in the ownership journal.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub service_checks: Vec<crate::models::ServiceCheck>,
+    /// Named process proxy listeners injected by the Linux daemon.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub proxy_exits: Vec<crate::models::NamedProxyExit>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1291,6 +1296,25 @@ pub struct XrayRemoveResult {
     pub removed: bool,
 }
 
+/// A running listener binding, without client environment or subscription secrets.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProxyExitBinding {
+    pub name: String,
+    pub target: crate::models::ProxyTarget,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyExitStatus {
+    pub name: String,
+    pub target: crate::models::ProxyTarget,
+    pub socks_port: u16,
+    pub http_port: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool: Option<crate::models::FailoverStatus>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct XrayStatusResult {
@@ -1312,6 +1336,8 @@ pub struct XrayStatusResult {
     pub failover: Option<crate::models::FailoverStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub watchdog: Option<crate::models::WatchdogStatus>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub proxy_exits: Vec<ProxyExitStatus>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1761,6 +1787,8 @@ pub struct XrayProcessResource {
     pub pinned_keys: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mtu: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub proxy_exits: Vec<ProxyExitBinding>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

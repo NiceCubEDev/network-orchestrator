@@ -10,6 +10,17 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+### Added
+
+- Strict data-only named proxy exit preferences: profile rules, a fixed
+  subscription endpoint, an ordered pool, or direct, with explicit no-proxy
+  exceptions and protected profile validation. Missing endpoint keys generate
+  blackholes, not replacements; named nodes are excluded from automatic main
+  pool recruitment without removing explicit primaries/manual backups.
+- Linux connection plans carry dedicated named pin outbounds; the daemon
+  protocol reports live bindings and per-pool health without subscription
+  credentials or executable configuration.
+
 ## [0.12.0] - 2026-11-02
 
 ### Added

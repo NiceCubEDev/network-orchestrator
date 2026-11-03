@@ -148,6 +148,23 @@ export interface PinnedRoute {
   missing?: boolean;
 }
 
+/** Linux `netorch proxy NAME`: where a spawned command's traffic exits —
+ * the normal profile rules, one fixed node, an ordered pool or direct. */
+export type ProxyTarget =
+  | { kind: "rules" }
+  | { kind: "node"; endpointKey: string }
+  | { kind: "pool"; endpointKeys: string[] }
+  | { kind: "direct" };
+
+/** One named proxy exit; owned by the proxy commands — a profile form save
+ * carries it back unchanged, never edits it. */
+export interface NamedProxyExit {
+  name: string;
+  target: ProxyTarget;
+  /** Explicit per-command proxy opt-outs; empty means proxy everything. */
+  noProxy?: string[];
+}
+
 export interface ServiceCheck {
   id: string;
   name: string;
@@ -519,6 +536,8 @@ export interface Profile {
   xrayTunMtu?: number | null;
   xrayTunDnsServers?: string[];
   xrayDirectDomainStrategy?: string | null;
+  /** Linux `netorch proxy` named exits; opaque to the profile form. */
+  xrayProxyExits?: NamedProxyExit[];
   /** Hosts pinned to the physical uplink, bypassing foreign capture tunnels. */
   endpointBypasses?: string[];
   /** Keep declared routes armed while the target interface is absent. */

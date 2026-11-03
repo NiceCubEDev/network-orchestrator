@@ -31,6 +31,29 @@ owned UDP transports and simulate a daemon crash plus a deleted old package
 executable, checking recovery/cleanup without killing unrelated Xray peers.
 The container has an explicit file-descriptor limit for these resource tests.
 
+## Linux named process proxy exits
+
+```bash
+cargo build -p network-orchestrator-daemon -p net-manager-cli
+python3 e2e/linux/multinode_scenarios.py --named-proxies
+```
+
+Uses the same disposable image, pinned backend and temporary CA, with real
+UID-65534 CLI commands and a full IPv4 TUN. Offline configuration/listing runs
+with an unreachable daemon socket and must send no service request. Synthetic
+HTTPS markers distinguish ordinary rules, fixed nodes, an independent ordered
+pool and the physical path: unproxied traffic first proves the target is captured
+by the TUN, while only a marked direct connection reaches the underlay marker.
+
+The scenario checks block/direct rules, fixed-node override, missing-key
+blackholes, ordered pool failover and all-down refusal despite a healthy main
+node/reserve. It poisons inherited HTTP/SOCKS proxies and `NO_PROXY=*`, then
+checks both the cleared default and an explicit bypass exception. It exercises
+literal argv, exit status 37, same-PID `exec`, SIGTERM, unchanged tunnel PID and
+kernel routes, stale/removed-alias refusal before command execution, listener
+cleanup and preservation of unrelated peers. No real subscription or public
+service is contacted.
+
 ## Linux pinned service availability
 
 ```bash

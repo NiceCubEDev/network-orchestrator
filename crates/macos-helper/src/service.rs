@@ -187,6 +187,7 @@ fn owned_entry(kind: Kind, record: Record) -> OwnedEntry {
             probe_url: None,
             pinned_keys: Vec::new(),
             mtu: None,
+            proxy_exits: Vec::new(),
         }),
         Kind::WireGuard => OwnedResource::WireGuardLink(WireGuardLinkResource {
             name,

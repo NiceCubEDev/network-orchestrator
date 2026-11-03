@@ -8,6 +8,7 @@ and the pinned Xray already staged by the package build.
 import json
 import os
 from pathlib import Path
+import signal
 import socket
 import ssl
 import subprocess
@@ -26,7 +27,7 @@ def run(*args, **kwargs):
     return subprocess.run(args, check=True, text=True, capture_output=True, **kwargs).stdout.strip()
 
 
-def driver(service_checks_only=False):
+def driver(service_checks_only=False, named_proxies=False):
     root = Path(__file__).resolve().parents[2]
     binary = root / "target/debug/network-orchestrator-daemon"
     cli = root / "target/debug/netorch"
@@ -51,7 +52,8 @@ def driver(service_checks_only=False):
         run("docker", "cp", str(root / "packaging/linux/com.netmanager.app.policy"),
             name + ":/usr/share/polkit-1/actions/com.netmanager.app.policy")
         result = subprocess.run(["docker", "exec", "--env", "NETORCH_MULTINODE_E2E=1",
-            "--env", f"NETORCH_SERVICE_CHECKS_E2E={int(service_checks_only)}", name,
+            "--env", f"NETORCH_SERVICE_CHECKS_E2E={int(service_checks_only)}",
+            "--env", f"NETORCH_NAMED_PROXIES_E2E={int(named_proxies)}", name,
             "python3", "-u", "/tmp/multinode_scenarios.py", "--inside"], text=True, timeout=600)
         if result.returncode:
             raise SystemExit(result.returncode)
@@ -80,7 +82,7 @@ def inside():
             "-keyout", str(key), "-out", str(csr))
         extension = directory / "extensions"
         extension.write_text(chr(10).join([
-            "subjectAltName=DNS:localhost,DNS:default.test,DNS:pinned.test,DNS:api.country.is,DNS:ipinfo.io,IP:198.51.100.50",
+            "subjectAltName=DNS:localhost,DNS:default.test,DNS:pinned.test,DNS:direct.test,DNS:blocked.test,DNS:api.country.is,DNS:ipinfo.io,IP:198.51.100.50",
             "basicConstraints=CA:FALSE", "extendedKeyUsage=serverAuth",
             "keyUsage=digitalSignature,keyEncipherment", "",
         ]))
@@ -92,6 +94,7 @@ def inside():
         context.load_cert_chain(cert, key)
         records = {}
         records["serviceRequests"] = []
+        records["proxyRequests"] = []
         socket_path = "/run/network-orchestrator/daemon.sock"
         managed_logs = []
         log_capture_stop = threading.Event()
@@ -183,6 +186,7 @@ def inside():
                 "ip", "daddr", "10.8.0.20", "dnat", "to", "127.0.0.1")
             with open("/etc/hosts", "a") as hosts:
                 hosts.write("\n198.51.100.10 default.test pinned.test\n")
+                hosts.write("198.51.100.50 direct.test blocked.test\n")
 
             def managed_pid():
                 managed = [path.parent for path in Path("/proc").glob("[0-9]*/cmdline")
@@ -218,6 +222,7 @@ def inside():
                         self.send_header("Content-Length", "0")
                         self.end_headers()
                     def do_GET(self):
+                        records["proxyRequests"].append((self.marker, self.path))
                         host = self.headers.get("Host", "").split(":")[0]
                         if self.path == "/subscription":
                             body = records["subscriptionBody"].encode()
@@ -278,7 +283,7 @@ def inside():
             run("dbus-daemon", "--system", "--fork")
             polkit = next(path for path in ("/usr/lib/polkit-1/polkitd", "/usr/libexec/polkitd")
                 if Path(path).exists())
-            if os.environ.get("NETORCH_SERVICE_CHECKS_E2E") in ("1", "2"):
+            if os.environ.get("NETORCH_SERVICE_CHECKS_E2E") in ("1", "2") or os.environ.get("NETORCH_NAMED_PROXIES_E2E") == "1":
                 rules = Path("/etc/polkit-1/rules.d")
                 rules.mkdir(parents=True, exist_ok=True)
                 (rules / "99-netorch-e2e.rules").write_text(
@@ -310,6 +315,185 @@ def inside():
                     raise AssertionError("synthetic CLI failed: " + result.stderr)
                 return json.loads(result.stdout)
             cli("add", f"https://localhost:{servers[0].server_port}/subscription", "--name", "country-proof")
+            if os.environ.get("NETORCH_NAMED_PROXIES_E2E") == "1":
+                # All setup and mutations below remain in this disposable
+                # namespace and the UID-65534 temporary data directory.
+                document_path = cli_data / "profiles.json"
+                document = json.loads(document_path.read_text())
+                profile = document["profiles"][0]
+                profile["xrayMode"] = "tun"
+                profile["routes"] = []
+                profile["privateLanDirect"] = False
+                profile["xrayTunDnsServers"] = []
+                profile["domainPolicies"] = [
+                    {"target": "block", "domains": ["full:blocked.test"]},
+                    {"target": "direct", "domains": ["full:direct.test"]},
+                ]
+                profile["xrayDns"] = {"hosts": {
+                    "direct.test": ["198.51.100.50"], "blocked.test": ["198.51.100.50"]}}
+                profile["subscription"]["probeUrl"] = "https://198.51.100.50:9443/"
+                document_path.write_text(json.dumps(document))
+                profile_id = profile["id"]
+                cli("use", "country-proof", "1")
+                cli("backup", "set", "country-proof", "reserve")
+                endpoints = cli("endpoints", "country-proof")
+                # Resolve real stable keys, never the root RPC fixture's
+                # unrelated synthetic 1111/2222/... identifiers.
+                endpoint_rows = endpoints if isinstance(endpoints, list) else endpoints["endpoints"]
+                real_keys = {name: next(row["key"] for row in endpoint_rows
+                    if name in row["name"]) for name in keys}
+                before_configuration = len(records["proxyRequests"])
+                cli_env["NETWORK_ORCHESTRATOR_SOCKET"] = str(directory / "absent.sock")
+                try:
+                    for name, target in [
+                        ("default", ["--rules"]),
+                        ("nl", ["--via", real_keys["backup"]]),
+                        ("ru", ["--pool", real_keys["backup"], real_keys["pinned"]]),
+                        ("direct", ["--direct"]),
+                        ("gone", ["--via", "ffffffffffffffff"]),
+                        ("bypass", ["--via", real_keys["reserve"], "--no-proxy", "198.51.100.50"]),
+                    ]:
+                        cli("proxy", "set", name, "--profile", "country-proof", *target)
+                    assert {row["name"] for row in cli("proxy", "list")} == {
+                        "default", "nl", "ru", "direct", "gone", "bypass"}
+                    unchanged = document_path.read_bytes()
+                    duplicate_profile = cli_raw("proxy", "--profile", "country-proof", "set",
+                        "nl", "--profile", "country-proof", "--direct")
+                    assert duplicate_profile.returncode != 0
+                    assert document_path.read_bytes() == unchanged
+                finally:
+                    cli_env.pop("NETWORK_ORCHESTRATOR_SOCKET")
+                assert len(records["proxyRequests"]) == before_configuration
+                print("PASS named proxy configuration and listing are offline and send no probes", flush=True)
+
+                class UnderlayHandler(Handler):
+                    marker = "underlay"
+                physical = ThreadingHTTPServer(("127.0.0.1", 0), UnderlayHandler)
+                physical.socket = context.wrap_socket(physical.socket, server_side=True)
+                servers.append(physical)
+                threading.Thread(target=physical.serve_forever, daemon=True).start()
+                # The marker requires the physical output interface before
+                # DNAT, not merely a nonzero mark. Captured TUN traffic cannot
+                # reach it by being redirected back to loopback.
+                run("nft", "add", "rule", "ip", "e2e_peers", "output",
+                    "oifname", "e2e-uplink", "meta", "mark", "!=", "0",
+                    "ip", "daddr", "198.51.100.50",
+                    "tcp", "dport", "9443", "dnat", "to", f"127.0.0.1:{physical.server_port}")
+                cli("up", "country-proof")
+                assert (runtime_dir / "netorch" / f"{profile_id}.pid").is_file()
+
+                def user_rpc(method, params):
+                    script = (
+                        "import json,socket,sys\n"
+                        "with socket.socket(socket.AF_UNIX) as s:\n"
+                        " s.settimeout(8);s.connect(sys.argv[1]);f=s.makefile('rwb')\n"
+                        " for i,m,p in [(1,'hello',{'protocol':1,'client':'proxy-e2e'}),"
+                        "(2,sys.argv[2],json.loads(sys.argv[3]))]:\n"
+                        "  f.write(json.dumps({'id':i,'method':m,'params':p}).encode()+b'\\n');f.flush()\n"
+                        "  r=json.loads(f.readline());assert r.get('ok'),r\n"
+                        " print(json.dumps(r['result']))\n")
+                    result = subprocess.run(["python3", "-c", script, socket_path, method, json.dumps(params)],
+                        check=True, text=True, capture_output=True, env=cli_env, user=65534, group=65534, timeout=15)
+                    return json.loads(result.stdout)
+
+                def named_status(name):
+                    return next(row for row in user_rpc("xray.proxyExits", {"profileId": profile_id})
+                        if row["name"] == name)
+
+                def user_pid():
+                    matches = [path.parent for path in Path("/proc").glob("[0-9]*/cmdline")
+                        if b"/run/network-orchestrator/65534/" in path.read_bytes()]
+                    assert len(matches) == 1, "expected exactly one user-owned managed Xray"
+                    return int(matches[0].name)
+
+                poisoned_env = dict(cli_env, HTTP_PROXY="http://127.0.0.1:9", http_proxy="http://127.0.0.1:9",
+                    HTTPS_PROXY="http://127.0.0.1:9", https_proxy="http://127.0.0.1:9",
+                    ALL_PROXY="socks5h://127.0.0.1:9", all_proxy="socks5h://127.0.0.1:9",
+                    NO_PROXY="*", no_proxy="*")
+
+                def proxy_run(name, *command):
+                    return subprocess.run(["/tmp/netorch", "--data-dir", str(cli_data),
+                        "proxy", name, "--", *command], text=True, capture_output=True,
+                        env=poisoned_env, user=65534, group=65534, timeout=20)
+
+                def via(name, host="198.51.100.50"):
+                    return proxy_run(name, "curl", "-sS", "--max-time", "5", "--cacert", str(ca),
+                        f"https://{host}:9443/")
+
+                until(lambda: named_status("ru").get("pool", {}).get("activeKey") == real_keys["backup"],
+                    "independent named pool probes and selects its own first member", timeout=70)
+                initial_pid = user_pid()
+                initial_rules = run("ip", "-j", "rule", "show")
+                initial_routes = run("ip", "-j", "route", "show", "table", "all")
+                normal = subprocess.run(["curl", "-sS", "--max-time", "5", "--noproxy", "*",
+                    "--cacert", str(ca), "https://198.51.100.50:9443/"], text=True,
+                    capture_output=True, env=cli_env, user=65534, group=65534, timeout=10)
+                assert normal.returncode == 0 and normal.stdout == "primary", normal
+                for name, expected in [("default", "primary"), ("nl", "backup"), ("ru", "backup"),
+                        ("direct", "underlay"), ("bypass", "primary")]:
+                    result = via(name)
+                    assert result.returncode == 0 and result.stdout == expected, (name, result)
+                blocked = via("default", "blocked.test")
+                assert blocked.returncode != 0, "normal-rules exit ignored the block"
+                fixed = via("nl", "blocked.test")
+                assert fixed.returncode == 0 and fixed.stdout == "backup", fixed
+                direct_rule = via("default", "direct.test")
+                assert direct_rule.returncode == 0 and direct_rule.stdout == "underlay", direct_rule
+                missing = via("gone")
+                assert missing.returncode != 0, "missing fixed node fell back"
+                print("PASS real curl follows rules, fixed node and pool; marked direct bypasses full TUN; ambient proxy/NO_PROXY cannot bypass the exit", flush=True)
+
+                result = proxy_run("default", "python3", "-c",
+                    "import json,sys;print(json.dumps(sys.argv[1:]))", "two words", ";$not-a-shell")
+                assert result.returncode == 0 and json.loads(result.stdout) == ["two words", ";$not-a-shell"]
+                assert proxy_run("default", "/bin/sh", "-c", "exit 37").returncode == 37
+                sleeper = subprocess.Popen(["/tmp/netorch", "--data-dir", str(cli_data),
+                    "proxy", "default", "--", "/bin/sleep", "60"], env=poisoned_env,
+                    user=65534, group=65534, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                children.append(sleeper)
+                until(lambda: Path(f"/proc/{sleeper.pid}/comm").read_text().strip() == "sleep",
+                    "proxy exec preserves the process PID")
+                sleeper.send_signal(signal.SIGTERM)
+                assert sleeper.wait(timeout=5) == -signal.SIGTERM
+                assert user_pid() == initial_pid
+                assert run("ip", "-j", "rule", "show") == initial_rules
+                assert run("ip", "-j", "route", "show", "table", "all") == initial_routes
+                print("PASS argv, exit status and signals survive exec without tunnel restart or routing changes", flush=True)
+
+                stop_node("backup")
+                until(lambda: named_status("ru").get("pool", {}).get("activeKey") == real_keys["pinned"],
+                    "named pool fails over only to its own next member", timeout=70)
+                assert via("ru").stdout == "pinned"
+                assert via("nl").returncode != 0, "dead fixed node used the pool or default"
+                stop_node("pinned")
+                until(lambda: named_status("ru").get("pool", {}).get("activeKey") == "unavailable",
+                    "all-down named pool blocks despite healthy default and reserve", timeout=70)
+                marker = cli_data / "unexpected-command"
+                rejected = proxy_run("ru", "/usr/bin/touch", str(marker))
+                assert rejected.returncode != 0 and not marker.exists()
+                assert via("default").stdout == "primary" and via("direct").stdout == "underlay"
+                assert user_rpc("xray.status", {"profileId": profile_id})["failover"]["activeKey"] == real_keys["primary"]
+                print("PASS unavailable fixed exits and pools never leak to default/direct or alter the default node", flush=True)
+
+                cli("proxy", "set", "nl", "--profile", "country-proof", "--direct")
+                rejected = proxy_run("nl", "/usr/bin/touch", str(marker))
+                assert rejected.returncode != 0 and not marker.exists()
+                cli("proxy", "remove", "direct", "--profile", "country-proof")
+                rejected = proxy_run("direct", "/usr/bin/touch", str(marker))
+                assert rejected.returncode != 0 and not marker.exists()
+                assert user_pid() == initial_pid
+                old_ports = [(row["socksPort"], row["httpPort"]) for row in user_rpc(
+                    "xray.proxyExits", {"profileId": profile_id})]
+                cli("down", "country-proof")
+                for pair in old_ports:
+                    for listener in pair:
+                        with socket.socket() as sock:
+                            sock.settimeout(.25)
+                            assert sock.connect_ex(("127.0.0.1", listener)) != 0, "owned proxy listener leaked"
+                assert records["primary"]["process"].poll() is None
+                assert records["reserve"]["process"].poll() is None
+                print("PASS stale/removed aliases refuse before exec; disconnect removes listeners and preserves peers", flush=True)
+                return
             cli("backup", "pool", "set", "country-proof", "Canada", "--no-verify")
             Path(xray).rename(xray + ".disabled")
             try:
@@ -702,5 +886,7 @@ if __name__ == "__main__":
         driver(service_checks_only=True)
     elif sys.argv[1:] == ["--service-checks-client"]:
         driver(service_checks_only=2)
+    elif sys.argv[1:] == ["--named-proxies"]:
+        driver(named_proxies=True)
     else:
-        raise SystemExit("usage: python3 e2e/linux/multinode_scenarios.py [--service-checks|--service-checks-client]")
+        raise SystemExit("usage: python3 e2e/linux/multinode_scenarios.py [--service-checks|--service-checks-client|--named-proxies]")

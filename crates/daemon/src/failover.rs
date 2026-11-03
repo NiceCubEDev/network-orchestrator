@@ -78,6 +78,30 @@ impl TrackedNode {
     }
 }
 
+#[derive(Clone, Copy)]
+pub enum OutboundKind {
+    Node,
+    Pin,
+}
+
+impl OutboundKind {
+    fn prefix(self) -> &'static str {
+        match self {
+            Self::Node => "node-",
+            Self::Pin => "pin-",
+        }
+    }
+
+    fn tag(self, key: &str) -> String {
+        format!("{}{key}", self.prefix())
+    }
+}
+
+pub struct BalancerTarget {
+    pub tag: String,
+    pub kind: OutboundKind,
+}
+
 /// Which tag the `failover` balancer must select.
 ///
 /// `healthy[i]` is the committed verdict for `candidates[i]` (primary
@@ -90,13 +114,16 @@ fn select_tag(
     healthy: &[Option<bool>],
     current: Option<&str>,
     auto_return: bool,
+    kind: OutboundKind,
 ) -> String {
-    let node = |key: &str| net_manager_core::xray::node_tag(key);
     // Without auto-return a running backup stays selected while healthy —
     // but never beyond its own failure (primary then wins back).
     if !auto_return {
         if let Some(current) = current {
-            if let Some(index) = candidates.iter().position(|key| node(key) == current) {
+            if let Some(index) = candidates
+                .iter()
+                .position(|key| current.strip_prefix(kind.prefix()) == Some(key.as_str()))
+            {
                 if healthy.get(index) == Some(&Some(true)) && index > 0 {
                     return current.to_string();
                 }
@@ -107,7 +134,7 @@ fn select_tag(
         .iter()
         .zip(healthy)
         .find(|(_, health)| **health == Some(true))
-        .map(|(key, _)| node(key))
+        .map(|(key, _)| kind.tag(key))
         .unwrap_or_else(|| net_manager_core::xray::UNAVAILABLE_TAG.to_string())
 }
 
@@ -121,13 +148,113 @@ pub struct FailoverSupervisor {
     api_child: Arc<Mutex<Option<Child>>>,
 }
 
+/// All controllers belonging to one Xray process share its teardown lifetime.
+#[derive(Default)]
+pub struct FailoverSupervisors {
+    main: Option<FailoverSupervisor>,
+    named: std::collections::HashMap<String, FailoverSupervisor>,
+}
+
+impl FailoverSupervisors {
+    pub fn spawn(
+        failover: Option<&XrayFailoverParams>,
+        exits: &[net_manager_core::daemon_protocol::ProxyExitBinding],
+        probe_url: Option<&str>,
+        pinned_keys: &[String],
+        mark: u32,
+    ) -> Self {
+        let mut supervisors = Self::default();
+        let api_port = crate::xray::xray_api_port(mark);
+        if let Some(params) = failover {
+            supervisors.main = FailoverSupervisor::spawn(
+                params.clone(),
+                api_port,
+                BalancerTarget {
+                    tag: net_manager_core::xray::FAILOVER_BALANCER.into(),
+                    kind: OutboundKind::Node,
+                },
+                |index| crate::xray::xray_probe_port(mark, index),
+            )
+            .map_err(|_| {
+                eprintln!("network-orchestrator-daemon: default failover supervisor unavailable")
+            })
+            .ok();
+        }
+        let Some(url) = probe_url.or_else(|| failover.map(|params| params.probe_url.as_str()))
+        else {
+            return supervisors;
+        };
+        let interval = failover.map_or(10, |params| params.interval_secs);
+        for exit in exits {
+            let Some(params) = crate::proxy_exits::pool_params(exit, url, interval) else {
+                continue;
+            };
+            let ports: Vec<u16> = params
+                .nodes
+                .iter()
+                .map(|node| {
+                    pinned_keys
+                        .iter()
+                        .position(|key| key == &node.key)
+                        .map(|index| crate::xray::xray_pin_probe_port(mark, index))
+                        // A missing saved member is never probed through another node.
+                        .unwrap_or(0)
+                })
+                .collect();
+            match FailoverSupervisor::spawn(
+                params,
+                api_port,
+                BalancerTarget {
+                    tag: crate::proxy_exits::balancer_tag(&exit.name),
+                    kind: OutboundKind::Pin,
+                },
+                |index| ports[index],
+            ) {
+                Ok(supervisor) => {
+                    supervisors.named.insert(exit.name.clone(), supervisor);
+                }
+                Err(_) => {
+                    eprintln!("network-orchestrator-daemon: named failover supervisor unavailable")
+                }
+            }
+        }
+        supervisors
+    }
+
+    pub fn status(&self) -> Option<FailoverStatus> {
+        self.main.as_ref().map(FailoverSupervisor::status)
+    }
+
+    pub fn exit_statuses(
+        &self,
+        exits: &[net_manager_core::daemon_protocol::ProxyExitBinding],
+        mark: u32,
+    ) -> Vec<net_manager_core::daemon_protocol::ProxyExitStatus> {
+        exits
+            .iter()
+            .enumerate()
+            .map(|(index, exit)| {
+                let (socks_port, http_port) = crate::proxy_exits::ports(mark, index);
+                net_manager_core::daemon_protocol::ProxyExitStatus {
+                    name: exit.name.clone(),
+                    target: exit.target.clone(),
+                    socks_port,
+                    http_port,
+                    pool: self.named.get(&exit.name).map(FailoverSupervisor::status),
+                }
+            })
+            .collect()
+    }
+}
+
 impl FailoverSupervisor {
-    /// Spawn the probe worker. `apply` runs `xray api bo`; injectable for
-    /// tests. Returns `Err` when the thread cannot be spawned — the caller
+    /// Start a bounded controller for exactly one balancer and candidate set.
+    /// Returns `Err` when the thread cannot be spawned; the caller
     /// treats it as degraded (the balancer still holds its safe default).
     pub fn spawn(
         params: XrayFailoverParams,
         api_port: u16,
+        balancer: BalancerTarget,
         probe_port_of: impl Fn(usize) -> u16,
     ) -> std::io::Result<Self> {
         let nodes: Vec<TrackedNode> = params
@@ -158,7 +285,7 @@ impl FailoverSupervisor {
             let api_child = Arc::clone(&api_child);
             thread::Builder::new()
                 .name("xray-failover".into())
-                .spawn(move || run(params, api_port, nodes, stop, status, api_child))?
+                .spawn(move || run(params, api_port, balancer, nodes, stop, status, api_child))?
         };
         Ok(Self {
             stop,
@@ -198,6 +325,7 @@ impl Drop for FailoverSupervisor {
 fn run(
     params: XrayFailoverParams,
     api_port: u16,
+    balancer: BalancerTarget,
     mut nodes: Vec<TrackedNode>,
     stop: Arc<AtomicBool>,
     status: SharedStatus,
@@ -206,6 +334,9 @@ fn run(
     let interval = Duration::from_secs(u64::from(params.interval_secs.max(1)));
     let mut applied: Option<String> = None;
     let mut next_round = Instant::now();
+    let keys: Vec<String> = nodes.iter().map(|node| node.key.clone()).collect();
+    let mut healthy = Vec::with_capacity(nodes.len());
+    let primary_tag = balancer.kind.tag(&params.primary_key);
     while !stop.load(Ordering::Relaxed) {
         if Instant::now() >= next_round {
             for node in &mut nodes {
@@ -214,21 +345,22 @@ fn run(
                 }
                 node.observe(probe(node.probe_port, &params.probe_url));
             }
-            let healthy: Vec<Option<bool>> = nodes.iter().map(|node| node.committed).collect();
-            let keys: Vec<String> = nodes.iter().map(|node| node.key.clone()).collect();
+            healthy.clear();
+            healthy.extend(nodes.iter().map(|node| node.committed));
             let wanted = select_tag(
                 &keys,
                 &healthy,
                 applied.as_deref(),
                 params.auto_return_primary,
+                balancer.kind,
             );
             if stop.load(Ordering::Relaxed) {
                 return;
             }
             let changed = applied.as_deref() != Some(wanted.as_str());
             if changed {
-                match api_override(api_port, &wanted, &stop, &api_child) {
-                    Ok(()) => applied = Some(wanted.clone()),
+                match api_override(api_port, &balancer.tag, &wanted, &stop, &api_child) {
+                    Ok(()) => applied = Some(wanted),
                     Err(err) => {
                         eprintln!("network-orchestrator-daemon: failover override failed: {err}")
                     }
@@ -238,12 +370,15 @@ fn run(
                 primary_key: params.primary_key.clone(),
                 active_key: applied
                     .as_deref()
-                    .map(|tag| tag.strip_prefix("node-").unwrap_or(tag).to_string())
+                    .map(|tag| {
+                        tag.strip_prefix(balancer.kind.prefix())
+                            .unwrap_or(tag)
+                            .to_string()
+                    })
                     .unwrap_or_else(|| net_manager_core::xray::UNAVAILABLE_TAG.to_string()),
                 auto_return_primary: params.auto_return_primary,
                 failover_active: applied.as_deref().is_some_and(|tag| {
-                    tag != net_manager_core::xray::UNAVAILABLE_TAG
-                        && tag != net_manager_core::xray::node_tag(&params.primary_key)
+                    tag != net_manager_core::xray::UNAVAILABLE_TAG && tag != primary_tag
                 }),
                 nodes: nodes.iter().map(TrackedNode::health).collect(),
             };
@@ -298,10 +433,10 @@ fn probe(probe_port: u16, url: &str) -> ProbeSample {
     }
 }
 
-/// `xray api bo -b failover <tag>` against the tunnel's loopback API —
-/// bounded like the statsquery helper; a hang can never wedge the worker.
+/// Apply one balancer override; bounded like the statsquery helper.
 fn api_override(
     api_port: u16,
+    balancer_tag: &str,
     tag: &str,
     stop: &AtomicBool,
     slot: &Mutex<Option<Child>>,
@@ -317,7 +452,7 @@ fn api_override(
             "-t",
             "3",
             "-b",
-            net_manager_core::xray::FAILOVER_BALANCER,
+            balancer_tag,
             tag,
         ])
         .stdin(Stdio::null())
@@ -452,25 +587,46 @@ mod tests {
             "ccccccccdddddddd".to_string(),
         ];
         assert_eq!(
-            select_tag(&keys, &[Some(true), Some(true)], None, true),
+            select_tag(
+                &keys,
+                &[Some(true), Some(true)],
+                None,
+                true,
+                OutboundKind::Node
+            ),
             "node-aaaaaaaabbbbbbbb"
         );
         assert_eq!(
-            select_tag(&keys, &[Some(false), Some(true)], None, true),
+            select_tag(
+                &keys,
+                &[Some(false), Some(true)],
+                None,
+                true,
+                OutboundKind::Node
+            ),
             "node-ccccccccdddddddd"
         );
         assert_eq!(
-            select_tag(&keys, &[Some(false), Some(false)], None, true),
+            select_tag(
+                &keys,
+                &[Some(false), Some(false)],
+                None,
+                true,
+                OutboundKind::Node
+            ),
             "unavailable"
         );
         // Unprobed nodes never win — the balancer stays on the blackhole.
-        assert_eq!(select_tag(&keys, &[None, None], None, true), "unavailable");
+        assert_eq!(
+            select_tag(&keys, &[None, None], None, true, OutboundKind::Node),
+            "unavailable"
+        );
     }
 
     #[test]
     fn all_down_selects_blackhole_never_direct() {
         let keys = vec!["aaaaaaaabbbbbbbb".to_string()];
-        let tag = select_tag(&keys, &[Some(false)], None, true);
+        let tag = select_tag(&keys, &[Some(false)], None, true, OutboundKind::Node);
         assert_eq!(tag, "unavailable");
         assert!(!tag.starts_with("node-"));
     }
@@ -488,6 +644,7 @@ mod tests {
                 &[Some(true), Some(true)],
                 Some("node-ccccccccdddddddd"),
                 false,
+                OutboundKind::Node,
             ),
             "node-ccccccccdddddddd"
         );
@@ -499,6 +656,7 @@ mod tests {
                 &[Some(true), Some(false)],
                 Some("node-ccccccccdddddddd"),
                 false,
+                OutboundKind::Node,
             ),
             "node-aaaaaaaabbbbbbbb"
         );
@@ -509,8 +667,34 @@ mod tests {
                 &[Some(true), Some(true)],
                 Some("node-ccccccccdddddddd"),
                 true,
+                OutboundKind::Node,
             ),
             "node-aaaaaaaabbbbbbbb"
+        );
+    }
+
+    #[test]
+    fn named_pool_selects_only_its_pinned_members_and_never_the_default_node() {
+        let keys = vec!["aaaaaaaabbbbbbbb".into(), "ccccccccdddddddd".into()];
+        assert_eq!(
+            select_tag(
+                &keys,
+                &[Some(false), Some(true)],
+                Some("node-eeeeeeeeffffffff"),
+                false,
+                OutboundKind::Pin
+            ),
+            "pin-ccccccccdddddddd"
+        );
+        assert_eq!(
+            select_tag(
+                &keys,
+                &[None, Some(false)],
+                Some("pin-ccccccccdddddddd"),
+                false,
+                OutboundKind::Pin
+            ),
+            "unavailable"
         );
     }
 

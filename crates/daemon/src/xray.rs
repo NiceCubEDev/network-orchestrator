@@ -44,6 +44,7 @@ pub struct XrayPlan {
     pub probe_url: Option<String>,
     pub pinned_keys: Vec<String>,
     pub service_checks: Vec<net_manager_core::models::ServiceCheck>,
+    pub proxy_exits: Vec<net_manager_core::daemon_protocol::ProxyExitBinding>,
     /// Inline caller-provided `geoip.dat`/`geosite.dat` contents; decoded
     /// into the root-owned staging dir before spawn (the sandboxed unit
     /// cannot see caller paths).
@@ -1070,6 +1071,7 @@ pub fn prepare_xray(uid: u32, params: XrayConnectParams, mark: u32) -> io::Resul
     }
     let mut config: Value = serde_json::from_str(&params.config).map_err(|_| rejected())?;
     validate_generated(&config)?;
+    let proxy_exits = crate::proxy_exits::bindings(&params.proxy_exits, &config)?;
     let failover = params
         .failover
         .as_ref()
@@ -1124,6 +1126,16 @@ pub fn prepare_xray(uid: u32, params: XrayConnectParams, mark: u32) -> io::Resul
         .as_deref()
         .map(crate::watchdog::checked_probe_url)
         .transpose()?;
+    if proxy_exits.iter().any(|exit| {
+        matches!(
+            exit.target,
+            net_manager_core::models::ProxyTarget::Pool { .. }
+        )
+    }) && probe_url.is_none()
+        && failover.is_none()
+    {
+        return Err(rejected());
+    }
     let pinned_keys: Vec<String> = config["outbounds"]
         .as_array()
         .ok_or_else(rejected)?
@@ -1200,7 +1212,13 @@ pub fn prepare_xray(uid: u32, params: XrayConnectParams, mark: u32) -> io::Resul
         "statsOutboundUplink": true,
         "statsOutboundDownlink": true,
     });
-    let services = if failover.is_some() {
+    let services = if failover.is_some()
+        || proxy_exits.iter().any(|exit| {
+            matches!(
+                exit.target,
+                net_manager_core::models::ProxyTarget::Pool { .. }
+            )
+        }) {
         vec!["StatsService", "RoutingService"]
     } else {
         vec!["StatsService"]
@@ -1256,6 +1274,7 @@ pub fn prepare_xray(uid: u32, params: XrayConnectParams, mark: u32) -> io::Resul
                 "protocol": "blackhole",
             }));
     }
+    crate::proxy_exits::inject(&mut config, &proxy_exits, mark)?;
     for outbound in config["outbounds"].as_array_mut().ok_or_else(rejected)? {
         if outbound["protocol"] != "blackhole" {
             if outbound["streamSettings"].is_null() {
@@ -1298,6 +1317,7 @@ pub fn prepare_xray(uid: u32, params: XrayConnectParams, mark: u32) -> io::Resul
         probe_url,
         pinned_keys,
         service_checks: params.service_checks,
+        proxy_exits,
         geo_assets: params.geo_assets,
     })
 }
@@ -1540,6 +1560,7 @@ mod tests {
             probe_url: None,
             mtu: None,
             service_checks: Vec::new(),
+            proxy_exits: Vec::new(),
         }
     }
 

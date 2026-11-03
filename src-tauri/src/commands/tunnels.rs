@@ -1840,6 +1840,7 @@ mod tests {
             rx_bytes: None,
             tx_bytes: None,
             failover: None,
+            proxy_exits: Vec::new(),
         };
         assert!(linux_xray_tunnel_status(status, &p).message.is_none());
     }
@@ -1861,6 +1862,7 @@ mod tests {
             rx_bytes: None,
             tx_bytes: None,
             failover: None,
+            proxy_exits: Vec::new(),
         };
         let message = linux_xray_tunnel_status(status, &p).message.unwrap();
         assert!(message.contains("DNS was not applied"));

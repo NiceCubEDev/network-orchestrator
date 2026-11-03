@@ -247,7 +247,8 @@ fn expected_countries(filters: &[&crate::models::NodePoolFilter]) -> Vec<String>
 }
 
 /// Keys that must never be swept into the pool: the explicit primary, the
-/// manual backups and every pinned endpoint.
+/// manual backups and every pinned endpoint (domain pins, DNS egress and
+/// named proxy exit node/pool targets).
 fn explicit_keys(
     profile: &crate::models::Profile,
     endpoints: &[SubscriptionEndpoint],
@@ -257,6 +258,7 @@ fn explicit_keys(
         .iter()
         .map(|route| route.endpoint_key.clone())
         .collect();
+    explicit.extend(profile.named_exit_keys());
     if let Some(key) = &profile.xray_dns.outbound_key {
         explicit.insert(key.clone());
     }
@@ -598,6 +600,7 @@ where
             || current_subscription.backup_keys != subscription.backup_keys
             || current.pinned_policies != profile.pinned_policies
             || current.xray_dns.outbound_key != profile.xray_dns.outbound_key
+            || current.xray_proxy_exits != profile.xray_proxy_exits
         {
             return Err(failure(
                 "Node selection changed during probing; rebuild the pool again",

@@ -1256,6 +1256,7 @@ mod tests {
             tx_bytes: None,
             failover: None,
             watchdog: None,
+            proxy_exits: Vec::new(),
         };
         assert_eq!(
             xray_tun_health(&status(TunnelState::Running)).state,

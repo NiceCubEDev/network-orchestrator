@@ -157,6 +157,19 @@ fn preserve_service_checks(profile: &mut Profile, stored: Option<&Profile>) {
     };
 }
 
+/// Named `netorch proxy` exits are owned by the proxy commands, never the
+/// generic form save — restore the stored spec so ordinary edits keep the
+/// aliases, and a non-Xray backend drops them entirely.
+fn preserve_named_proxy_exits(profile: &mut Profile, stored: Option<&Profile>) {
+    profile.xray_proxy_exits = if profile.backend == TunnelBackend::Xray {
+        stored
+            .filter(|stored| stored.backend == TunnelBackend::Xray)
+            .map_or_else(Vec::new, |stored| stored.xray_proxy_exits.clone())
+    } else {
+        Vec::new()
+    };
+}
+
 fn preserve_migrated_xray_settings(profile: &mut Profile, stored: Option<&Profile>) {
     if profile.backend != TunnelBackend::Xray {
         profile.xray_sockopts = None;
@@ -361,6 +374,7 @@ pub(crate) async fn save_profile(
     preserve_canonical_subscription(&mut profile, stored.as_ref());
     preserve_pinned_policies(&mut profile, stored.as_ref());
     preserve_service_checks(&mut profile, stored.as_ref());
+    preserve_named_proxy_exits(&mut profile, stored.as_ref());
     preserve_migrated_xray_settings(&mut profile, stored.as_ref());
     preserve_generated_xray_source(&mut profile, stored.as_ref());
     #[cfg(target_os = "linux")]
@@ -475,6 +489,7 @@ pub(crate) async fn save_vless_profile(
     preserve_canonical_subscription(&mut profile, stored.as_ref());
     preserve_pinned_policies(&mut profile, stored.as_ref());
     preserve_service_checks(&mut profile, stored.as_ref());
+    preserve_named_proxy_exits(&mut profile, stored.as_ref());
     preserve_migrated_xray_settings(&mut profile, stored.as_ref());
     validate_xray_routing(&profile)?;
     if let Some(existing) = &stored {
@@ -570,6 +585,7 @@ pub(crate) async fn save_wireguard_profile(
     preserve_canonical_subscription(&mut profile, stored.as_ref());
     preserve_pinned_policies(&mut profile, stored.as_ref());
     preserve_service_checks(&mut profile, stored.as_ref());
+    preserve_named_proxy_exits(&mut profile, stored.as_ref());
     preserve_migrated_xray_settings(&mut profile, stored.as_ref());
     if let Some(existing) = &stored {
         #[cfg(target_os = "linux")]

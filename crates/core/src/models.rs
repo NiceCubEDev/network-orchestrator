@@ -207,6 +207,55 @@ pub struct EndpointRef {
     pub name: String,
 }
 
+/// Named `netorch proxy NAME -- COMMAND` exits for an Xray TUN profile.
+/// Where traffic of the spawned command leaves the tunnel: the normal
+/// profile rules, one fixed subscription node, an independent ordered node
+/// pool, or the marked direct outbound. Config is data only — never a
+/// command, shell string or plugin; the program is chosen at invocation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum ProxyTarget {
+    /// Follows the profile's normal routing policies.
+    Rules,
+    /// One pinned subscription endpoint (`pin-<key>`); a missing key drops.
+    Node { endpoint_key: String },
+    /// Its own ordered, bounded set of pinned subscription endpoints.
+    Pool { endpoint_keys: Vec<String> },
+    /// The marked direct outbound that bypasses the tunnel's own TUN.
+    Direct,
+}
+
+impl ProxyTarget {
+    /// Subscription endpoint keys the target pins (empty for rules/direct).
+    pub fn endpoint_keys(&self) -> &[String] {
+        match self {
+            ProxyTarget::Rules | ProxyTarget::Direct => &[],
+            ProxyTarget::Node { endpoint_key } => std::slice::from_ref(endpoint_key),
+            ProxyTarget::Pool { endpoint_keys } => endpoint_keys,
+        }
+    }
+}
+
+/// One named proxy exit: a loopback SOCKS/HTTP listener pair the daemon
+/// binds for `netorch proxy NAME`. `no_proxy` entries are the command's
+/// explicit opt-out list — they never inherit ambient bypass rules.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NamedProxyExit {
+    /// 1-32 lowercase `[a-z0-9_-]`, first char alnum, unique per profile.
+    pub name: String,
+    pub target: ProxyTarget,
+    /// Hosts/CIDRs/`*` that leave unproxied for commands run under this
+    /// exit; empty (the default) means everything goes through the proxy.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub no_proxy: Vec<String>,
+}
+
 /// Probed health of one failover candidate, as the daemon last saw it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -604,6 +653,12 @@ pub struct Profile {
     pub pinned_policies: Vec<PinnedRoute>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub xray_service_checks: Vec<ServiceCheck>,
+    /// Named `netorch proxy` exits: extra loopback listener pairs the daemon
+    /// binds, each egressing via the declared target. Edited through the
+    /// dedicated proxy commands, never the generic form save. Missing
+    /// endpoint keys are kept (fail-closed blackhole), never retargeted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub xray_proxy_exits: Vec<NamedProxyExit>,
     #[serde(default)]
     pub private_lan_direct: bool,
     #[serde(default)]
@@ -720,6 +775,17 @@ impl Profile {
         }
     }
 
+    /// Endpoint keys the named proxy exits pin explicitly (node and pool
+    /// targets). Like domain pins and the DNS egress key these are excluded
+    /// from the automatic failover pool: an explicit user choice is never
+    /// swept into a name-matched pool.
+    pub fn named_exit_keys(&self) -> std::collections::HashSet<String> {
+        self.xray_proxy_exits
+            .iter()
+            .flat_map(|exit| exit.target.endpoint_keys().iter().cloned())
+            .collect()
+    }
+
     /// A secondary connection must list valid networks and split-DNS domains
     /// before anything is started.
     pub fn check_role(&self) -> Result<(), String> {
@@ -775,6 +841,7 @@ impl Default for Profile {
             tunnel_networks: Vec::new(),
             pinned_policies: Vec::new(),
             xray_service_checks: Vec::new(),
+            xray_proxy_exits: Vec::new(),
         }
     }
 }

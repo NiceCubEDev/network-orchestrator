@@ -207,12 +207,14 @@ pub fn prepare_linux_xray_tun_params(
             || subscription.node_pool.is_some() && !subscription.pool_keys.is_empty()
     }) || !profile.pinned_policies.is_empty()
         || profile.xray_dns.outbound_key.is_some();
-    let (config, failover) = if multinode {
+    let (mut config, failover) = if multinode {
         build_multinode(vault, profile)?
     } else {
         (config, None)
     };
-
+    // Named `netorch proxy` exits: dedicated pin-<key> outbounds appended
+    // after everything else — the default route and failover stay as built.
+    net_manager_core::proxy_exits::append_named_proxy_outbounds(vault, profile, &mut config)?;
     let effective_routes = profile.effective_routes();
     let default_route = effective_routes.is_empty();
     let route = |destination: &str| PolicyRoute {
@@ -274,6 +276,7 @@ pub fn prepare_linux_xray_tun_params(
             .filter(|check| check.background)
             .cloned()
             .collect(),
+        proxy_exits: profile.xray_proxy_exits.clone(),
     };
     check_xray_frame_size(&params)?;
     Ok(params)
