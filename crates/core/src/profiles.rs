@@ -4,7 +4,6 @@ use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
-use std::sync::Mutex;
 
 pub const PROFILE_DOCUMENT_VERSION: u32 = 1;
 
@@ -17,15 +16,11 @@ pub struct ProfileDocument {
 
 pub struct ProfileStore {
     path: PathBuf,
-    write_lock: Mutex<()>,
 }
 
 impl ProfileStore {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self {
-            path: path.into(),
-            write_lock: Mutex::new(()),
-        }
+        Self { path: path.into() }
     }
 
     pub fn load(&self) -> io::Result<ProfileDocument> {
@@ -55,11 +50,40 @@ impl ProfileStore {
     }
 
     pub fn save(&self, document: &ProfileDocument) -> io::Result<()> {
-        let _guard = self
-            .write_lock
-            .lock()
-            .map_err(|_| io::Error::other("profile store lock poisoned"))?;
+        // Reject invalid input before creating even the transaction lock.
+        for profile in &document.profiles {
+            crate::service_checks::validate_profile_service_checks(profile)?;
+            crate::proxy_exits::validate_profile_proxy_exits(profile)?;
+        }
+        let _guard = self.lock()?;
         self.save_locked(document)
+    }
+
+    /// A separate file survives atomic replacement of the document. Each
+    /// transaction opens its own handle, so threads and other processes use
+    /// the same OS lock; dropping the handle releases it even on errors.
+    fn lock(&self) -> io::Result<fs::File> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)?;
+            crate::config_security::protect_path(parent)?;
+        }
+        let mut name = self.path.clone().into_os_string();
+        name.push(".lock");
+        let path = PathBuf::from(name);
+        let mut options = fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options
+            .open(&path)
+            .map_err(|_| io::Error::other("cannot open profile transaction lock"))?;
+        crate::config_security::protect_path(&path)?;
+        file.lock()
+            .map_err(|_| io::Error::other("cannot lock profile store"))?;
+        Ok(file)
     }
 
     fn save_locked(&self, document: &ProfileDocument) -> io::Result<()> {
@@ -87,10 +111,7 @@ impl ProfileStore {
 
     pub fn upsert(&self, profile: Profile) -> io::Result<ProfileDocument> {
         validate_profile(&profile)?;
-        let _guard = self
-            .write_lock
-            .lock()
-            .map_err(|_| io::Error::other("profile store lock poisoned"))?;
+        let _guard = self.lock()?;
         let mut document = self.load()?;
         if let Some(existing) = document.profiles.iter_mut().find(|p| p.id == profile.id) {
             *existing = profile;
@@ -108,10 +129,7 @@ impl ProfileStore {
         id: &str,
         update: impl FnOnce(&mut Profile) -> io::Result<()>,
     ) -> io::Result<ProfileDocument> {
-        let _guard = self
-            .write_lock
-            .lock()
-            .map_err(|_| io::Error::other("profile store lock poisoned"))?;
+        let _guard = self.lock()?;
         let mut document = self.load()?;
         let profile = document
             .profiles
@@ -126,10 +144,7 @@ impl ProfileStore {
 
     /// Flags whether the app starts this profile when it launches.
     pub fn set_auto_connect(&self, id: &str, enabled: bool) -> io::Result<ProfileDocument> {
-        let _guard = self
-            .write_lock
-            .lock()
-            .map_err(|_| io::Error::other("profile store lock poisoned"))?;
+        let _guard = self.lock()?;
         let mut document = self.load()?;
         let profile = document
             .profiles
@@ -146,10 +161,7 @@ impl ProfileStore {
     /// Whether a static-route profile arms its routes while the interface is
     /// absent (true) or refuses to connect (false).
     pub fn set_wait_for_interface(&self, id: &str, enabled: bool) -> io::Result<ProfileDocument> {
-        let _guard = self
-            .write_lock
-            .lock()
-            .map_err(|_| io::Error::other("profile store lock poisoned"))?;
+        let _guard = self.lock()?;
         let mut document = self.load()?;
         let profile = document
             .profiles
@@ -164,10 +176,7 @@ impl ProfileStore {
     }
 
     pub fn delete(&self, id: &str) -> io::Result<ProfileDocument> {
-        let _guard = self
-            .write_lock
-            .lock()
-            .map_err(|_| io::Error::other("profile store lock poisoned"))?;
+        let _guard = self.lock()?;
         let mut document = self.load()?;
         let len_before = document.profiles.len();
         document.profiles.retain(|p| p.id != id);
@@ -189,6 +198,7 @@ impl ProfileStore {
         backend: TunnelBackend,
         ordered_ids: &[String],
     ) -> io::Result<ProfileDocument> {
+        let _guard = self.lock()?;
         let mut document = self.load()?;
         let positions: Vec<usize> = document
             .profiles
@@ -223,7 +233,7 @@ impl ProfileStore {
         for &index in &positions {
             document.profiles[index] = ordered.next().expect("queue covers the group");
         }
-        self.save(&document)?;
+        self.save_locked(&document)?;
         Ok(document)
     }
 }
@@ -417,6 +427,43 @@ mod tests {
             auto_connect: true,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn independent_stores_preserve_concurrent_profile_edits() {
+        let dir = unique_dir("concurrent-stores");
+        let path = dir.join("profiles.json");
+        let store = ProfileStore::new(path.clone());
+        let mut profile = wg_profile();
+        profile.name = "0".into();
+        let id = profile.id.clone();
+        store.upsert(profile).unwrap();
+        let start = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let path = path.clone();
+                let id = id.clone();
+                let start = start.clone();
+                std::thread::spawn(move || {
+                    let independent = ProfileStore::new(path);
+                    start.wait();
+                    for _ in 0..16 {
+                        independent
+                            .update_profile(&id, |profile| {
+                                let previous: usize = profile.name.parse().unwrap();
+                                profile.name = (previous + 1).to_string();
+                                Ok(())
+                            })
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(store.load().unwrap().profiles[0].name, "128");
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

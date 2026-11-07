@@ -151,10 +151,32 @@ pub fn prepare_connect_ports(
     };
     let old_path = profile.config_path.clone();
     rewrite_generated_proxy_ports(vault, profile, new_socks, new_http)?;
-    if let Err(err) = store.upsert(profile.clone()) {
-        let _ = vault.remove_revision_for_config(&profile.config_path);
-        return Err(err);
-    }
+    let updated = store.update_profile(&profile.id, |stored| {
+        if stored.config_path != old_path
+            || stored.xray_socks_port != old_socks
+            || stored.xray_http_port != old_http
+        {
+            return Err(io::Error::other(
+                "profile changed while preparing listener ports",
+            ));
+        }
+        stored.config_path = profile.config_path.clone();
+        stored.xray_socks_port = profile.xray_socks_port;
+        stored.xray_http_port = profile.xray_http_port;
+        Ok(())
+    });
+    let document = match updated {
+        Ok(document) => document,
+        Err(error) => {
+            let _ = vault.remove_revision_for_config(&profile.config_path);
+            return Err(error);
+        }
+    };
+    *profile = document
+        .profiles
+        .into_iter()
+        .find(|stored| stored.id == profile.id)
+        .expect("updated profile remains in its document");
     if let Some(stored) = profiles.iter_mut().find(|stored| stored.id == profile.id) {
         *stored = profile.clone();
     }

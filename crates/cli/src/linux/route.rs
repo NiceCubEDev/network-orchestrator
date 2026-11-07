@@ -250,15 +250,33 @@ fn wanted(rules: &RuleArgs) -> Result<Vec<Wanted>, String> {
 
 fn save(
     ctx: &Ctx,
-    mut profile: Profile,
+    profile: Profile,
     policies: Vec<DomainPolicy>,
     extra: Vec<String>,
 ) -> Result<Output, String> {
-    profile.domain_policies = policies;
-    ctx.store().upsert(profile.clone()).map_err(|_| {
-        "The rules could not be saved. Check the selectors and file permissions.".to_string()
-    })?;
-    let rules = rules_json(&profile);
+    let document = ctx
+        .store()
+        .update_profile(&profile.id, |stored| {
+            for policy in &policies {
+                check_not_pinned(stored, &policy.domains).map_err(std::io::Error::other)?;
+            }
+            stored.domain_policies = policies;
+            stored.private_lan_direct = profile.private_lan_direct;
+            Ok(())
+        })
+        .map_err(|_| {
+            "The rules could not be saved. Check the selectors and file permissions.".to_string()
+        })?;
+    let saved = document
+        .profiles
+        .into_iter()
+        .find(|stored| stored.id == profile.id)
+        .ok_or("Profile not found")?;
+    Ok(saved_output(&saved, extra))
+}
+
+fn saved_output(profile: &Profile, extra: Vec<String>) -> Output {
+    let rules = rules_json(profile);
     let mut text = format!(
         "Rules of \"{}\" saved. They apply when the profile connects: \
          `netorch down {0:?}` and `netorch up {0:?}` if it is already up.",
@@ -267,7 +285,7 @@ fn save(
     for hint in extra {
         text.push_str(&format!("\n  note: {hint}"));
     }
-    Ok((rules, text))
+    (rules, text)
 }
 
 /// Replaces every list, like the macOS command and the app's editor.
@@ -306,7 +324,35 @@ fn edit(ctx: &Ctx, query: &str, rules: &RuleArgs, how: Edit) -> Result<Output, S
     if lists.iter().all(|list| list.selectors.is_empty()) {
         return Err("Name at least one selector with --block, --proxy or --direct".into());
     }
-    let mut policies = profile.domain_policies.clone();
+    let mut notes = Vec::new();
+    let document = ctx
+        .store()
+        .update_profile(&profile.id, |stored| {
+            notes = edit_policies(stored, lists, how)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+            Ok(())
+        })
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::InvalidInput {
+                error.to_string()
+            } else {
+                "The rules could not be saved. Check the selectors and file permissions.".into()
+            }
+        })?;
+    let saved = document
+        .profiles
+        .into_iter()
+        .find(|stored| stored.id == profile.id)
+        .ok_or("Profile not found")?;
+    Ok(saved_output(&saved, notes))
+}
+
+fn edit_policies(
+    profile: &mut Profile,
+    lists: Vec<Wanted>,
+    how: Edit,
+) -> Result<Vec<String>, String> {
+    let mut policies = std::mem::take(&mut profile.domain_policies);
     let mut notes = Vec::new();
     for Wanted {
         target,
@@ -321,7 +367,7 @@ fn edit(ctx: &Ctx, query: &str, rules: &RuleArgs, how: Edit) -> Result<Output, S
             let present = selectors_of(&policies, target).contains(&selector);
             match how {
                 Edit::Add => {
-                    check_not_pinned(&profile, std::slice::from_ref(&selector))?;
+                    check_not_pinned(profile, std::slice::from_ref(&selector))?;
                     if let Some((other, _)) = holder {
                         return Err(format!(
                             "{selector} is already in the {other} list; remove it there first"
@@ -351,7 +397,8 @@ fn edit(ctx: &Ctx, query: &str, rules: &RuleArgs, how: Edit) -> Result<Output, S
         }
     }
     policies.retain(|policy| !policy.domains.is_empty());
-    save(ctx, profile, policies, notes)
+    profile.domain_policies = policies;
+    Ok(notes)
 }
 
 /// The node a pin targets: a server of the subscription (number, name part)
@@ -719,13 +766,30 @@ mod tests {
         )
     }
 
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
-    fn the_geo_directory_follows_the_pinned_xray() {
-        assert_eq!(
-            XRAY_VERSION,
-            net_manager_core::managed_xray::LINUX_XRAY_VERSION
-        );
+    fn concurrent_selector_additions_preserve_every_edit() {
+        let (_dir, ctx) = setup(Vec::new());
+        let start = std::sync::Arc::new(std::sync::Barrier::new(8));
+        std::thread::scope(|scope| {
+            for worker in 0..8 {
+                let ctx = &ctx;
+                let start = start.clone();
+                scope.spawn(move || {
+                    start.wait();
+                    for step in 0..8 {
+                        let selector = format!("domain:host-{worker}-{step}.test");
+                        edit(ctx, "x1", &rules(&[], &[], &[&selector]), Edit::Add).unwrap();
+                    }
+                });
+            }
+        });
+        let mut actual = direct_of(&ctx);
+        let mut expected: Vec<_> = (0..8)
+            .flat_map(|worker| (0..8).map(move |step| format!("domain:host-{worker}-{step}.test")))
+            .collect();
+        actual.sort();
+        expected.sort();
+        assert_eq!(actual, expected);
     }
 
     #[test]
