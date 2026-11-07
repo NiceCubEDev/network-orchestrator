@@ -43,8 +43,11 @@ pub fn parse_vless_url(uri: &str) -> io::Result<ParsedVless> {
         return Err(invalid_input("vless url must contain a nonblank user id"));
     }
     let address = url
-        .host_str()
-        .map(str::to_string)
+        .host()
+        .map(|host| match host {
+            url::Host::Ipv6(address) => address.to_string(),
+            host => host.to_string(),
+        })
         .filter(|host| !host.trim().is_empty())
         .ok_or_else(|| invalid_input("vless url must contain a host"))?;
 
@@ -872,7 +875,11 @@ fn generate_hysteria2_config(uri: &str, socks_port: u16) -> io::Result<Value> {
         return Err(invalid_input("hysteria2 url must contain auth"));
     }
     let address = url
-        .host_str()
+        .host()
+        .map(|host| match host {
+            url::Host::Ipv6(address) => address.to_string(),
+            host => host.to_string(),
+        })
         .filter(|host| !host.is_empty())
         .ok_or_else(|| invalid_input("hysteria2 url must contain a host"))?;
     let port = url.port().unwrap_or(443);
@@ -2647,6 +2654,51 @@ mod tests {
     use serde_json::json;
 
     const WS_TLS_URL: &str = "vless://11111111-2222-3333-4444-555555555555@example.com:443?type=ws&security=tls&sni=edge.example.com&fp=chrome&path=%2Fapi%2Fws&host=cdn.example.com#My%20Node%20%F0%9F%9A%80";
+
+    #[test]
+    fn ipv6_vless_uri_generates_bare_ip_without_changing_dns_or_ipv4_hosts() {
+        for (authority, expected) in [
+            ("[fd79:6e65:746f::3]", "fd79:6e65:746f::3"),
+            ("192.0.2.3", "192.0.2.3"),
+            ("node.example.test", "node.example.test"),
+        ] {
+            let uri = format!("vless://11111111-2222-3333-4444-555555555555@{authority}:11002?type=raw&security=none");
+            let parsed = parse_vless_url(&uri).unwrap();
+            assert_eq!(parsed.address, expected);
+            let config = generate_share_link_config_with_http(&uri, 20808, 20809).unwrap();
+            assert_eq!(
+                config["outbounds"][0]["settings"]["vnext"][0]["address"],
+                expected
+            );
+            assert_eq!(
+                config["outbounds"][0]["settings"]["vnext"][0]["port"],
+                11002
+            );
+            if authority.starts_with('[') {
+                assert!(parsed.address.parse::<IpAddr>().unwrap().is_ipv6());
+            }
+        }
+    }
+
+    #[test]
+    fn ipv6_hysteria_uri_generates_bare_ip_without_changing_dns_or_ipv4_hosts() {
+        for (authority, expected) in [
+            ("[fd79:6e65:746f::3]", "fd79:6e65:746f::3"),
+            ("192.0.2.3", "192.0.2.3"),
+            ("node.example.test", "node.example.test"),
+        ] {
+            let uri = format!("hysteria2://test-password@{authority}:8443");
+            let config = generate_share_link_config_with_http(&uri, 20808, 20809).unwrap();
+            let address = config["outbounds"][0]["settings"]["address"]
+                .as_str()
+                .unwrap();
+            assert_eq!(address, expected);
+            assert_eq!(config["outbounds"][0]["settings"]["port"], 8443);
+            if authority.starts_with('[') {
+                assert!(address.parse::<IpAddr>().unwrap().is_ipv6());
+            }
+        }
+    }
 
     #[test]
     fn parses_tls_websocket_url() {

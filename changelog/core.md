@@ -10,6 +10,12 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+### Fixed
+
+- Normalize IPv6 hosts from VLESS and Hysteria2 links before generating Xray
+  server addresses, so transport dialing and literal endpoint bypasses use bare
+  IPv6 addresses rather than bracketed URL authorities.
+
 ## [0.14.0] - 2026-11-07
 
 ### Added
