@@ -15,6 +15,11 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 - Normalize IPv6 hosts from VLESS and Hysteria2 links before generating Xray
   server addresses, so transport dialing and literal endpoint bypasses use bare
   IPv6 addresses rather than bracketed URL authorities.
+- Keep NetBird setup keys in inherited anonymous descriptors on Linux and track
+  pending logins by process birth, executable, user and provider socket. A later
+  frontend can cancel its own pending login without signaling unrelated processes.
+- Reject symlinked NetBird runtime/log storage and report unsuccessful provider
+  shutdowns instead of acknowledging a failed operation.
 
 ## [0.14.0] - 2026-11-07
 
