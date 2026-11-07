@@ -12,7 +12,7 @@ version = "0.10.2"
 
 [linux]
 # The Linux app, the network daemon and netorch for Linux.
-version = "0.13.1"
+version = "0.14.0"
 
 [windows]
 # The Windows app.

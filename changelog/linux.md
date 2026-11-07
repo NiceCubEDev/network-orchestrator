@@ -10,6 +10,36 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-11-07
+
+Core 0.14.0.
+
+### Added
+
+- Shared unprivileged `netorch serve` user service for local Xray SOCKS/HTTP
+  children and detached daemon connection lifetime. CLI and GUI control the
+  same runtime; closing the window does not terminate it.
+- Raw Xray JSON import in the CLI, defaulting to unprivileged SOCKS mode.
+- Arch/CachyOS packages include GUI, CLI, daemon, pinned Xray, shell completions
+  and tmpfiles configuration; Debian GUI installers also include the CLI runtime.
+
+### Changed
+
+- Linux CLI and GUI use one connection engine, data-directory convention,
+  OpenVPN credential store and geodata preparation. CLI profile changes refresh
+  the open GUI. OS file locks protect cross-process profile edits.
+- Replace per-profile CLI keeper processes with the shared user service.
+  A systemd user manager (or foreground `netorch serve`) is required; retaining
+  user units across logout requires explicit linger configuration.
+- Root connects require foreground mode. Foreground terminal hangup disconnects
+  instead of leaving a shared connection running.
+
+### Fixed
+
+- Show a ready Xray executable with an unknown version as ready, not absent.
+- Update vulnerable frontend build dependencies within compatible ranges.
+- Preserve automatic installation marks when upgrading shared daemon/CLI dependencies.
+
 ## [0.13.1] - 2026-11-03
 
 Core 0.13.0.
