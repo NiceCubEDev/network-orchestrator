@@ -14,11 +14,12 @@ use crate::linux::{
 use crate::privileged::Privileged;
 use net_manager_core::config_vault::ConfigVault;
 use net_manager_core::daemon_protocol::{
-    method, ErrorCode, OpenVpnConnectResult, OpenVpnCredentials, OpenVpnDisconnectResult,
-    OpenVpnProbeResult, OpenVpnProfileParams, OpenVpnStatusResult, WireGuardConnectResult,
-    WireGuardDisconnectResult, WireGuardProfileParams, WireGuardStatusResult, XrayConnectParams,
-    XrayConnectResult, XrayDisconnectResult, XrayProfileParams, XrayStatusResult,
-    DEFAULT_SOCKET_PATH, SOCKET_ENV,
+    feature, method, ErrorCode, OpenVpnConnectRequest, OpenVpnConnectResult, OpenVpnCredentials,
+    OpenVpnDisconnectResult, OpenVpnPlanResult, OpenVpnProbeResult, OpenVpnProfileParams,
+    OpenVpnStatusResult, RoutesApplyParams, RoutesApplyResult, WireGuardConnectParams,
+    WireGuardConnectResult, WireGuardDisconnectResult, WireGuardProfileParams,
+    WireGuardStatusResult, XrayConnectParams, XrayConnectResult, XrayDisconnectResult,
+    XrayProfileParams, XrayStatusResult, DEFAULT_SOCKET_PATH, SOCKET_ENV,
 };
 use net_manager_core::helper_client::{HelperClient, HelperError};
 use net_manager_core::models::{Profile, TunnelBackend, TunnelState, TunnelStatus, XrayMode};
@@ -68,6 +69,30 @@ pub struct LinuxEngine {
     data_root: Option<PathBuf>,
     // Injected/in-process privileged adapters remain caller-owned.
     socket: Option<PathBuf>,
+}
+
+/// A concrete connection request and immutable profile snapshot; never expose secrets in output.
+pub struct PreparedConnection {
+    profile: Profile,
+    request: PreparedRequest,
+}
+
+enum PreparedRequest {
+    Routes(RoutesApplyParams),
+    WireGuard(WireGuardConnectParams),
+    OpenVpn(OpenVpnConnectRequest, Option<&'static str>),
+    Xray(XrayConnectParams, Vec<String>),
+    #[cfg(target_os = "linux")]
+    Local(
+        crate::linux_session::PreparedLocalRequest,
+        Option<RoutesApplyParams>,
+    ),
+}
+
+impl PreparedConnection {
+    pub fn profile(&self) -> &Profile {
+        &self.profile
+    }
 }
 
 impl LinuxEngine {
@@ -160,10 +185,8 @@ impl LinuxEngine {
             || !profile.endpoint_bypasses.is_empty()
     }
 
-    fn apply_profile_routes(&self, profile: &Profile) -> Result<(), String> {
-        use net_manager_core::daemon_protocol::{
-            AttachSpecParams, RoutesApplyParams, RoutesApplyResult,
-        };
+    fn prepare_profile_routes(&self, profile: &Profile) -> Result<RoutesApplyParams, String> {
+        use net_manager_core::daemon_protocol::AttachSpecParams;
         let interfaces = net_manager_core::explorer::list_interfaces()
             .map_err(|_| "Cannot enumerate network interfaces")?;
         let plan = net_manager_core::policy::plan_profile(profile, &interfaces)
@@ -178,15 +201,11 @@ impl LinuxEngine {
             endpoint_bypasses: profile.endpoint_bypasses.clone(),
             uplink: false,
         });
-        let _: RoutesApplyResult = self.ask(
-            method::ROUTES_APPLY,
-            RoutesApplyParams {
-                owner: profile.id.clone(),
-                routes,
-                attach,
-            },
-        )?;
-        Ok(())
+        Ok(RoutesApplyParams {
+            owner: profile.id.clone(),
+            routes,
+            attach,
+        })
     }
 
     fn remove_profile_routes(&self, id: &str) -> Result<(), String> {
@@ -226,7 +245,11 @@ impl LinuxEngine {
         self.privileged.as_ref()
     }
 
-    fn ask<P: serde::Serialize, R: serde::de::DeserializeOwned>(
+    pub(crate) fn socket_path(&self) -> Option<&std::path::Path> {
+        self.socket.as_deref()
+    }
+
+    pub(crate) fn ask<P: serde::Serialize, R: serde::de::DeserializeOwned>(
         &self,
         method_name: &str,
         params: P,
@@ -278,25 +301,153 @@ impl LinuxEngine {
         credentials: Option<OpenVpnCredentials>,
         remembered: &dyn CredentialSource,
     ) -> Result<TunnelStatus, String> {
+        let prepared = self.prepare_connection(vault, profile, credentials, remembered, true)?;
+        self.execute_prepared(&prepared)
+    }
+
+    /// Read and validate concrete payloads without starting/stopping any resource.
+    pub fn prepare_connection(
+        &self,
+        vault: &ConfigVault,
+        profile: &Profile,
+        credentials: Option<OpenVpnCredentials>,
+        remembered: &dyn CredentialSource,
+        prepare_local_ports: bool,
+    ) -> Result<PreparedConnection, String> {
+        #[cfg(not(target_os = "linux"))]
+        let _ = prepare_local_ports;
         profile.check_role()?;
         if !Self::handles(profile) {
             return Err("This connection does not run through the network daemon".into());
         }
-        let status = match profile.backend {
+        let request = match profile.backend {
             TunnelBackend::None => {
                 if profile.routes.is_empty() && profile.endpoint_bypasses.is_empty() {
                     return Err("Static-route profile has no routes or endpoint bypasses".into());
                 }
-                self.apply_profile_routes(profile)?;
-                self.static_status(&profile.id, &profile.interface_name)
+                PreparedRequest::Routes(self.prepare_profile_routes(profile)?)
             }
             #[cfg(target_os = "linux")]
             TunnelBackend::Xray if profile.xray_mode == XrayMode::Socks => {
-                let status = self.local_request(crate::linux_session::Request::Connect {
-                    id: profile.id.clone(),
-                })?;
-                if Self::requires_daemon(profile) {
-                    if let Err(error) = self.apply_profile_routes(profile) {
+                let root = self
+                    .data_root
+                    .as_deref()
+                    .ok_or("The application data directory is required")?;
+                let socket = self
+                    .socket
+                    .as_deref()
+                    .ok_or("A daemon socket is required for the shared user runtime")?;
+                crate::linux_session::ensure_prepared_support(root, socket)?;
+                let local =
+                    crate::linux_session::prepare_connection(root, profile, prepare_local_ports)?;
+                let routes = if Self::requires_daemon(profile) {
+                    Some(self.prepare_profile_routes(profile)?)
+                } else {
+                    None
+                };
+                PreparedRequest::Local(local, routes)
+            }
+            TunnelBackend::WireGuard => {
+                PreparedRequest::WireGuard(wireguard_connect_params(vault, profile)?)
+            }
+            TunnelBackend::OpenVpn => {
+                let (request, notice) = prepare_linux_openvpn_request(
+                    vault,
+                    remembered,
+                    profile,
+                    credentials,
+                    profile.effective_routes(),
+                    method::OPENVPN_CONNECT,
+                )?;
+                PreparedRequest::OpenVpn(request, notice)
+            }
+            _ => {
+                let (params, notices) = self.xray_params(vault, profile)?;
+                if params
+                    .routes
+                    .iter()
+                    .any(|route| route.destination.addr().is_ipv6())
+                    || params.dns_servers.iter().any(|server| server.is_ipv6())
+                {
+                    let hello = self.privileged().hello().map_err(daemon_error)?;
+                    net_manager_core::helper_client::require_capability(
+                        &hello,
+                        feature::XRAY_TUN_IPV6,
+                    )
+                    .map_err(daemon_error)?;
+                }
+                PreparedRequest::Xray(params, notices)
+            }
+        };
+        Ok(PreparedConnection {
+            profile: profile.clone(),
+            request,
+        })
+    }
+
+    /// Validate set cutovers against the same config policies the daemon executes.
+    /// Ordinary single-profile connects keep their existing daemon compatibility.
+    pub fn validate_prepared_configuration(
+        &self,
+        prepared: &PreparedConnection,
+    ) -> Result<(), String> {
+        match &prepared.request {
+            PreparedRequest::WireGuard(params) => {
+                net_manager_core::wireguard_config::parse_wireguard_config(
+                    &params.config,
+                    &params.routes,
+                )
+                .map_err(|error| error.to_string())?;
+                net_manager_core::models::validate_secondary(
+                    params.role,
+                    &params.routes,
+                    &params.dns_domains,
+                )
+                .map_err(str::to_owned)?;
+            }
+            PreparedRequest::OpenVpn(request, _) => {
+                let _: OpenVpnPlanResult = self.ask(method::OPENVPN_PLAN, request)?;
+            }
+            PreparedRequest::Routes(_) | PreparedRequest::Xray(_, _) => {}
+            #[cfg(target_os = "linux")]
+            PreparedRequest::Local(_, _) => {}
+        }
+        Ok(())
+    }
+
+    pub fn execute_prepared(&self, prepared: &PreparedConnection) -> Result<TunnelStatus, String> {
+        let profile = &prepared.profile;
+        let status = match &prepared.request {
+            PreparedRequest::Routes(params) => {
+                let _: RoutesApplyResult = self.ask(method::ROUTES_APPLY, params)?;
+                self.static_status(&profile.id, &profile.interface_name)
+            }
+            PreparedRequest::WireGuard(params) => {
+                let result: WireGuardConnectResult = self.ask(method::WIREGUARD_CONNECT, params)?;
+                Ok(linux_wireguard_tunnel_status(result.status))
+            }
+            PreparedRequest::OpenVpn(request, notice) => {
+                let result: OpenVpnConnectResult = self.ask(method::OPENVPN_CONNECT, request)?;
+                Ok(finish_openvpn_connect(result.status, *notice))
+            }
+            PreparedRequest::Xray(params, notices) => {
+                self.execute_xray(profile, params, notices, method::XRAY_CONNECT)
+            }
+            #[cfg(target_os = "linux")]
+            PreparedRequest::Local(local, routes) => {
+                let root = self
+                    .data_root
+                    .as_deref()
+                    .ok_or("The application data directory is required")?;
+                let socket = self
+                    .socket
+                    .as_deref()
+                    .ok_or("A daemon socket is required for the shared user runtime")?;
+                let status = crate::linux_session::execute_prepared(root, socket, local)?;
+                if let Some(routes) = routes {
+                    let applied: Result<RoutesApplyResult, String> =
+                        self.ask(method::ROUTES_APPLY, routes);
+                    if let Err(error) = applied {
                         let cleanup =
                             self.local_request(crate::linux_session::Request::Disconnect {
                                 id: profile.id.clone(),
@@ -309,24 +460,6 @@ impl LinuxEngine {
                 }
                 Ok(status)
             }
-            TunnelBackend::WireGuard => {
-                let params = wireguard_connect_params(vault, profile)?;
-                let result: WireGuardConnectResult = self.ask(method::WIREGUARD_CONNECT, params)?;
-                Ok(linux_wireguard_tunnel_status(result.status))
-            }
-            TunnelBackend::OpenVpn => {
-                let (request, notice) = prepare_linux_openvpn_request(
-                    vault,
-                    remembered,
-                    profile,
-                    credentials,
-                    profile.effective_routes(),
-                    method::OPENVPN_CONNECT,
-                )?;
-                let result: OpenVpnConnectResult = self.ask(method::OPENVPN_CONNECT, request)?;
-                Ok(finish_openvpn_connect(result.status, notice))
-            }
-            _ => self.start_xray(vault, profile, method::XRAY_CONNECT),
         }?;
         #[cfg(target_os = "linux")]
         self.retain_connection(profile)?;
@@ -366,12 +499,33 @@ impl LinuxEngine {
         method_name: &str,
     ) -> Result<TunnelStatus, String> {
         let (params, notices) = self.xray_params(vault, profile)?;
-        let result: XrayConnectResult = self.ask(method_name, params)?;
+        self.execute_xray(profile, &params, &notices, method_name)
+    }
+
+    fn execute_xray(
+        &self,
+        profile: &Profile,
+        params: &XrayConnectParams,
+        notices: &[String],
+        method_name: &str,
+    ) -> Result<TunnelStatus, String> {
+        let needs_ipv6 = params
+            .routes
+            .iter()
+            .any(|route| route.destination.addr().is_ipv6())
+            || params.dns_servers.iter().any(|server| server.is_ipv6());
+        let result: XrayConnectResult = if needs_ipv6 {
+            self.privileged()
+                .call_with_capability(method_name, params, feature::XRAY_TUN_IPV6)
+                .map_err(daemon_error)?
+        } else {
+            self.ask(method_name, params)?
+        };
         let mut status = linux_xray_tunnel_status(result.status, profile);
         for notice in notices {
             status.message = Some(match status.message.take() {
                 Some(message) => format!("{message}; {notice}"),
-                None => notice,
+                None => notice.clone(),
             });
         }
         Ok(status)
@@ -536,6 +690,7 @@ mod tests {
     #[derive(Default)]
     struct FakeDaemon {
         replies: HashMap<&'static str, Value>,
+        capabilities: Vec<String>,
         calls: Mutex<Vec<(String, Value)>>,
     }
 
@@ -545,7 +700,7 @@ mod tests {
                 protocol: PROTOCOL_VERSION,
                 daemon_version: "test".into(),
                 uid: 1000,
-                capabilities: Vec::new(),
+                capabilities: self.capabilities.clone(),
                 tools: Default::default(),
             })
         }
@@ -600,6 +755,263 @@ mod tests {
         json!({"profileId": "wg1", "state": state, "interfaceName": "wg1",
             "latestHandshake": null, "rxBytes": 0, "txBytes": 0, "dnsApplied": true,
             "warnings": []})
+    }
+
+    fn xray_profile(dir: &std::path::Path) -> (ConfigVault, Profile) {
+        let vault = ConfigVault::new(dir.join("configs"));
+        let store = net_manager_core::profiles::ProfileStore::new(dir.join("profiles.json"));
+        net_manager_core::profile_import::import_share_link(
+            &vault,
+            &store,
+            "xray1",
+            "Xray capability fixture",
+            "vless://synthetic-id@node.test:443?security=tls#Capability",
+            |_| true,
+        )
+        .unwrap();
+        let mut profile = store.load().unwrap().profiles.remove(0);
+        profile.xray_mode = XrayMode::Tun;
+        (vault, profile)
+    }
+
+    fn xray_daemon(ipv6: bool) -> FakeDaemon {
+        let mut capabilities = vec![method::XRAY_CONNECT.into(), method::XRAY_RELOAD.into()];
+        if ipv6 {
+            capabilities.push("xray.tun.ipv6".into());
+        }
+        let status = json!({
+            "profileId": "xray1", "state": "running", "interfaceName": "nxray1",
+            "dnsApplied": true, "ipv4Covered": true, "ipv6Covered": ipv6,
+            "rxBytes": null, "txBytes": null, "failover": null, "watchdog": null,
+            "proxyExits": []
+        });
+        FakeDaemon {
+            capabilities,
+            replies: HashMap::from([
+                (method::XRAY_CONNECT, json!({"status": status.clone()})),
+                (method::XRAY_RELOAD, json!({"status": status})),
+            ]),
+            ..Default::default()
+        }
+    }
+
+    fn xray_mutation(
+        engine: &LinuxEngine,
+        vault: &ConfigVault,
+        profile: &Profile,
+        method_name: &str,
+    ) -> Result<TunnelStatus, String> {
+        match method_name {
+            method::XRAY_CONNECT => engine.connect(vault, profile, None, &NoCredentials),
+            method::XRAY_RELOAD => engine.reload_xray(vault, profile),
+            _ => unreachable!(),
+        }
+    }
+
+    fn policy_route(destination: &str) -> PolicyRoute {
+        PolicyRoute {
+            destination: destination.parse().unwrap(),
+            metric: 5,
+            via: None,
+        }
+    }
+
+    #[test]
+    fn xray_tun_ipv6_capability_missing_rejects_explicit_routes_before_mutation() {
+        for method_name in [method::XRAY_CONNECT, method::XRAY_RELOAD] {
+            for (role, destinations) in [
+                (TunnelRole::Primary, vec!["2001:db8:20::/48"]),
+                (
+                    TunnelRole::Primary,
+                    vec!["10.20.0.0/16", "2001:db8:20::/48"],
+                ),
+                (TunnelRole::Secondary, vec!["2001:db8:20::/48"]),
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let (vault, mut profile) = xray_profile(dir.path());
+                profile.tunnel_role = role;
+                profile.routes = destinations
+                    .iter()
+                    .map(|route| policy_route(route))
+                    .collect();
+                profile.tunnel_networks = destinations
+                    .iter()
+                    .map(|network| network.parse().unwrap())
+                    .collect();
+                let (engine, daemon) = engine(xray_daemon(false));
+
+                let result = xray_mutation(&engine, &vault, &profile, method_name);
+
+                assert!(
+                    daemon.calls.lock().unwrap().is_empty(),
+                    "{method_name} must not mutate a legacy daemon for {role:?} {destinations:?}"
+                );
+                assert!(result.is_err(), "missing IPv6 support must be rejected");
+            }
+        }
+    }
+
+    #[test]
+    fn xray_tun_ipv6_capability_missing_rejects_default_routes_before_mutation() {
+        for method_name in [method::XRAY_CONNECT, method::XRAY_RELOAD] {
+            for split_default in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let (vault, mut profile) = xray_profile(dir.path());
+                profile.xray_split_default = split_default;
+                assert!(profile.routes.is_empty());
+                let (engine, daemon) = engine(xray_daemon(false));
+
+                let result = xray_mutation(&engine, &vault, &profile, method_name);
+
+                assert!(
+                    daemon.calls.lock().unwrap().is_empty(),
+                    "{method_name} must not mutate a legacy daemon for dual-stack defaults"
+                );
+                assert!(result.is_err(), "missing IPv6 support must be rejected");
+            }
+        }
+    }
+
+    #[test]
+    fn xray_tun_ipv6_capability_missing_rejects_dns_before_mutation() {
+        for method_name in [method::XRAY_CONNECT, method::XRAY_RELOAD] {
+            let dir = tempfile::tempdir().unwrap();
+            let (vault, mut profile) = xray_profile(dir.path());
+            profile.routes = vec![policy_route("10.20.0.0/16")];
+            profile.xray_tun_dns_servers = vec!["2001:db8::53".parse().unwrap()];
+            let (engine, daemon) = engine(xray_daemon(false));
+
+            let result = xray_mutation(&engine, &vault, &profile, method_name);
+
+            assert!(
+                daemon.calls.lock().unwrap().is_empty(),
+                "{method_name} must not mutate a legacy daemon for IPv6 DNS on IPv4 routes"
+            );
+            assert!(result.is_err(), "missing IPv6 DNS support must be rejected");
+        }
+    }
+
+    #[test]
+    fn xray_tun_ipv6_capability_is_not_required_for_ipv4_only_requests() {
+        for method_name in [method::XRAY_CONNECT, method::XRAY_RELOAD] {
+            let dir = tempfile::tempdir().unwrap();
+            let (vault, mut profile) = xray_profile(dir.path());
+            profile.routes = vec![policy_route("10.20.0.0/16")];
+            profile.xray_tun_dns_servers = vec!["10.20.0.53".parse().unwrap()];
+            let (engine, daemon) = engine(xray_daemon(false));
+
+            let status = xray_mutation(&engine, &vault, &profile, method_name).unwrap();
+
+            assert_eq!(status.state, TunnelState::Running);
+            let calls = daemon.calls.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].0, method_name);
+            assert_eq!(
+                calls[0].1["routes"],
+                json!([{
+                    "destination": "10.20.0.0/16", "metric": 5
+                }])
+            );
+            assert_eq!(calls[0].1["dnsServers"], json!(["10.20.0.53"]));
+        }
+    }
+
+    #[test]
+    fn xray_tun_ipv6_capability_advertised_permits_the_intended_mutation() {
+        for method_name in [method::XRAY_CONNECT, method::XRAY_RELOAD] {
+            let dir = tempfile::tempdir().unwrap();
+            let (vault, mut profile) = xray_profile(dir.path());
+            profile.routes = vec![
+                policy_route("10.20.0.0/16"),
+                policy_route("2001:db8:20::/48"),
+            ];
+            profile.xray_tun_dns_servers = vec![
+                "10.20.0.53".parse().unwrap(),
+                "2001:db8:20::53".parse().unwrap(),
+            ];
+            let (engine, daemon) = engine(xray_daemon(true));
+
+            let status = xray_mutation(&engine, &vault, &profile, method_name).unwrap();
+
+            assert_eq!(status.state, TunnelState::Running);
+            let calls = daemon.calls.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].0, method_name);
+            let sent: XrayConnectParams = serde_json::from_value(calls[0].1.clone()).unwrap();
+            assert_eq!(sent.profile_id, profile.id);
+            assert_eq!(sent.routes, profile.routes);
+            assert_eq!(sent.dns_servers, profile.xray_tun_dns_servers);
+        }
+    }
+
+    #[test]
+    fn xray_tun_ipv6_capability_missing_effective_networks_give_update_guidance() {
+        for method_name in [method::XRAY_CONNECT, method::XRAY_RELOAD] {
+            let dir = tempfile::tempdir().unwrap();
+            let (vault, mut profile) = xray_profile(dir.path());
+            profile.tunnel_role = TunnelRole::Secondary;
+            profile.tunnel_networks = vec!["2001:db8:20::/48".parse().unwrap()];
+            let (engine, daemon) = engine(xray_daemon(false));
+
+            let message = xray_mutation(&engine, &vault, &profile, method_name).unwrap_err();
+
+            assert!(daemon.calls.lock().unwrap().is_empty());
+            assert!(message.contains("xray.tun.ipv6"));
+            assert!(message.contains("Update"));
+            assert!(message.contains("restart"));
+        }
+    }
+
+    #[test]
+    fn xray_tun_ipv6_capability_missing_still_allows_status_and_disconnect() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, mut profile) = xray_profile(dir.path());
+        profile.routes = vec![policy_route("2001:db8:20::/48")];
+        let mut legacy = xray_daemon(false);
+        let status = legacy.replies[method::XRAY_CONNECT]["status"].clone();
+        legacy.replies.insert(method::XRAY_STATUS, status);
+        legacy
+            .replies
+            .insert(method::XRAY_DISCONNECT, json!({"stopped": true}));
+        let (engine, daemon) = engine(legacy);
+
+        assert_eq!(engine.status(&profile).unwrap().state, TunnelState::Running);
+        assert_eq!(
+            engine.disconnect(&profile).unwrap().state,
+            TunnelState::Stopped
+        );
+        let calls = daemon.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, method::XRAY_STATUS);
+        assert_eq!(calls[1].0, method::XRAY_DISCONNECT);
+    }
+
+    #[test]
+    fn xray_tun_ipv6_capability_is_not_required_for_other_backends() {
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, mut profile) = wireguard_profile(dir.path());
+        profile.routes = vec![policy_route("2001:db8:20::/48")];
+        let (engine, daemon) = engine(FakeDaemon {
+            capabilities: vec![
+                method::WIREGUARD_CONNECT.into(),
+                method::XRAY_CONNECT.into(),
+            ],
+            replies: HashMap::from([(
+                method::WIREGUARD_CONNECT,
+                json!({"status": wg_status("running")}),
+            )]),
+            ..Default::default()
+        });
+
+        let status = engine
+            .connect(&vault, &profile, None, &NoCredentials)
+            .unwrap();
+
+        assert_eq!(status.state, TunnelState::Running);
+        let calls = daemon.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, method::WIREGUARD_CONNECT);
+        assert_eq!(calls[0].1["routes"][0]["destination"], "2001:db8:20::/48");
     }
 
     #[test]

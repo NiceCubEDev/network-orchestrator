@@ -7,7 +7,9 @@
 //! checker resolves; a best-effort `ipwho.is` lookup annotates the exit IP
 //! with a country code.
 
-use net_manager_core::exit_ip::{check_one, ExitIpEntry, CHECKERS, TIMEOUT};
+#[cfg(not(target_os = "linux"))]
+use net_manager_core::exit_ip::{check_one, TIMEOUT};
+use net_manager_core::exit_ip::{ExitIpEntry, CHECKERS};
 use serde::Serialize;
 use tauri::ipc::Channel;
 
@@ -20,6 +22,19 @@ pub(crate) enum ExitIpEvent {
     Result { entry: ExitIpEntry },
 }
 
+#[cfg(target_os = "linux")]
+#[tauri::command]
+pub(crate) async fn check_exit_ips(on_event: Channel<ExitIpEvent>) -> Result<(), String> {
+    let _ = on_event.send(ExitIpEvent::Pending {
+        names: CHECKERS.iter().map(|(name, _)| name.to_string()).collect(),
+    });
+    net_manager_engine::linux_diagnostics::check_exit_ips(&|entry| {
+        let _ = on_event.send(ExitIpEvent::Result { entry });
+    })
+    .await
+}
+
+#[cfg(not(target_os = "linux"))]
 #[tauri::command]
 pub(crate) async fn check_exit_ips(on_event: Channel<ExitIpEvent>) {
     let Ok(client) = reqwest::Client::builder().timeout(TIMEOUT).build() else {

@@ -146,7 +146,7 @@ pub fn restart_elevated() -> std::io::Result<()> {
     ))
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_os = "linux")))]
 pub fn enable_backup_privilege() -> std::io::Result<()> {
     Ok(())
 }
@@ -158,11 +158,5 @@ mod tests {
     #[test]
     fn is_elevated_returns_ok() {
         assert!(is_elevated().is_ok());
-    }
-
-    #[test]
-    fn enable_backup_privilege_returns_ok() {
-        // May fail if not elevated — that's fine in CI.
-        let _ = enable_backup_privilege();
     }
 }

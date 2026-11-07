@@ -7,7 +7,7 @@ use crate::state::AppState;
 use serde_json::Value;
 use tauri::State;
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn runtime_dir(state: &AppState) -> std::path::PathBuf {
     // `$XDG_RUNTIME_DIR` is per-user and tmpfs-backed; fall back to the data dir.
     std::env::var_os("XDG_RUNTIME_DIR")
@@ -34,13 +34,20 @@ async fn blocking<T: Send + 'static>(
 /// Summary of the NetBird daemon: installed, state, address, peers. A missing
 /// CLI or stopped daemon is a state, not an error.
 #[tauri::command]
-pub(crate) async fn netbird_status() -> Result<Value, String> {
-    #[cfg(unix)]
+pub(crate) async fn netbird_status(state: State<'_, AppState>) -> Result<Value, String> {
+    #[cfg(target_os = "linux")]
     {
+        let root = state.data_dir().to_path_buf();
+        blocking(move || net_manager_engine::linux_services::netbird_status(&root)).await?
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        let _ = state;
         blocking(|| net_manager_core::netbird::NetBird::detect().status()).await
     }
     #[cfg(not(unix))]
     {
+        let _ = state;
         Ok(serde_json::json!({"installed": false, "state": "notInstalled"}))
     }
 }
@@ -53,7 +60,19 @@ pub(crate) async fn netbird_up(
     setup_key: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<Value, String> {
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
+    {
+        let root = state.data_dir().to_path_buf();
+        blocking(move || {
+            net_manager_engine::linux_services::netbird_up(
+                &root,
+                management_url.as_deref(),
+                setup_key.as_deref(),
+            )
+        })
+        .await?
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
     {
         let runtime = runtime_dir(&state);
         blocking(move || {
@@ -71,13 +90,20 @@ pub(crate) async fn netbird_up(
 }
 
 #[tauri::command]
-pub(crate) async fn netbird_down() -> Result<Value, String> {
-    #[cfg(unix)]
+pub(crate) async fn netbird_down(state: State<'_, AppState>) -> Result<Value, String> {
+    #[cfg(target_os = "linux")]
     {
+        let root = state.data_dir().to_path_buf();
+        blocking(move || net_manager_engine::linux_services::netbird_down(&root)).await?
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        let _ = state;
         blocking(|| net_manager_core::netbird::NetBird::detect().down()).await?
     }
     #[cfg(not(unix))]
     {
+        let _ = state;
         Err("NetBird control is not available on this platform".into())
     }
 }

@@ -383,6 +383,77 @@ across logout requires an explicit administrator-approved linger setting
 `netorch up --foreground` disconnects on interrupt, termination or terminal
 hangup. Root connections require `--foreground` and never launch the user service.
 
+### Linux CLI-first operations
+
+The GUI and CLI use the same profile, subscription, network, provider,
+diagnostic, system and connection-set services. Existing short commands remain
+available; `netorch --json` emits machine-readable results. Use
+`netorch COMMAND --help` for arguments and protected input-file options.
+
+| Area | Commands |
+|---|---|
+| Profile settings | `profile list/show/create/edit/delete/reorder/role/networks`, `profile save-link/save-wireguard/import-configs/import-link` |
+| Subscriptions | `subscription import/refresh/interval/endpoints/test/switch`; existing `backup`, `route`, `checks`, `migrate` and `proxy` commands |
+| Connection lifecycle | `up`, `down`, `status`, `reload`; `openvpn connect/plan/probe`, `openvpn credentials forget` |
+| Network inventory and changes | `net interfaces/routes/tables/lookup/map/explain`, `net interface`, `net stop-external`, `net route/rule add/delete/list`, `net dns status/probe`, `net intent list/set/delete` |
+| Routing input | `net import-cidrs/import-happ/test-route` |
+| Other providers | `service nm list/set`, `service tailscale status/up/down`, `service netbird status/up/down` |
+| Persistent policy | `always-on list/set/remove/resume`, `condition list/put/remove` |
+| Observability and recovery | `diagnostics inspect/diagnose/exit-ip/proxies/stats`, `logs show/clear/daemon`, `recovery report/cleanup` |
+| System settings | `system capabilities/daemon-status/elevated`, `system proxy status`, `system auth get/set`, `system autostart get/set`, `system auto-connect result/run` |
+| Backend settings | `backend list`, `backend path set/reset`, `backend xray offer/install/cancel/remove` |
+| Saved combinations | `sets list/get/put/delete/import/capture/apply/down` |
+
+`profile edit PROFILE --file FILE` is a partial atomic update: omitted
+subscription identities, pins, checks, proxy exits and other settings survive.
+`subscription import` accepts separate private URL/HWID files and an optional
+`--cache-file`; cached import/refresh does not contact the provider.
+`checks set PROFILE --file FILE` replaces the complete service-check list.
+Use private regular files owned by your user (`chmod 600`), or supported stdin
+inputs, rather than putting subscription URLs, credentials or setup keys in argv.
+
+Connection sets live in the protected shared `connection-sets.json`; Linux
+migrates browser-owned sets only after persistence succeeds, without replacing
+existing shared IDs. Missing members remain visible and block application.
+Apply prepares starts and rollback requests before stopping existing connections;
+unchanged members and always-on enrollment are preserved. OpenVPN prompts are
+collected before teardown. Headless callers can use:
+
+```bash
+netorch sets apply work --credentials-file /private/openvpn-inputs.json
+```
+
+The private input maps profile IDs to
+`{"credentials":{"authUserPass":{"username":"vpn-user","password":"<password>"}},"remember":false}`.
+Credentials are not stored in a set; `remember: true` explicitly requests the
+shared keyring policy. `sets down` needs no reconnect credentials and reports
+partial teardown failures. App logs are shared, bounded and redacted before
+persistence; clearing them in either frontend clears the same store.
+
+Starting an idle runtime or listing profiles does not execute auto-connect.
+`system auto-connect run` is explicit. Login autostart retains the existing
+`Network Orchestrator.desktop` entry and starts the GUI; it does not silently
+enable a second headless startup mode. Managed installation cancellation works
+across frontends. Update both packages and restart an old user runtime before
+using prepared local-Xray connections; incompatibility is rejected before a set
+disconnects anything. Windows-only elevation relaunch and standard-config
+discovery are not Linux CLI operations.
+
+### Linux Xray IPv6
+
+A primary managed TUN with no explicit routes captures IPv4 and IPv6. Split
+default installs both halves of each family. Explicit routes and secondary
+networks are not expanded. FakeDNS emits only pools fully captured by the
+effective routes; incompatible explicit DNS-family choices fail rather than
+being rewritten. Endpoint bypasses, underlay selection, reload, child recovery
+and journal cleanup handle both address families.
+
+IPv6 TUN requests require the daemon's `xray.tun.ipv6` capability. Update/restart
+the system daemon when upgrading; unsupported requests fail before mutation.
+IPv4-only requests and status/disconnect remain available with older daemons.
+Capture is not proof that a remote provider offers IPv6 Internet egress.
+See [`docs/testing.md`](docs/testing.md) for isolated packet evidence and limits.
+
 
 ## Development
 

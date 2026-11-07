@@ -10,6 +10,15 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+### Added
+
+- Shared Linux profile, network, service, diagnostic, system and connection-set
+  operations for CLI and GUI clients.
+- Retained connection preparation for safe set/endpoint cutovers, authenticated
+  local-runtime capability negotiation and common WireGuard input validation.
+- Canonical Linux Xray route derivation for dual-stack runtime and static
+  analysis, including split-default and explicit IPv6 scope.
+
 ### Fixed
 
 - Normalize IPv6 hosts from VLESS and Hysteria2 links before generating Xray

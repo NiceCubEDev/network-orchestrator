@@ -11,7 +11,6 @@ use std::time::Duration;
 use tauri::menu::{Menu, MenuItem, Submenu};
 use tauri::tray::TrayIconBuilder;
 use tauri::{Emitter, Manager};
-use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_dialog::DialogExt;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -268,18 +267,13 @@ pub(crate) fn install(app: &mut tauri::App) -> tauri::Result<bool> {
 }
 
 #[tauri::command]
-pub(crate) fn get_login_autostart(app: tauri::AppHandle) -> Result<bool, String> {
-    app.autolaunch().is_enabled().map_err(|err| err.to_string())
+pub(crate) fn get_login_autostart(_app: tauri::AppHandle) -> Result<bool, String> {
+    net_manager_engine::linux_system::login_autostart()
 }
 
 #[tauri::command]
-pub(crate) fn set_login_autostart(app: tauri::AppHandle, enabled: bool) -> Result<bool, String> {
-    if enabled {
-        app.autolaunch().enable().map_err(|err| err.to_string())?;
-    } else {
-        app.autolaunch().disable().map_err(|err| err.to_string())?;
-    }
-    get_login_autostart(app)
+pub(crate) fn set_login_autostart(_app: tauri::AppHandle, enabled: bool) -> Result<bool, String> {
+    net_manager_engine::linux_system::set_login_autostart(enabled)
 }
 
 #[cfg(test)]

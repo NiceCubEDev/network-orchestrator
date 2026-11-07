@@ -88,9 +88,31 @@ impl HelperClient {
         method_name: &str,
         params: P,
     ) -> Result<R, HelperError> {
+        self.call_requiring_capability(method_name, params, None)
+    }
+
+    /// Require a promise from this connection's hello before sending a request.
+    pub fn call_with_capability<P: Serialize, R: DeserializeOwned>(
+        &self,
+        method_name: &str,
+        params: P,
+        capability: &str,
+    ) -> Result<R, HelperError> {
+        self.call_requiring_capability(method_name, params, Some(capability))
+    }
+
+    fn call_requiring_capability<P: Serialize, R: DeserializeOwned>(
+        &self,
+        method_name: &str,
+        params: P,
+        capability: Option<&str>,
+    ) -> Result<R, HelperError> {
         let mut stream = self.connect()?;
         let mut reader = BufReader::new(stream.try_clone().map_err(HelperError::Unreachable)?);
-        handshake(&mut stream, &mut reader, &self.client_name)?;
+        let hello = handshake(&mut stream, &mut reader, &self.client_name)?;
+        if let Some(capability) = capability {
+            require_capability(&hello, capability)?;
+        }
         let params =
             serde_json::to_value(params).map_err(|err| HelperError::Protocol(err.to_string()))?;
         let request = RequestFrame {
@@ -101,6 +123,17 @@ impl HelperClient {
         send(&mut stream, &request)?;
         let response = receive(&mut reader)?;
         decode(response)
+    }
+}
+
+/// Shared check for socket and injected privileged adapters.
+pub fn require_capability(hello: &HelloResult, capability: &str) -> Result<(), HelperError> {
+    if hello.capabilities.iter().any(|entry| entry == capability) {
+        Ok(())
+    } else {
+        Err(HelperError::Protocol(format!(
+            "The network daemon does not advertise {capability}. Update and restart network-orchestrator before retrying; IPv6 routes and DNS will not fall back to IPv4."
+        )))
     }
 }
 
@@ -223,6 +256,65 @@ mod tests {
             .call::<_, serde_json::Value>("x", ())
             .unwrap_err();
         assert!(is_denied(&error));
+    }
+
+    #[test]
+    fn required_capability_is_checked_on_the_request_connection_before_sending() {
+        for advertised in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("h.sock");
+            let listener = UnixListener::bind(&path).unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let request: RequestFrame = serde_json::from_str(&line).unwrap();
+                assert_eq!(request.method, method::HELLO);
+                let capabilities = if advertised {
+                    vec![crate::daemon_protocol::feature::XRAY_TUN_IPV6]
+                } else {
+                    vec![method::XRAY_CONNECT]
+                };
+                let hello = ResponseFrame::ok(
+                    request.id,
+                    json!({
+                        "protocol": PROTOCOL_VERSION, "daemonVersion": "legacy", "uid": 1000,
+                        "capabilities": capabilities
+                    }),
+                );
+                stream.write_all(&encode_line(&hello).unwrap()).unwrap();
+                line.clear();
+                let read = reader.read_line(&mut line).unwrap();
+                if !advertised {
+                    assert_eq!(read, 0, "unsupported daemon must receive no mutation");
+                    return;
+                }
+                let request: RequestFrame = serde_json::from_str(&line).unwrap();
+                assert_eq!(request.method, method::XRAY_CONNECT);
+                assert_eq!(request.params, json!({"routes": ["::/0"]}));
+                let response = ResponseFrame::ok(request.id, json!({"sent": true}));
+                stream.write_all(&encode_line(&response).unwrap()).unwrap();
+            });
+            let result: Result<serde_json::Value, _> = HelperClient::new(&path)
+                .call_with_capability(
+                    method::XRAY_CONNECT,
+                    json!({"routes": ["::/0"]}),
+                    crate::daemon_protocol::feature::XRAY_TUN_IPV6,
+                );
+            if advertised {
+                assert_eq!(result.unwrap(), json!({"sent": true}));
+            } else {
+                let message = result.unwrap_err().to_string();
+                assert!(message.contains("xray.tun.ipv6"));
+                assert!(message.contains("Update"));
+                assert!(message.contains("restart"));
+            }
+            server.join().unwrap();
+        }
     }
 
     #[test]

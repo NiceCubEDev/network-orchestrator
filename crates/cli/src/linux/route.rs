@@ -10,7 +10,10 @@ use super::library::require_user;
 use net_manager_core::models::{
     DomainPolicy, DomainRouteTarget, PinnedRoute, Profile, TunnelBackend, TunnelState,
 };
-use net_manager_core::route_check::{check_route, GeoDbs, GeoIpDb, GeoSiteDb};
+use net_manager_core::route_check::{check_route, GeoDbs};
+#[cfg(not(target_os = "linux"))]
+use net_manager_core::route_check::{GeoIpDb, GeoSiteDb};
+#[cfg(not(target_os = "linux"))]
 use net_manager_core::subscription;
 use net_manager_core::xray::{self, ProfileRoutingOptions};
 use net_manager_engine::linux_engine::LinuxEngine;
@@ -22,6 +25,7 @@ use std::path::Path;
 const XRAY_DIR: &str = "/usr/lib/network-orchestrator/xray";
 /// The core's `LINUX_XRAY_VERSION`, which only exists in Linux builds.
 const XRAY_VERSION: &str = "v26.10.31";
+#[cfg(not(target_os = "linux"))]
 const MAX_GEO_ASSET_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Xray takes the first matching rule, so blocks win over proxy over direct.
@@ -254,6 +258,13 @@ fn save(
     policies: Vec<DomainPolicy>,
     extra: Vec<String>,
 ) -> Result<Output, String> {
+    #[cfg(target_os = "linux")]
+    let document = net_manager_engine::linux_profiles::ProfileService::new(
+        ctx.root.clone(),
+        ctx.engine.clone(),
+    )
+    .set_routing(&profile.id, policies, profile.private_lan_direct)?;
+    #[cfg(not(target_os = "linux"))]
     let document = ctx
         .store()
         .update_profile(&profile.id, |stored| {
@@ -418,6 +429,7 @@ fn pin_key(ctx: &Ctx, profile: &Profile, via: &str) -> Result<(String, String), 
     Ok((key, name))
 }
 
+#[cfg(not(target_os = "linux"))]
 fn save_pins(ctx: &Ctx, profile: &Profile, routes: Vec<PinnedRoute>) -> Result<(), String> {
     let candidate = if profile
         .xray_service_checks
@@ -444,6 +456,13 @@ fn save_pins(ctx: &Ctx, profile: &Profile, routes: Vec<PinnedRoute>) -> Result<(
             std::io::ErrorKind::InvalidInput => error.to_string(),
             _ => "The pinned rules could not be saved. Check file permissions.".into(),
         })
+        .map(|_| ())
+}
+
+#[cfg(target_os = "linux")]
+fn save_pins(ctx: &Ctx, profile: &Profile, routes: Vec<PinnedRoute>) -> Result<(), String> {
+    net_manager_engine::linux_profiles::ProfileService::new(ctx.root.clone(), ctx.engine.clone())
+        .set_pinned_routes(&profile.id, routes)
         .map(|_| ())
 }
 
@@ -602,6 +621,10 @@ fn quic(ctx: &Ctx, query: &str, enabled: Option<super::args::BoolOnOff>) -> Resu
     require_user(ctx)?;
     let on = matches!(enabled, super::args::BoolOnOff::On);
     let running = running(ctx, &profile);
+    #[cfg(target_os = "linux")]
+    net_manager_engine::linux_profiles::ProfileService::new(ctx.root.clone(), ctx.engine.clone())
+        .set_quic(&profile.id, on)?;
+    #[cfg(not(target_os = "linux"))]
     ctx.store()
         .update_profile(&profile.id, |current| {
             if current.backend != TunnelBackend::Xray {
@@ -624,6 +647,7 @@ fn quic(ctx: &Ctx, query: &str, enabled: Option<super::args::BoolOnOff>) -> Resu
     ))
 }
 
+#[cfg(not(target_os = "linux"))]
 fn load_asset<T>(dir: &Path, name: &str, parse: fn(&[u8]) -> std::io::Result<T>) -> Option<T> {
     let path = dir.join(name);
     let meta = std::fs::metadata(&path).ok()?;
@@ -636,8 +660,23 @@ fn load_asset<T>(dir: &Path, name: &str, parse: fn(&[u8]) -> std::io::Result<T>)
 /// Which rule of the profile decides a host or address, replayed offline.
 fn check(ctx: &Ctx, target: &str, query: &str, geo_dir: &Path) -> Result<Output, String> {
     let profile = xray_profile(ctx, query)?;
-    let geo_site = load_asset(geo_dir, "geosite.dat", GeoSiteDb::parse);
-    let geo_ip = load_asset(geo_dir, "geoip.dat", GeoIpDb::parse);
+    #[cfg(target_os = "linux")]
+    let (geo_site, geo_ip) = {
+        let mut dirs = net_manager_engine::linux_network::geo_asset_dirs(
+            &ctx.root,
+            profile.xray_geoip_url.as_deref(),
+            profile.xray_geosite_url.as_deref(),
+        );
+        // The CLI's selected stock directory replaces the managed-package default.
+        dirs.pop();
+        dirs.push(geo_dir.to_path_buf());
+        net_manager_engine::linux_network::load_geo_assets(&dirs)
+    };
+    #[cfg(not(target_os = "linux"))]
+    let (geo_site, geo_ip) = (
+        load_asset(geo_dir, "geosite.dat", GeoSiteDb::parse),
+        load_asset(geo_dir, "geoip.dat", GeoIpDb::parse),
+    );
     let geo = GeoDbs {
         geo_site: geo_site.as_ref(),
         geo_ip: geo_ip.as_ref(),
@@ -734,6 +773,8 @@ mod tests {
                 name: "Work".into(),
                 backend: TunnelBackend::Xray,
                 xray_mode: XrayMode::Tun,
+                xray_socks_port: Some(10808),
+                xray_http_port: Some(10809),
                 config_path: "x1.json".into(),
                 domain_policies: policies,
                 ..Default::default()

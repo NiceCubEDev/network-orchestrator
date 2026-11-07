@@ -1,142 +1,155 @@
-use crate::state::{find_profile, AppState};
-use net_manager_core::analysis;
+use crate::state::AppState;
+#[cfg(all(not(target_os = "linux"), test))]
 use net_manager_core::config_vault::ConfigVault;
-#[cfg(target_os = "linux")]
-use net_manager_core::daemon_protocol::{
-    IpFamily, OwnedListResult, OwnedResource, OwnedState, WireGuardFullResource,
-};
-use net_manager_core::explorer;
 use net_manager_core::models::*;
+#[cfg(all(target_os = "linux", test))]
+use net_manager_core::{
+    config_vault::ConfigVault, diagnostics::build_profile_inspection,
+    diagnostics::openvpn_health as linux_openvpn_protocol_health,
+};
+#[cfg(target_os = "linux")]
+use net_manager_engine::linux_diagnostics as shared;
+#[cfg(all(target_os = "linux", test))]
+pub(crate) use shared::applied_route_present;
+#[cfg(all(target_os = "linux", test))]
+pub(crate) use shared::{build_diagnostics, linux_owned_checks, DiagnosticsInput};
+#[cfg(all(target_os = "linux", test))]
+use std::path::PathBuf;
+#[cfg(all(not(target_os = "linux"), test))]
 use std::path::PathBuf;
 use tauri::State;
 
-pub(crate) struct DiagnosticsInput {
-    pub(crate) profile: Profile,
-    pub(crate) status: TunnelStatus,
-    pub(crate) managed: bool,
-    pub(crate) inspection: Option<ProfileInspection>,
-    pub(crate) inspection_error: Option<String>,
-    pub(crate) executable: Result<PathBuf, String>,
-    pub(crate) interfaces: Result<Vec<NetworkInterface>, String>,
-    pub(crate) os_routes: Result<Vec<RouteEntry>, String>,
-    pub(crate) owned_routes: Option<Vec<AppliedRoute>>,
-    pub(crate) protocol_health: ProtocolHealth,
-    pub(crate) proxy_owner: Option<String>,
+#[cfg(target_os = "linux")]
+#[tauri::command]
+pub(crate) async fn inspect_profiles(
+    state: State<'_, AppState>,
+) -> Result<Vec<ProfileInspection>, String> {
+    shared::inspect_all(&state.config_vault, &state.profiles).await
 }
 
-fn diag_check(name: &str, level: DiagnosticLevel, message: String) -> DiagnosticCheck {
-    DiagnosticCheck {
-        name: name.to_string(),
-        level,
-        message,
-    }
+#[cfg(target_os = "linux")]
+#[tauri::command]
+pub(crate) async fn inspect_profile_by_id(
+    id: String,
+    state: State<'_, AppState>,
+) -> Result<ProfileInspection, String> {
+    shared::inspect(&state.config_vault, &state.profiles, &id).await
 }
 
-pub(crate) fn applied_route_present(applied: &AppliedRoute, entry: &RouteEntry) -> bool {
-    applied.interface_index == entry.interface_index
-        && entry.destination == applied.destination.network()
-        && entry.prefix_len == applied.destination.prefix_len()
-        && applied
-            .gateway
-            .is_none_or(|gateway| entry.gateway == Some(gateway))
+#[cfg(target_os = "linux")]
+#[tauri::command]
+pub(crate) async fn diagnose_profile(
+    id: String,
+    state: State<'_, AppState>,
+) -> Result<ProfileDiagnostics, String> {
+    let root = state.data_dir().to_path_buf();
+    tauri::async_runtime::spawn_blocking(move || {
+        let engine = net_manager_engine::linux_engine::LinuxEngine::new("net-manager-app")
+            .with_data_root(root.clone());
+        let vault = net_manager_core::config_vault::ConfigVault::new(root.join("configs"));
+        let store = net_manager_core::profiles::ProfileStore::new(root.join("profiles.json"));
+        tokio::runtime::Runtime::new()
+            .map_err(|_| "Cannot start diagnostics worker")?
+            .block_on(shared::diagnose(&engine, &root, &vault, &store, &id))
+    })
+    .await
+    .map_err(|_| "Diagnostics worker failed")?
 }
 
-fn resolve_backend_executable(state: &AppState, profile: &Profile) -> Result<PathBuf, String> {
-    if profile.backend == TunnelBackend::None {
-        return Ok(PathBuf::new());
-    }
-    #[cfg(target_os = "linux")]
-    if matches!(
-        profile.backend,
-        TunnelBackend::WireGuard | TunnelBackend::OpenVpn
-    ) {
-        return Ok(PathBuf::new());
-    }
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    if profile.backend == TunnelBackend::Xray && profile.xray_mode == XrayMode::Tun {
-        let root = PathBuf::from(net_manager_core::managed_xray::LINUX_XRAY_PACKAGE_ROOT);
-        let executable =
-            net_manager_core::managed_xray::linux_managed_version_dir(&root).join("xray");
-        net_manager_core::managed_xray::verify_managed_linux_executable(&root, &executable)
-            .map_err(|_| "verified package Xray is unavailable".to_string())?;
-        return Ok(executable);
-    }
-    state
-        .resolve_backend_executable(profile.backend)
-        .map(|resolved| resolved.path)
-        .map_err(|e| e.to_string())
-}
+#[cfg(not(target_os = "linux"))]
+pub(crate) use non_linux::*;
+#[cfg(not(target_os = "linux"))]
+mod non_linux {
+    use crate::state::{find_profile, AppState};
+    use net_manager_core::analysis;
+    use net_manager_core::config_vault::ConfigVault;
+    use net_manager_core::explorer;
+    use net_manager_core::models::*;
+    use std::path::PathBuf;
+    use tauri::State;
 
-fn build_diagnostics(input: &DiagnosticsInput) -> Vec<DiagnosticCheck> {
-    let mut checks = Vec::new();
-    let profile = &input.profile;
+    pub(crate) struct DiagnosticsInput {
+        pub(crate) profile: Profile,
+        pub(crate) status: TunnelStatus,
+        pub(crate) managed: bool,
+        pub(crate) inspection: Option<ProfileInspection>,
+        pub(crate) inspection_error: Option<String>,
+        pub(crate) executable: Result<PathBuf, String>,
+        pub(crate) interfaces: Result<Vec<NetworkInterface>, String>,
+        pub(crate) os_routes: Result<Vec<RouteEntry>, String>,
+        pub(crate) owned_routes: Option<Vec<AppliedRoute>>,
+        pub(crate) protocol_health: ProtocolHealth,
+        pub(crate) proxy_owner: Option<String>,
+    }
 
-    checks.push(match &input.inspection {
-        None => diag_check(
-            "Configuration",
-            DiagnosticLevel::Error,
-            format!(
-                "configuration could not be read or analyzed: {}",
-                input.inspection_error.as_deref().unwrap_or("unknown error")
-            ),
-        ),
-        Some(_) if input.managed => {
-            let dpapi_protected = profile
-                .config_path
-                .file_name()
-                .map(|name| {
-                    name.to_string_lossy()
-                        .to_lowercase()
-                        .ends_with(".json.dpapi")
-                })
-                .unwrap_or(false);
-            diag_check(
+    fn diag_check(name: &str, level: DiagnosticLevel, message: String) -> DiagnosticCheck {
+        DiagnosticCheck {
+            name: name.to_string(),
+            level,
+            message,
+        }
+    }
+
+    pub(crate) fn applied_route_present(applied: &AppliedRoute, entry: &RouteEntry) -> bool {
+        applied.interface_index == entry.interface_index
+            && entry.destination == applied.destination.network()
+            && entry.prefix_len == applied.destination.prefix_len()
+            && applied
+                .gateway
+                .is_none_or(|gateway| entry.gateway == Some(gateway))
+    }
+
+    fn resolve_backend_executable(state: &AppState, profile: &Profile) -> Result<PathBuf, String> {
+        if profile.backend == TunnelBackend::None {
+            return Ok(PathBuf::new());
+        }
+        state
+            .resolve_backend_executable(profile.backend)
+            .map(|resolved| resolved.path)
+            .map_err(|e| e.to_string())
+    }
+
+    pub(crate) fn build_diagnostics(input: &DiagnosticsInput) -> Vec<DiagnosticCheck> {
+        let mut checks = Vec::new();
+        let profile = &input.profile;
+
+        checks.push(match &input.inspection {
+            None => diag_check(
                 "Configuration",
-                DiagnosticLevel::Healthy,
-                if dpapi_protected {
-                    "managed configuration is DPAPI protected".to_string()
-                } else {
-                    "configuration is stored in managed storage".to_string()
-                },
-            )
-        }
-        Some(_) => diag_check(
-            "Configuration",
-            DiagnosticLevel::Warning,
-            "Resave this profile to import it into managed storage".to_string(),
-        ),
-    });
-
-    #[cfg(target_os = "linux")]
-    if matches!(
-        profile.backend,
-        TunnelBackend::WireGuard | TunnelBackend::OpenVpn
-    ) || (profile.backend == TunnelBackend::Xray && profile.xray_mode == XrayMode::Tun)
-    {
-        checks.push(diag_check(
-            "Network daemon",
-            if input.status.state == TunnelState::Failed {
-                DiagnosticLevel::Error
-            } else {
-                DiagnosticLevel::Healthy
-            },
-            input
-                .status
-                .message
-                .clone()
-                .unwrap_or_else(|| "Tunnel status reported by network daemon".into()),
-        ));
-        if profile.backend == TunnelBackend::Xray && profile.xray_mode == XrayMode::Tun {
-            checks.push(match &input.executable {
-                Ok(_) => diag_check(
-                    "Package Xray",
-                    DiagnosticLevel::Healthy,
-                    "verified package Xray is available".into(),
+                DiagnosticLevel::Error,
+                format!(
+                    "configuration could not be read or analyzed: {}",
+                    input.inspection_error.as_deref().unwrap_or("unknown error")
                 ),
-                Err(err) => diag_check("Package Xray", DiagnosticLevel::Error, err.clone()),
-            });
-        }
-    } else {
+            ),
+            Some(_) if input.managed => {
+                let dpapi_protected = profile
+                    .config_path
+                    .file_name()
+                    .map(|name| {
+                        name.to_string_lossy()
+                            .to_lowercase()
+                            .ends_with(".json.dpapi")
+                    })
+                    .unwrap_or(false);
+                diag_check(
+                    "Configuration",
+                    DiagnosticLevel::Healthy,
+                    if dpapi_protected {
+                        "managed configuration is DPAPI protected".to_string()
+                    } else {
+                        "configuration is stored in managed storage".to_string()
+                    },
+                )
+            }
+            Some(_) => diag_check(
+                "Configuration",
+                DiagnosticLevel::Warning,
+                "Resave this profile to import it into managed storage".to_string(),
+            ),
+        });
+
+        #[cfg(not(target_os = "linux"))]
         checks.push(match &input.executable {
             Ok(path) => diag_check(
                 "Backend executable",
@@ -145,127 +158,117 @@ fn build_diagnostics(input: &DiagnosticsInput) -> Vec<DiagnosticCheck> {
             ),
             Err(err) => diag_check("Backend executable", DiagnosticLevel::Error, err.clone()),
         });
-    }
-    #[cfg(not(target_os = "linux"))]
-    checks.push(match &input.executable {
-        Ok(path) => diag_check(
-            "Backend executable",
-            DiagnosticLevel::Healthy,
-            format!("found {}", path.display()),
-        ),
-        Err(err) => diag_check("Backend executable", DiagnosticLevel::Error, err.clone()),
-    });
 
-    const STATUS_NOTE: &str = "process/service state only, not handshake verification";
-    checks.push(match input.status.state {
-        TunnelState::Running => diag_check(
-            "Tunnel status",
-            DiagnosticLevel::Healthy,
-            format!("running ({STATUS_NOTE})"),
-        ),
-        TunnelState::Stopped => diag_check(
-            "Tunnel status",
-            DiagnosticLevel::Warning,
-            format!("stopped ({STATUS_NOTE})"),
-        ),
-        TunnelState::Failed => diag_check(
-            "Tunnel status",
-            DiagnosticLevel::Error,
-            format!(
-                "failed: {} ({STATUS_NOTE})",
-                input.status.message.as_deref().unwrap_or("unknown error")
+        const STATUS_NOTE: &str = "process/service state only, not handshake verification";
+        checks.push(match input.status.state {
+            TunnelState::Running => diag_check(
+                "Tunnel status",
+                DiagnosticLevel::Healthy,
+                format!("running ({STATUS_NOTE})"),
             ),
-        ),
-    });
+            TunnelState::Stopped => diag_check(
+                "Tunnel status",
+                DiagnosticLevel::Warning,
+                format!("stopped ({STATUS_NOTE})"),
+            ),
+            TunnelState::Failed => diag_check(
+                "Tunnel status",
+                DiagnosticLevel::Error,
+                format!(
+                    "failed: {} ({STATUS_NOTE})",
+                    input.status.message.as_deref().unwrap_or("unknown error")
+                ),
+            ),
+        });
 
-    let health = &input.protocol_health;
-    checks.push(diag_check(
-        "Protocol health",
-        match health.state {
-            ProtocolHealthState::Healthy => DiagnosticLevel::Healthy,
-            ProtocolHealthState::Degraded => DiagnosticLevel::Warning,
-            ProtocolHealthState::Failed => DiagnosticLevel::Error,
-            ProtocolHealthState::Unknown => DiagnosticLevel::Warning,
-        },
-        health.summary.clone(),
-    ));
-    if let Some(tail) = health.log_tail.as_ref().filter(|t| !t.trim().is_empty()) {
+        let health = &input.protocol_health;
         checks.push(diag_check(
-            "Runtime log",
-            if matches!(
-                health.state,
-                ProtocolHealthState::Failed | ProtocolHealthState::Degraded
-            ) {
-                DiagnosticLevel::Warning
-            } else {
-                DiagnosticLevel::Healthy
+            "Protocol health",
+            match health.state {
+                ProtocolHealthState::Healthy => DiagnosticLevel::Healthy,
+                ProtocolHealthState::Degraded => DiagnosticLevel::Warning,
+                ProtocolHealthState::Failed => DiagnosticLevel::Error,
+                ProtocolHealthState::Unknown => DiagnosticLevel::Warning,
             },
-            tail.clone(),
+            health.summary.clone(),
         ));
-    }
-
-    if !health.pushed_routes.is_empty() {
-        let list = health
-            .pushed_routes
-            .iter()
-            .map(|r| r.destination.to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        checks.push(diag_check(
-            if cfg!(target_os = "linux") && profile.backend == TunnelBackend::OpenVpn {
-                "Daemon routes"
-            } else {
-                "Pushed routes"
-            },
-            DiagnosticLevel::Healthy,
-            format!("{} route(s): {list}", health.pushed_routes.len()),
-        ));
-    }
-
-    // Endpoint path: a remote endpoint that resolves out a tunnel interface
-    // gets its handshake swallowed (TLS timeouts). Only literal IPs are
-    // checked — DNS names are resolved by the daemon at apply time.
-    {
-        let mut endpoints: Vec<std::net::IpAddr> = profile
-            .endpoint_bypasses
-            .iter()
-            .filter_map(|e| e.trim().parse().ok())
-            .collect();
-        if let Some(inspection) = &input.inspection {
-            endpoints.extend(
-                inspection
-                    .analysis
-                    .endpoints
-                    .iter()
-                    .filter_map(|e| e.address.trim().parse::<std::net::IpAddr>().ok()),
-            );
+        if let Some(tail) = health.log_tail.as_ref().filter(|t| !t.trim().is_empty()) {
+            checks.push(diag_check(
+                "Runtime log",
+                if matches!(
+                    health.state,
+                    ProtocolHealthState::Failed | ProtocolHealthState::Degraded
+                ) {
+                    DiagnosticLevel::Warning
+                } else {
+                    DiagnosticLevel::Healthy
+                },
+                tail.clone(),
+            ));
         }
-        endpoints.sort();
-        endpoints.dedup();
-        if !endpoints.is_empty() {
-            let routes = input.os_routes.as_deref().unwrap_or(&[]);
-            let ifaces = input.interfaces.as_deref().unwrap_or(&[]);
-            let swallowed: Vec<String> = endpoints
+
+        if !health.pushed_routes.is_empty() {
+            let list = health
+                .pushed_routes
                 .iter()
-                .filter_map(|ip| {
-                    let route = explorer::longest_prefix_match(*ip, routes)?;
-                    let tunnel_ish = ifaces
-                        .iter()
-                        .find(|i| i.name == route.interface_name)
-                        .map(|i| {
-                            matches!(
-                                i.category,
-                                InterfaceCategory::Vpn | InterfaceCategory::Tunnel
-                            )
-                        })
-                        .unwrap_or_else(|| {
-                            let n = route.interface_name.as_str();
-                            n.starts_with("tun") || n.starts_with("wg") || n.starts_with("utun")
-                        });
-                    tunnel_ish.then(|| format!("{ip} via {}", route.interface_name))
-                })
+                .map(|r| r.destination.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            checks.push(diag_check(
+                if cfg!(target_os = "linux") && profile.backend == TunnelBackend::OpenVpn {
+                    "Daemon routes"
+                } else {
+                    "Pushed routes"
+                },
+                DiagnosticLevel::Healthy,
+                format!("{} route(s): {list}", health.pushed_routes.len()),
+            ));
+        }
+
+        // Endpoint path: a remote endpoint that resolves out a tunnel interface
+        // gets its handshake swallowed (TLS timeouts). Only literal IPs are
+        // checked — DNS names are resolved by the daemon at apply time.
+        {
+            let mut endpoints: Vec<std::net::IpAddr> = profile
+                .endpoint_bypasses
+                .iter()
+                .filter_map(|e| e.trim().parse().ok())
                 .collect();
-            checks.push(if swallowed.is_empty() {
+            if let Some(inspection) = &input.inspection {
+                endpoints.extend(
+                    inspection
+                        .analysis
+                        .endpoints
+                        .iter()
+                        .filter_map(|e| e.address.trim().parse::<std::net::IpAddr>().ok()),
+                );
+            }
+            endpoints.sort();
+            endpoints.dedup();
+            if !endpoints.is_empty() {
+                let routes = input.os_routes.as_deref().unwrap_or(&[]);
+                let ifaces = input.interfaces.as_deref().unwrap_or(&[]);
+                let swallowed: Vec<String> = endpoints
+                    .iter()
+                    .filter_map(|ip| {
+                        let route = explorer::longest_prefix_match(*ip, routes)?;
+                        let tunnel_ish = ifaces
+                            .iter()
+                            .find(|i| i.name == route.interface_name)
+                            .map(|i| {
+                                matches!(
+                                    i.category,
+                                    InterfaceCategory::Vpn | InterfaceCategory::Tunnel
+                                )
+                            })
+                            .unwrap_or_else(|| {
+                                let n = route.interface_name.as_str();
+                                n.starts_with("tun") || n.starts_with("wg") || n.starts_with("utun")
+                            });
+                        tunnel_ish.then(|| format!("{ip} via {}", route.interface_name))
+                    })
+                    .collect();
+                checks.push(if swallowed.is_empty() {
                 diag_check(
                     "Endpoint path",
                     DiagnosticLevel::Healthy,
@@ -281,913 +284,371 @@ fn build_diagnostics(input: &DiagnosticsInput) -> Vec<DiagnosticCheck> {
                     ),
                 )
             });
+            }
         }
-    }
 
-    if profile.use_system_proxy || input.proxy_owner.is_some() {
-        let check = match &input.proxy_owner {
-            Some(owner) if owner == &profile.id => {
-                if input.status.state == TunnelState::Running {
-                    diag_check(
-                        "System proxy",
-                        DiagnosticLevel::Healthy,
-                        "system proxy is applied for this profile (127.0.0.1 SOCKS5)".to_string(),
-                    )
-                } else {
-                    diag_check(
+        if profile.use_system_proxy || input.proxy_owner.is_some() {
+            let check = match &input.proxy_owner {
+                Some(owner) if owner == &profile.id => {
+                    if input.status.state == TunnelState::Running {
+                        diag_check(
+                            "System proxy",
+                            DiagnosticLevel::Healthy,
+                            "system proxy is applied for this profile (127.0.0.1 SOCKS5)"
+                                .to_string(),
+                        )
+                    } else {
+                        diag_check(
                         "System proxy",
                         DiagnosticLevel::Error,
                         "stale ownership: system proxy still applied while the profile is not running".to_string(),
                     )
+                    }
                 }
-            }
-            Some(owner) => diag_check(
-                "System proxy",
-                DiagnosticLevel::Error,
-                format!("system proxy is owned by another profile '{owner}'"),
-            ),
-            None if profile.use_system_proxy => diag_check(
-                "System proxy",
-                DiagnosticLevel::Warning,
-                "system proxy is configured but not currently applied".to_string(),
-            ),
-            None => diag_check(
-                "System proxy",
-                DiagnosticLevel::Warning,
-                "stale system proxy record without a known owner".to_string(),
-            ),
-        };
-        checks.push(check);
-    }
-
-    match &input.inspection {
-        None => checks.push(diag_check(
-            "Static analysis",
-            DiagnosticLevel::Warning,
-            "static analysis unavailable".to_string(),
-        )),
-        Some(inspection) => {
-            let warning_count = inspection.analysis.warnings.len();
-            let conflict_count = inspection.conflicts.len();
-            let incomplete = !inspection.analysis.route_knowledge_complete;
-            if warning_count + conflict_count == 0 && !incomplete {
-                checks.push(diag_check(
-                    "Static analysis",
-                    DiagnosticLevel::Healthy,
-                    "no warnings or conflicts".to_string(),
-                ));
-            } else {
-                let mut details: Vec<String> = inspection.analysis.warnings.clone();
-                details.extend(inspection.conflicts.iter().map(|c| c.message.clone()));
-                if incomplete {
-                    details.push("effective routes are not fully known".to_string());
-                }
-                checks.push(diag_check(
-                    "Static analysis",
+                Some(owner) => diag_check(
+                    "System proxy",
+                    DiagnosticLevel::Error,
+                    format!("system proxy is owned by another profile '{owner}'"),
+                ),
+                None if profile.use_system_proxy => diag_check(
+                    "System proxy",
                     DiagnosticLevel::Warning,
-                    format!(
-                        "{warning_count} warning(s), {conflict_count} conflict(s): {}",
-                        details.join("; ")
-                    ),
-                ));
+                    "system proxy is configured but not currently applied".to_string(),
+                ),
+                None => diag_check(
+                    "System proxy",
+                    DiagnosticLevel::Warning,
+                    "stale system proxy record without a known owner".to_string(),
+                ),
+            };
+            checks.push(check);
+        }
+
+        match &input.inspection {
+            None => checks.push(diag_check(
+                "Static analysis",
+                DiagnosticLevel::Warning,
+                "static analysis unavailable".to_string(),
+            )),
+            Some(inspection) => {
+                let warning_count = inspection.analysis.warnings.len();
+                let conflict_count = inspection.conflicts.len();
+                let incomplete = !inspection.analysis.route_knowledge_complete;
+                if warning_count + conflict_count == 0 && !incomplete {
+                    checks.push(diag_check(
+                        "Static analysis",
+                        DiagnosticLevel::Healthy,
+                        "no warnings or conflicts".to_string(),
+                    ));
+                } else {
+                    let mut details: Vec<String> = inspection.analysis.warnings.clone();
+                    details.extend(inspection.conflicts.iter().map(|c| c.message.clone()));
+                    if incomplete {
+                        details.push("effective routes are not fully known".to_string());
+                    }
+                    checks.push(diag_check(
+                        "Static analysis",
+                        DiagnosticLevel::Warning,
+                        format!(
+                            "{warning_count} warning(s), {conflict_count} conflict(s): {}",
+                            details.join("; ")
+                        ),
+                    ));
+                }
             }
         }
-    }
 
-    if !profile.routes.is_empty()
-        && !(cfg!(target_os = "linux")
+        if !profile.routes.is_empty()
+            && !(cfg!(target_os = "linux")
+                && (matches!(
+                    profile.backend,
+                    TunnelBackend::WireGuard | TunnelBackend::OpenVpn
+                ) || (profile.backend == TunnelBackend::Xray
+                    && profile.xray_mode == XrayMode::Tun)))
+        {
+            let check = match &input.interfaces {
+                Err(err) => diag_check(
+                    "Target interface",
+                    DiagnosticLevel::Error,
+                    format!("cannot list interfaces: {err}"),
+                ),
+                Ok(interfaces) => match interfaces.iter().find(|i| {
+                    i.friendly_name == profile.interface_name || i.name == profile.interface_name
+                }) {
+                    Some(i) if matches!(i.state, InterfaceState::Up) => diag_check(
+                        "Target interface",
+                        DiagnosticLevel::Healthy,
+                        format!("interface '{}' is up", profile.interface_name),
+                    ),
+                    Some(_) => diag_check(
+                        "Target interface",
+                        DiagnosticLevel::Error,
+                        format!("interface '{}' is not up", profile.interface_name),
+                    ),
+                    None => diag_check(
+                        "Target interface",
+                        DiagnosticLevel::Error,
+                        format!("interface '{}' not found", profile.interface_name),
+                    ),
+                },
+            };
+            checks.push(check);
+        }
+
+        if cfg!(target_os = "linux")
             && (matches!(
                 profile.backend,
                 TunnelBackend::WireGuard | TunnelBackend::OpenVpn
-            ) || (profile.backend == TunnelBackend::Xray
-                && profile.xray_mode == XrayMode::Tun)))
-    {
-        let check = match &input.interfaces {
-            Err(err) => diag_check(
-                "Target interface",
-                DiagnosticLevel::Error,
-                format!("cannot list interfaces: {err}"),
-            ),
-            Ok(interfaces) => match interfaces.iter().find(|i| {
-                i.friendly_name == profile.interface_name || i.name == profile.interface_name
-            }) {
-                Some(i) if matches!(i.state, InterfaceState::Up) => diag_check(
-                    "Target interface",
-                    DiagnosticLevel::Healthy,
-                    format!("interface '{}' is up", profile.interface_name),
-                ),
-                Some(_) => diag_check(
-                    "Target interface",
-                    DiagnosticLevel::Error,
-                    format!("interface '{}' is not up", profile.interface_name),
-                ),
-                None => diag_check(
-                    "Target interface",
-                    DiagnosticLevel::Error,
-                    format!("interface '{}' not found", profile.interface_name),
-                ),
-            },
-        };
-        checks.push(check);
-    }
-
-    if cfg!(target_os = "linux")
-        && (matches!(
-            profile.backend,
-            TunnelBackend::WireGuard | TunnelBackend::OpenVpn
-        ) || (profile.backend == TunnelBackend::Xray && profile.xray_mode == XrayMode::Tun))
-    {
-        checks.push(diag_check(
-            "Applied routes",
-            match input.status.state {
-                TunnelState::Running => DiagnosticLevel::Healthy,
-                TunnelState::Stopped => DiagnosticLevel::Warning,
-                TunnelState::Failed => DiagnosticLevel::Error,
-            },
-            format!(
-                "{:?} routes are managed by the network daemon",
-                profile.backend
-            ),
-        ));
-    } else if profile.routes.is_empty() {
-        checks.push(diag_check(
-            "Applied routes",
-            DiagnosticLevel::Healthy,
-            "No app-managed routes".to_string(),
-        ));
-    } else {
-        let check = match &input.owned_routes {
-            None => diag_check(
-                "Applied routes",
-                if input.status.state == TunnelState::Running {
-                    DiagnosticLevel::Error
-                } else {
-                    DiagnosticLevel::Warning
-                },
-                "app-managed routes not applied".to_string(),
-            ),
-            Some(routes) => match &input.os_routes {
-                Err(err) => diag_check(
-                    "Applied routes",
-                    DiagnosticLevel::Error,
-                    format!("cannot list OS routes: {err}"),
-                ),
-                Ok(entries) => {
-                    let missing: Vec<String> = routes
-                        .iter()
-                        .filter(|r| !entries.iter().any(|e| applied_route_present(r, e)))
-                        .map(|r| r.destination.to_string())
-                        .collect();
-                    if missing.is_empty() {
-                        diag_check(
-                            "Applied routes",
-                            DiagnosticLevel::Healthy,
-                            format!("{} managed route(s) present", routes.len()),
-                        )
-                    } else {
-                        diag_check(
-                            "Applied routes",
-                            DiagnosticLevel::Error,
-                            format!("missing OS routes: {}", missing.join(", ")),
-                        )
-                    }
-                }
-            },
-        };
-        checks.push(check);
-    }
-
-    if let Some(inspection) = &input.inspection {
-        if inspection.analysis.endpoints.is_empty() {
+            ) || (profile.backend == TunnelBackend::Xray && profile.xray_mode == XrayMode::Tun))
+        {
             checks.push(diag_check(
-                "Endpoints",
-                DiagnosticLevel::Warning,
-                "no remote endpoints discovered in config".to_string(),
+                "Applied routes",
+                match input.status.state {
+                    TunnelState::Running => DiagnosticLevel::Healthy,
+                    TunnelState::Stopped => DiagnosticLevel::Warning,
+                    TunnelState::Failed => DiagnosticLevel::Error,
+                },
+                format!(
+                    "{:?} routes are managed by the network daemon",
+                    profile.backend
+                ),
+            ));
+        } else if profile.routes.is_empty() {
+            checks.push(diag_check(
+                "Applied routes",
+                DiagnosticLevel::Healthy,
+                "No app-managed routes".to_string(),
             ));
         } else {
-            let list = inspection
-                .analysis
-                .endpoints
-                .iter()
-                .map(|e| match e.port {
-                    Some(port) => format!("{}:{port}", e.address),
-                    None => e.address.clone(),
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            checks.push(diag_check(
-                "Endpoints",
-                DiagnosticLevel::Healthy,
-                format!(
-                    "{} endpoint(s): {list}",
-                    inspection.analysis.endpoints.len()
+            let check = match &input.owned_routes {
+                None => diag_check(
+                    "Applied routes",
+                    if input.status.state == TunnelState::Running {
+                        DiagnosticLevel::Error
+                    } else {
+                        DiagnosticLevel::Warning
+                    },
+                    "app-managed routes not applied".to_string(),
                 ),
-            ));
+                Some(routes) => match &input.os_routes {
+                    Err(err) => diag_check(
+                        "Applied routes",
+                        DiagnosticLevel::Error,
+                        format!("cannot list OS routes: {err}"),
+                    ),
+                    Ok(entries) => {
+                        let missing: Vec<String> = routes
+                            .iter()
+                            .filter(|r| !entries.iter().any(|e| applied_route_present(r, e)))
+                            .map(|r| r.destination.to_string())
+                            .collect();
+                        if missing.is_empty() {
+                            diag_check(
+                                "Applied routes",
+                                DiagnosticLevel::Healthy,
+                                format!("{} managed route(s) present", routes.len()),
+                            )
+                        } else {
+                            diag_check(
+                                "Applied routes",
+                                DiagnosticLevel::Error,
+                                format!("missing OS routes: {}", missing.join(", ")),
+                            )
+                        }
+                    }
+                },
+            };
+            checks.push(check);
         }
-        if profile.backend == TunnelBackend::Xray {
-            if inspection.analysis.listeners.is_empty() {
+
+        if let Some(inspection) = &input.inspection {
+            if inspection.analysis.endpoints.is_empty() {
                 checks.push(diag_check(
-                    "Listeners",
+                    "Endpoints",
                     DiagnosticLevel::Warning,
-                    "no inbound listeners discovered".to_string(),
+                    "no remote endpoints discovered in config".to_string(),
                 ));
             } else {
                 let list = inspection
                     .analysis
-                    .listeners
+                    .endpoints
                     .iter()
-                    .map(|l| format!("{}:{}", l.address, l.port))
+                    .map(|e| match e.port {
+                        Some(port) => format!("{}:{port}", e.address),
+                        None => e.address.clone(),
+                    })
                     .collect::<Vec<_>>()
                     .join(", ");
                 checks.push(diag_check(
-                    "Listeners",
+                    "Endpoints",
                     DiagnosticLevel::Healthy,
-                    format!("listeners: {list}"),
+                    format!(
+                        "{} endpoint(s): {list}",
+                        inspection.analysis.endpoints.len()
+                    ),
                 ));
             }
-        }
-    }
-
-    checks
-}
-
-#[cfg(target_os = "linux")]
-fn linux_daemon_tunnel(profile: &Profile) -> bool {
-    matches!(
-        profile.backend,
-        TunnelBackend::WireGuard | TunnelBackend::OpenVpn
-    ) || (profile.backend == TunnelBackend::Xray && profile.xray_mode == XrayMode::Tun)
-}
-
-#[cfg(target_os = "linux")]
-async fn fetch_daemon_owners(
-    client: &crate::daemon_client::DaemonClient,
-) -> Option<OwnedListResult> {
-    client
-        .request(
-            net_manager_core::daemon_protocol::method::OWNED_LIST,
-            serde_json::Value::Null,
-        )
-        .await
-        .ok()
-}
-
-#[cfg(target_os = "linux")]
-fn linux_owned_checks(
-    input: &DiagnosticsInput,
-    listing: Option<&OwnedListResult>,
-) -> Vec<DiagnosticCheck> {
-    let mut checks = Vec::new();
-    let profile = &input.profile;
-    let owner = match profile.backend {
-        TunnelBackend::WireGuard => format!("wg:{}", profile.id),
-        TunnelBackend::OpenVpn => format!("ovpn:{}", profile.id),
-        TunnelBackend::Xray => format!("xray:{}", profile.id),
-        TunnelBackend::None => return checks,
-    };
-    let Some(listing) = listing else {
-        checks.push(diag_check(
-            "Daemon ownership",
-            DiagnosticLevel::Warning,
-            "Ownership is unknown: daemon listing is unavailable".into(),
-        ));
-        checks.push(diag_check(
-            "Applied routes",
-            DiagnosticLevel::Warning,
-            "Route ownership is unknown".into(),
-        ));
-        checks.push(diag_check(
-            "Tunnel DNS",
-            DiagnosticLevel::Warning,
-            "DNS ownership is unknown".into(),
-        ));
-        return checks;
-    };
-    let Some(entry) = listing.owners.iter().find(|entry| entry.owner == owner) else {
-        let running = input.status.state == TunnelState::Running;
-        checks.push(diag_check(
-            "Daemon ownership",
-            if running {
-                DiagnosticLevel::Error
-            } else {
-                DiagnosticLevel::Warning
-            },
-            if running {
-                "Tunnel reports running, but daemon has no owner"
-            } else {
-                "No active daemon owner"
-            }
-            .into(),
-        ));
-        checks.push(diag_check(
-            "Applied routes",
-            if running {
-                DiagnosticLevel::Error
-            } else {
-                DiagnosticLevel::Warning
-            },
-            "No daemon route ownership recorded".into(),
-        ));
-        checks.push(diag_check(
-            "Tunnel DNS",
-            DiagnosticLevel::Warning,
-            "No daemon DNS ownership recorded".into(),
-        ));
-        return checks;
-    };
-    let marker = entry
-        .resources
-        .iter()
-        .find_map(|resource| match (profile.backend, resource) {
-            (TunnelBackend::WireGuard, OwnedResource::WireGuardLink(link)) => {
-                Some((link.name.as_str(), Some(link.index), link.full.as_ref()))
-            }
-            (TunnelBackend::OpenVpn, OwnedResource::OpenVpnProcess(process)) => {
-                Some((process.name.as_str(), None, process.full.as_ref()))
-            }
-            (TunnelBackend::Xray, OwnedResource::XrayProcess(process)) => Some((
-                process.name.as_str(),
-                Some(process.index),
-                process.full.as_ref(),
-            )),
-            _ => None,
-        });
-    let ownership_level = match entry.state {
-        OwnedState::Stale => DiagnosticLevel::Error,
-        OwnedState::Applying => DiagnosticLevel::Warning,
-        OwnedState::Applied if marker.is_none() => DiagnosticLevel::Error,
-        OwnedState::Applied if input.status.state != TunnelState::Running => DiagnosticLevel::Error,
-        OwnedState::Applied => DiagnosticLevel::Healthy,
-    };
-    checks.push(diag_check(
-        "Daemon ownership",
-        ownership_level,
-        match entry.state {
-            OwnedState::Stale => "Daemon ownership is stale and needs recovery".into(),
-            OwnedState::Applying => "Daemon is still applying tunnel resources".into(),
-            OwnedState::Applied if marker.is_none() => {
-                "Daemon owner lacks a backend resource marker".into()
-            }
-            OwnedState::Applied if input.status.state != TunnelState::Running => {
-                "Daemon owner remains applied while tunnel status is not running".into()
-            }
-            OwnedState::Applied => format!(
-                "Daemon journal tracks {} resource(s)",
-                entry.resources.len()
-            ),
-        },
-    ));
-
-    let journal_routes: Vec<&AppliedRoute> = entry
-        .resources
-        .iter()
-        .filter_map(|resource| match resource {
-            OwnedResource::Route(route) => Some(route),
-            _ => None,
-        })
-        .collect();
-    let expected = if !profile.routes.is_empty() {
-        profile
-            .routes
-            .iter()
-            .map(|route| route.destination)
-            .collect::<Vec<_>>()
-    } else if profile.backend == TunnelBackend::OpenVpn
-        && !input.protocol_health.pushed_routes.is_empty()
-    {
-        input
-            .protocol_health
-            .pushed_routes
-            .iter()
-            .map(|route| route.destination)
-            .collect()
-    } else {
-        input
-            .inspection
-            .as_ref()
-            .map(|inspection| {
-                inspection
-                    .analysis
-                    .os_routes
-                    .iter()
-                    .map(|route| route.destination)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default()
-    };
-    let expected_strings: Vec<String> = expected.iter().map(ToString::to_string).collect();
-    let journal_strings: Vec<String> = journal_routes
-        .iter()
-        .map(|route| route.destination.to_string())
-        .collect();
-    let journal_has = |destination: &str| journal_strings.iter().any(|route| route == destination);
-    let missing_expected = expected_strings
-        .iter()
-        .filter(|destination| {
-            !journal_has(destination)
-                && !(destination.as_str() == "0.0.0.0/0"
-                    && journal_has("0.0.0.0/1")
-                    && journal_has("128.0.0.0/1"))
-                && !(destination.as_str() == "::/0"
-                    && journal_has("::/1")
-                    && journal_has("8000::/1"))
-        })
-        .count();
-    let main_routes: Vec<_> = journal_routes
-        .iter()
-        .filter(|route| route.table.is_none())
-        .collect();
-    let missing_main = match &input.os_routes {
-        Ok(os_routes) => main_routes
-            .iter()
-            .filter(|route| {
-                !os_routes
-                    .iter()
-                    .any(|os_route| applied_route_present(route, os_route))
-            })
-            .count(),
-        Err(_) => 0,
-    };
-    checks.push(if entry.state == OwnedState::Stale || missing_expected > 0 || missing_main > 0 {
-        diag_check("Applied routes", DiagnosticLevel::Error, format!(
-            "Daemon route ownership is incomplete: {missing_expected} expected and {missing_main} main-table route(s) missing"
-        ))
-    } else if expected.is_empty() || input.os_routes.is_err() || journal_routes.iter().any(|route| route.table.is_some()) {
-        diag_check("Applied routes", DiagnosticLevel::Warning, format!(
-            "{} route(s) journaled; expected coverage or non-main OS table is not fully verified",
-            journal_routes.len()
-        ))
-    } else {
-        diag_check("Applied routes", DiagnosticLevel::Warning, format!(
-            "{} expected route(s) journaled and matching OS routes visible; kernel ownership is not independently verified",
-            expected.len()
-        ))
-    });
-
-    let expected_full = expected_strings
-        .iter()
-        .any(|route| route == "0.0.0.0/0" || route == "::/0")
-        || (["0.0.0.0/1", "128.0.0.0/1"]
-            .iter()
-            .all(|half| expected_strings.iter().any(|route| route == half)))
-        || (["::/1", "8000::/1"]
-            .iter()
-            .all(|half| expected_strings.iter().any(|route| route == half)))
-        || journal_has("0.0.0.0/0")
-        || journal_has("::/0")
-        || (journal_has("0.0.0.0/1") && journal_has("128.0.0.0/1"))
-        || (journal_has("::/1") && journal_has("8000::/1"))
-        || entry
-            .resources
-            .iter()
-            .any(|resource| matches!(resource, OwnedResource::Dns(dns) if dns.full));
-    let full = marker.and_then(|(_, _, full)| full);
-    if expected_full || full.is_some() {
-        checks.push(match full {
-            None => diag_check("Policy rules", DiagnosticLevel::Error, "Expected full-tunnel policy ownership is absent".into()),
-            Some(full) => {
-                let missing = [IpFamily::Ipv4, IpFamily::Ipv6].into_iter()
-                    .filter(|family| (*family == IpFamily::Ipv4 && full.ipv4) || (*family == IpFamily::Ipv6 && full.ipv6))
-                    .flat_map(|family| [
-                        !has_full_main_rule(&entry.resources, family, full),
-                        !has_full_tunnel_rule(&entry.resources, family, full),
-                    ])
-                    .filter(|missing| *missing)
-                    .count();
-                if missing > 0 || (!full.ipv4 && !full.ipv6) {
-                    diag_check("Policy rules", DiagnosticLevel::Error, format!("{missing} required full-tunnel rule(s) missing from daemon journal"))
+            if profile.backend == TunnelBackend::Xray {
+                if inspection.analysis.listeners.is_empty() {
+                    checks.push(diag_check(
+                        "Listeners",
+                        DiagnosticLevel::Warning,
+                        "no inbound listeners discovered".to_string(),
+                    ));
                 } else {
-                    diag_check("Policy rules", DiagnosticLevel::Warning, "Full-tunnel rules are journaled; kernel rule presence is not independently verified".into())
+                    let list = inspection
+                        .analysis
+                        .listeners
+                        .iter()
+                        .map(|l| format!("{}:{}", l.address, l.port))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    checks.push(diag_check(
+                        "Listeners",
+                        DiagnosticLevel::Healthy,
+                        format!("listeners: {list}"),
+                    ));
                 }
             }
-        });
-    }
-
-    let dns: Vec<_> = entry
-        .resources
-        .iter()
-        .filter_map(|resource| match resource {
-            OwnedResource::Dns(dns) => Some(dns),
-            _ => None,
-        })
-        .collect();
-    checks.push(if dns.is_empty() {
-        diag_check(
-            "Tunnel DNS",
-            DiagnosticLevel::Warning,
-            "No DNS resource is journaled; DNS requirements are unknown".into(),
-        )
-    } else if dns.iter().any(|dns| {
-        marker.is_none_or(|(name, index, _)| {
-            dns.name != name
-                || index.is_some_and(|index| index != 0 && dns.interface_index != index)
-        })
-    }) {
-        diag_check(
-            "Tunnel DNS",
-            DiagnosticLevel::Error,
-            "DNS resource does not match the owned tunnel link".into(),
-        )
-    } else if dns.iter().any(|dns| !dns.applied) {
-        diag_check(
-            "Tunnel DNS",
-            if dns.iter().any(|dns| dns.full && !dns.applied) {
-                DiagnosticLevel::Error
-            } else {
-                DiagnosticLevel::Warning
-            },
-            "Daemon reports tunnel DNS was not applied".into(),
-        )
-    } else {
-        diag_check(
-            "Tunnel DNS",
-            DiagnosticLevel::Warning,
-            "Daemon journal marks DNS applied; resolver state is not independently verified".into(),
-        )
-    });
-    checks
-}
-
-#[cfg(target_os = "linux")]
-fn has_full_main_rule(
-    resources: &[OwnedResource],
-    family: IpFamily,
-    full: &WireGuardFullResource,
-) -> bool {
-    resources.iter().any(|resource| {
-        matches!(resource, OwnedResource::Rule(rule)
-        if rule.family == family && rule.priority == full.priority_main && rule.table == 254
-            && rule.fwmark.is_none() && !rule.invert && rule.suppress_prefix_length == Some(0))
-    })
-}
-
-#[cfg(target_os = "linux")]
-fn has_full_tunnel_rule(
-    resources: &[OwnedResource],
-    family: IpFamily,
-    full: &WireGuardFullResource,
-) -> bool {
-    resources.iter().any(|resource| matches!(resource, OwnedResource::Rule(rule)
-        if rule.family == family && rule.priority == full.priority_tunnel && rule.table == full.table
-            && rule.fwmark == Some(full.fwmark) && rule.invert && rule.suppress_prefix_length.is_none()))
-}
-
-fn build_profile_inspection(
-    candidate: &Profile,
-    others: &[Profile],
-    os_routes: &[RouteEntry],
-    vault: &ConfigVault,
-) -> Result<ProfileInspection, String> {
-    let mut analysis = analysis::analyze_profile(candidate).map_err(|e| e.to_string())?;
-    let mut conflicts = Vec::new();
-    for other in others {
-        match analysis::analyze_profile(other) {
-            Ok(other_analysis) => conflicts.extend(analysis::conflicts_between(
-                &analysis,
-                &other_analysis,
-                false,
-            )),
-            Err(_) => analysis.warnings.push(format!(
-                "could not analyze profile '{}' ('{}') for conflicts",
-                other.name, other.id
-            )),
         }
-    }
-    conflicts.extend(analysis::warnings_against_os_routes(&analysis, os_routes));
-    Ok(ProfileInspection {
-        analysis,
-        conflicts,
-        managed_config: vault.is_managed_profile_path(&candidate.id, &candidate.config_path),
-    })
-}
 
-#[tauri::command]
-pub(crate) async fn inspect_profiles(
-    state: State<'_, AppState>,
-) -> Result<Vec<ProfileInspection>, String> {
-    let profiles = state.profiles.load().map_err(|e| e.to_string())?.profiles;
-    let os_routes = explorer::list_routes().await.map_err(|e| e.to_string())?;
-    let mut inspections = Vec::with_capacity(profiles.len());
-    for profile in &profiles {
+        checks
+    }
+
+    pub(crate) fn build_profile_inspection(
+        candidate: &Profile,
+        others: &[Profile],
+        os_routes: &[RouteEntry],
+        vault: &ConfigVault,
+    ) -> Result<ProfileInspection, String> {
+        let mut analysis = analysis::analyze_profile(candidate).map_err(|e| e.to_string())?;
+        let mut conflicts = Vec::new();
+        for other in others {
+            match analysis::analyze_profile(other) {
+                Ok(other_analysis) => conflicts.extend(analysis::conflicts_between(
+                    &analysis,
+                    &other_analysis,
+                    false,
+                )),
+                Err(_) => analysis.warnings.push(format!(
+                    "could not analyze profile '{}' ('{}') for conflicts",
+                    other.name, other.id
+                )),
+            }
+        }
+        conflicts.extend(analysis::warnings_against_os_routes(&analysis, os_routes));
+        Ok(ProfileInspection {
+            analysis,
+            conflicts,
+            managed_config: vault.is_managed_profile_path(&candidate.id, &candidate.config_path),
+        })
+    }
+
+    #[tauri::command]
+    pub(crate) async fn inspect_profiles(
+        state: State<'_, AppState>,
+    ) -> Result<Vec<ProfileInspection>, String> {
+        let profiles = state.profiles.load().map_err(|e| e.to_string())?.profiles;
+        let os_routes = explorer::list_routes().await.map_err(|e| e.to_string())?;
+        let mut inspections = Vec::with_capacity(profiles.len());
+        for profile in &profiles {
+            let others: Vec<Profile> = profiles
+                .iter()
+                .filter(|o| o.id != profile.id)
+                .cloned()
+                .collect();
+            inspections.push(build_profile_inspection(
+                profile,
+                &others,
+                &os_routes,
+                &state.config_vault,
+            )?);
+        }
+        Ok(inspections)
+    }
+
+    #[tauri::command]
+    pub(crate) async fn diagnose_profile(
+        id: String,
+        state: State<'_, AppState>,
+    ) -> Result<ProfileDiagnostics, String> {
+        let profile = find_profile(&state.profiles, &id)?;
+        let profiles = state.profiles.load().map_err(|e| e.to_string())?.profiles;
         let others: Vec<Profile> = profiles
             .iter()
             .filter(|o| o.id != profile.id)
             .cloned()
             .collect();
-        inspections.push(build_profile_inspection(
-            profile,
-            &others,
-            &os_routes,
-            &state.config_vault,
-        )?);
-    }
-    Ok(inspections)
-}
-
-#[cfg(target_os = "linux")]
-fn linux_openvpn_protocol_health(
-    status: &net_manager_core::daemon_protocol::OpenVpnStatusResult,
-) -> ProtocolHealth {
-    use net_manager_core::daemon_protocol::OpenVpnConnectionState;
-
-    let state = match status.state {
-        OpenVpnConnectionState::Connected if status.warnings.is_empty() => {
-            ProtocolHealthState::Healthy
-        }
-        OpenVpnConnectionState::Connected
-        | OpenVpnConnectionState::Connecting
-        | OpenVpnConnectionState::Reconnecting => ProtocolHealthState::Degraded,
-        OpenVpnConnectionState::Failed => ProtocolHealthState::Failed,
-        OpenVpnConnectionState::Stopped => ProtocolHealthState::Unknown,
-    };
-    ProtocolHealth {
-        state,
-        summary: format!("OpenVPN {:?} reported by network daemon", status.state),
-        last_handshake_unix: None,
-        rx_bytes: Some(status.rx_bytes),
-        tx_bytes: Some(status.tx_bytes),
-        log_tail: None,
-        pushed_routes: status
-            .applied_routes
-            .iter()
-            .map(|destination| AnalyzedRoute {
-                destination: *destination,
-                source: "OpenVPN daemon".into(),
-                metric: None,
-            })
-            .collect(),
-    }
-}
-
-#[tauri::command]
-pub(crate) async fn diagnose_profile(
-    id: String,
-    state: State<'_, AppState>,
-) -> Result<ProfileDiagnostics, String> {
-    let profile = find_profile(&state.profiles, &id)?;
-    let profiles = state.profiles.load().map_err(|e| e.to_string())?.profiles;
-    let others: Vec<Profile> = profiles
-        .iter()
-        .filter(|o| o.id != profile.id)
-        .cloned()
-        .collect();
-    let os_routes = explorer::list_routes().await.map_err(|e| e.to_string());
-    let interfaces = explorer::list_interfaces().map_err(|e| e.to_string());
-    let empty_routes: &[RouteEntry] = &[];
-    let routes_ref = os_routes.as_deref().unwrap_or(empty_routes);
-    let (inspection, inspection_error) =
-        match build_profile_inspection(&profile, &others, routes_ref, &state.config_vault) {
-            Ok(inspection) => (Some(inspection), None),
-            Err(err) => (None, Some(err)),
-        };
-    let executable = resolve_backend_executable(&state, &profile);
-    #[cfg(target_os = "linux")]
-    let daemon_owners = if linux_daemon_tunnel(&profile) {
-        let client = crate::daemon_client::DaemonClient::system();
-        fetch_daemon_owners(&client).await
-    } else {
-        None
-    };
-    #[cfg(target_os = "linux")]
-    let wg_status = if profile.backend == TunnelBackend::WireGuard {
-        Some(
-            crate::commands::tunnels::linux_wireguard_status_result(
-                &crate::daemon_client::DaemonClient::system(),
-                &profile,
-            )
-            .await,
-        )
-    } else {
-        None
-    };
-    #[cfg(target_os = "linux")]
-    let ovpn_status = if profile.backend == TunnelBackend::OpenVpn {
-        Some(
-            crate::commands::tunnels::linux_openvpn_status_result(
-                &crate::daemon_client::DaemonClient::system(),
-                &profile,
-            )
-            .await,
-        )
-    } else {
-        None
-    };
-    #[cfg(target_os = "linux")]
-    let xray_status =
-        if profile.backend == TunnelBackend::Xray && profile.xray_mode == XrayMode::Tun {
-            Some(
-                crate::commands::tunnels::linux_xray_status_result(
-                    &crate::daemon_client::DaemonClient::system(),
-                    &profile,
-                )
-                .await,
-            )
-        } else {
-            None
-        };
-    let mut runtime = state.runtime.lock().await;
-    #[cfg(target_os = "linux")]
-    let (status, protocol_health) = match wg_status {
-        Some(Ok(wg)) => {
-            let health = ProtocolHealth {
-                state: if wg.latest_handshake.is_some() && wg.state == TunnelState::Running {
-                    ProtocolHealthState::Healthy
-                } else {
-                    ProtocolHealthState::Unknown
-                },
-                summary: if wg.latest_handshake.is_some() {
-                    "WireGuard handshake reported by network daemon".into()
-                } else {
-                    "No WireGuard handshake reported yet".into()
-                },
-                last_handshake_unix: wg.latest_handshake,
-                rx_bytes: Some(wg.rx_bytes),
-                tx_bytes: Some(wg.tx_bytes),
-                log_tail: None,
-                pushed_routes: Vec::new(),
+        let os_routes = explorer::list_routes().await.map_err(|e| e.to_string());
+        let interfaces = explorer::list_interfaces().map_err(|e| e.to_string());
+        let empty_routes: &[RouteEntry] = &[];
+        let routes_ref = os_routes.as_deref().unwrap_or(empty_routes);
+        let (inspection, inspection_error) =
+            match build_profile_inspection(&profile, &others, routes_ref, &state.config_vault) {
+                Ok(inspection) => (Some(inspection), None),
+                Err(err) => (None, Some(err)),
             };
-            (
-                crate::commands::tunnels::linux_wireguard_tunnel_status(wg),
-                health,
-            )
-        }
-        Some(Err(err)) => (
-            TunnelStatus {
-                profile_id: profile.id.clone(),
-                state: TunnelState::Failed,
-                message: Some(err.clone()),
-                interface_name: None,
-                failover: None,
-                watchdog: None,
-            },
-            ProtocolHealth {
-                state: ProtocolHealthState::Failed,
-                summary: err,
-                last_handshake_unix: None,
-                rx_bytes: None,
-                tx_bytes: None,
-                log_tail: None,
-                pushed_routes: Vec::new(),
-            },
-        ),
-        None => match ovpn_status {
-            Some(Ok(ovpn)) => {
-                let health = linux_openvpn_protocol_health(&ovpn);
-                (
-                    crate::commands::tunnels::linux_openvpn_tunnel_status(ovpn),
-                    health,
-                )
-            }
-            Some(Err(err)) => (
-                TunnelStatus {
-                    profile_id: profile.id.clone(),
-                    state: TunnelState::Failed,
-                    message: Some(err.clone()),
-                    interface_name: None,
-                    watchdog: None,
-                    failover: None,
-                },
-                ProtocolHealth {
-                    state: ProtocolHealthState::Failed,
-                    summary: err,
-                    last_handshake_unix: None,
-                    rx_bytes: None,
-                    tx_bytes: None,
-                    log_tail: None,
-                    pushed_routes: Vec::new(),
-                },
-            ),
-            None => match xray_status {
-                Some(Ok(status)) => {
-                    let health = ProtocolHealth {
-                        state: if status.state == TunnelState::Failed { ProtocolHealthState::Failed } else { ProtocolHealthState::Unknown },
-                        summary: "Xray TUN state reported by network daemon; proxy traffic is not verified".into(),
-                        last_handshake_unix: None,
-                        rx_bytes: status.rx_bytes,
-                        tx_bytes: status.tx_bytes,
-                        log_tail: None,
-                        pushed_routes: Vec::new(),
-                    };
-                    (
-                        crate::commands::tunnels::linux_xray_tunnel_status(status, &profile),
-                        health,
-                    )
-                }
-                Some(Err(err)) => (
-                    TunnelStatus {
-                        profile_id: profile.id.clone(),
-                        state: TunnelState::Failed,
-                        message: Some(err.clone()),
-                        watchdog: None,
-                        interface_name: None,
-                        failover: None,
-                    },
-                    ProtocolHealth {
-                        state: ProtocolHealthState::Failed,
-                        summary: err,
-                        last_handshake_unix: None,
-                        rx_bytes: None,
-                        tx_bytes: None,
-                        log_tail: None,
-                        pushed_routes: Vec::new(),
-                    },
-                ),
-                None => {
-                    let status = crate::commands::tunnels::linux_profile_status(
-                        &crate::daemon_client::DaemonClient::system(),
-                        &state,
-                        &profile,
-                    )
-                    .await?;
-                    let health = ProtocolHealth {
-                        state: if status.state == TunnelState::Failed {
-                            ProtocolHealthState::Failed
-                        } else {
-                            ProtocolHealthState::Unknown
-                        },
-                        summary: "Shared runtime state; proxy traffic is not verified".into(),
-                        last_handshake_unix: None,
-                        rx_bytes: None,
-                        tx_bytes: None,
-                        log_tail: None,
-                        pushed_routes: Vec::new(),
-                    };
-                    (status, health)
-                }
-            },
-        },
-    };
-    #[cfg(not(target_os = "linux"))]
-    let status = runtime.tunnels.status(&profile);
-    #[cfg(not(target_os = "linux"))]
-    let protocol_health = runtime.tunnels.protocol_health(&profile);
-    let owned_routes = {
-        #[cfg(target_os = "linux")]
-        if linux_daemon_tunnel(&profile) {
-            None
-        } else if runtime.routes.has_applied(&id).await? {
-            Some(runtime.routes.applied_for(&id).await?)
-        } else {
-            None
-        }
+        let executable = resolve_backend_executable(&state, &profile);
+        let mut runtime = state.runtime.lock().await;
         #[cfg(not(target_os = "linux"))]
-        if runtime.routes.has_applied(&id).await? {
-            Some(runtime.routes.applied_for(&id).await?)
-        } else {
-            None
-        }
-    };
-    drop(runtime);
-    let proxy_owner = state
-        .proxy_ownership()
-        .await
-        .map_err(|error| error.to_string())?
-        .map(|ownership| ownership.profile_id);
-    let managed = state
-        .config_vault
-        .is_managed_profile_path(&profile.id, &profile.config_path);
-    let input = DiagnosticsInput {
-        profile: profile.clone(),
-        status: status.clone(),
-        managed,
-        inspection: inspection.clone(),
-        inspection_error,
-        executable,
-        interfaces,
-        os_routes,
-        owned_routes,
-        protocol_health,
-        proxy_owner,
-    };
-    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
-    let mut checks = build_diagnostics(&input);
-    #[cfg(target_os = "linux")]
-    if linux_daemon_tunnel(&profile) {
-        checks.retain(|check| check.name != "Applied routes");
-        checks.extend(linux_owned_checks(&input, daemon_owners.as_ref()));
+        let status = runtime.tunnels.status(&profile);
+        #[cfg(not(target_os = "linux"))]
+        let protocol_health = runtime.tunnels.protocol_health(&profile);
+        let owned_routes = {
+            #[cfg(not(target_os = "linux"))]
+            if runtime.routes.has_applied(&id).await? {
+                Some(runtime.routes.applied_for(&id).await?)
+            } else {
+                None
+            }
+        };
+        drop(runtime);
+        let proxy_owner = state
+            .proxy_ownership()
+            .await
+            .map_err(|error| error.to_string())?
+            .map(|ownership| ownership.profile_id);
+        let managed = state
+            .config_vault
+            .is_managed_profile_path(&profile.id, &profile.config_path);
+        let input = DiagnosticsInput {
+            profile: profile.clone(),
+            status: status.clone(),
+            managed,
+            inspection: inspection.clone(),
+            inspection_error,
+            executable,
+            interfaces,
+            os_routes,
+            owned_routes,
+            protocol_health,
+            proxy_owner,
+        };
+        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+        let mut checks = build_diagnostics(&input);
+        Ok(ProfileDiagnostics {
+            profile_id: profile.id,
+            status,
+            inspection,
+            checks,
+        })
     }
-    Ok(ProfileDiagnostics {
-        profile_id: profile.id,
-        status,
-        inspection,
-        checks,
-    })
-}
 
-#[tauri::command]
-pub(crate) async fn inspect_profile_by_id(
-    id: String,
-    state: State<'_, AppState>,
-) -> Result<ProfileInspection, String> {
-    let profiles = state.profiles.load().map_err(|e| e.to_string())?.profiles;
-    let candidate = profiles
-        .iter()
-        .find(|p| p.id == id)
-        .cloned()
-        .ok_or_else(|| format!("profile '{id}' not found"))?;
-    let others: Vec<Profile> = profiles.into_iter().filter(|p| p.id != id).collect();
-    let os_routes = explorer::list_routes().await.map_err(|e| e.to_string())?;
-    build_profile_inspection(&candidate, &others, &os_routes, &state.config_vault)
+    #[tauri::command]
+    pub(crate) async fn inspect_profile_by_id(
+        id: String,
+        state: State<'_, AppState>,
+    ) -> Result<ProfileInspection, String> {
+        let profiles = state.profiles.load().map_err(|e| e.to_string())?.profiles;
+        let candidate = profiles
+            .iter()
+            .find(|p| p.id == id)
+            .cloned()
+            .ok_or_else(|| format!("profile '{id}' not found"))?;
+        let others: Vec<Profile> = profiles.into_iter().filter(|p| p.id != id).collect();
+        let os_routes = explorer::list_routes().await.map_err(|e| e.to_string())?;
+        build_profile_inspection(&candidate, &others, &os_routes, &state.config_vault)
+    }
 }
 
 #[cfg(test)]
@@ -1539,61 +1000,6 @@ mod tests {
             "{}",
             applied.message
         );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn reads_uid_scoped_owned_list_from_fake_daemon() {
-        use net_manager_core::daemon_protocol::{self, method, RequestFrame, ResponseFrame};
-        use serde_json::json;
-        use tokio::io::{AsyncWriteExt, BufReader};
-        use tokio::net::UnixListener;
-
-        let dir = unique_dir("diagnostics-owned-list");
-        let socket = dir.join("daemon.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
-        let server =
-            tokio::spawn(async move {
-                let (stream, _) = listener.accept().await.unwrap();
-                let (reader, mut writer) = stream.into_split();
-                let mut reader = BufReader::new(reader);
-                let hello: RequestFrame = serde_json::from_slice(
-                    &daemon_protocol::read_frame(&mut reader, 1024)
-                        .await
-                        .unwrap()
-                        .unwrap(),
-                )
-                .unwrap();
-                assert_eq!(hello.method, method::HELLO);
-                writer.write_all(&daemon_protocol::encode_line(&ResponseFrame::ok(
-                hello.id,
-                json!({"protocol":1,"daemonVersion":"test","uid":1000,"capabilities":[]}),
-            )).unwrap()).await.unwrap();
-                let request: RequestFrame = serde_json::from_slice(
-                    &daemon_protocol::read_frame(&mut reader, 1024)
-                        .await
-                        .unwrap()
-                        .unwrap(),
-                )
-                .unwrap();
-                assert_eq!(request.method, method::OWNED_LIST);
-                writer
-                    .write_all(
-                        &daemon_protocol::encode_line(&ResponseFrame::ok(
-                            request.id,
-                            json!({"owners":[{"owner":"wg:p1","state":"applied","resources":[]}]}),
-                        ))
-                        .unwrap(),
-                    )
-                    .await
-                    .unwrap();
-            });
-
-        let client = crate::daemon_client::DaemonClient::new(socket);
-        let owned = fetch_daemon_owners(&client).await.unwrap();
-        assert_eq!(owned.owners.len(), 1);
-        server.await.unwrap();
-        fs::remove_dir_all(dir).unwrap();
     }
 
     #[cfg(target_os = "linux")]

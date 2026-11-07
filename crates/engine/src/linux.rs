@@ -225,25 +225,11 @@ pub fn prepare_linux_xray_tun_params(
     // Named `netorch proxy` exits: dedicated pin-<key> outbounds appended
     // after everything else — the default route and failover stay as built.
     net_manager_core::proxy_exits::append_named_proxy_outbounds(vault, profile, &mut config)?;
-    let effective_routes = profile.effective_routes();
-    let default_route = effective_routes.is_empty();
-    let route = |destination: &str| PolicyRoute {
-        destination: destination.parse().unwrap(),
-        metric: 5,
-        via: None,
-    };
-    let routes = if default_route {
-        // Split-default installs the two def1 halves instead of one /0 —
-        // same full coverage, but coexisting tunnel managers that use the
-        // halves see a consistent picture.
-        if profile.xray_split_default {
-            vec![route("0.0.0.0/1"), route("128.0.0.0/1")]
-        } else {
-            vec![route("0.0.0.0/0")]
-        }
-    } else {
-        effective_routes
-    };
+    let default_route = profile.tunnel_role == TunnelRole::Primary && profile.routes.is_empty();
+    let routes = net_manager_core::connect_plan::linux_xray_tun_routes(profile);
+    if profile.xray_dns.fake_dns {
+        configure_linux_fake_dns(&mut config, &routes, profile.xray_dns.query_strategy)?;
+    }
     let mut dns_bypass = net_manager_core::xray::dns_bypass_hosts(&profile.xray_dns);
     if default_route {
         for ip in ["1.1.1.1", "8.8.8.8", "9.9.9.9"] {
@@ -291,6 +277,45 @@ pub fn prepare_linux_xray_tun_params(
     check_xray_frame_size(&params)?;
     Ok(params)
 }
+
+fn configure_linux_fake_dns(
+    config: &mut serde_json::Value,
+    routes: &[PolicyRoute],
+    strategy: Option<XrayDnsQueryStrategy>,
+) -> Result<(), String> {
+    let destinations: Vec<_> = routes
+        .iter()
+        .map(|route| route.destination.trunc())
+        .collect();
+    let destinations = ipnet::IpNet::aggregate(&destinations);
+    let captured = |pool: ipnet::IpNet| {
+        destinations
+            .iter()
+            .any(|route| route.prefix_len() <= pool.prefix_len() && route.contains(&pool.network()))
+    };
+    let ipv4 = captured("198.18.0.0/16".parse().unwrap());
+    let ipv6 = captured("fc00::/18".parse().unwrap());
+    if !ipv4 && !ipv6 {
+        return Err(
+            "Xray fake DNS requires routes covering a complete synthetic address pool".into(),
+        );
+    }
+    if strategy == Some(XrayDnsQueryStrategy::UseIpv4) && !ipv4
+        || strategy == Some(XrayDnsQueryStrategy::UseIpv6) && !ipv6
+    {
+        return Err("Xray fake DNS query strategy requires a captured pool in that family".into());
+    }
+    let mut pools = Vec::with_capacity(usize::from(ipv4) + usize::from(ipv6));
+    if ipv4 {
+        pools.push(serde_json::json!({ "ipPool": "198.18.0.0/16", "poolSize": 65535 }));
+    }
+    if ipv6 {
+        pools.push(serde_json::json!({ "ipPool": "fc00::/18", "poolSize": 65535 }));
+    }
+    config["fakedns"] = serde_json::Value::Array(pools);
+    Ok(())
+}
+
 /// Build the multinode connect pieces: every failover candidate and pinned
 /// endpoint is generated from its *current* share link (not `config_path`,
 /// which may hold a stale selection), the routing rules land on the fresh
@@ -721,5 +746,304 @@ pub fn linux_wireguard_tunnel_status(status: WireGuardStatusResult) -> TunnelSta
         interface_name: status.interface_name,
         failover: None,
         watchdog: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use net_manager_core::config_vault::ConfigVault;
+    use net_manager_core::profile_import::import_share_link;
+    use net_manager_core::profiles::ProfileStore;
+
+    fn generated_tun_profile() -> (tempfile::TempDir, ConfigVault, Profile) {
+        let directory = tempfile::tempdir().unwrap();
+        let vault = ConfigVault::new(directory.path().join("configs"));
+        let store = ProfileStore::new(directory.path().join("profiles.json"));
+        import_share_link(
+            &vault,
+            &store,
+            "ipv6-tun",
+            "IPv6 TUN fixture",
+            "vless://synthetic-id@node.test:443?security=tls#IPv6",
+            |_| true,
+        )
+        .unwrap();
+        let mut profile = store.load().unwrap().profiles.remove(0);
+        profile.xray_mode = XrayMode::Tun;
+        (directory, vault, profile)
+    }
+
+    fn route(destination: &str) -> PolicyRoute {
+        PolicyRoute {
+            destination: destination.parse().unwrap(),
+            metric: 5,
+            via: None,
+        }
+    }
+
+    #[test]
+    fn xray_tun_default_primary_captures_both_route_families() {
+        let (_directory, vault, mut profile) = generated_tun_profile();
+        profile.tunnel_role = TunnelRole::Primary;
+        profile.routes.clear();
+        profile.xray_split_default = false;
+
+        let params = prepare_linux_xray_tun_params(&vault, &profile).unwrap();
+
+        assert_eq!(params.routes.len(), 2);
+        for destination in ["0.0.0.0/0", "::/0"] {
+            let route = params
+                .routes
+                .iter()
+                .find(|route| route.destination == destination.parse().unwrap())
+                .expect("default route must cover each address family");
+            assert_eq!(route.via, None);
+        }
+        assert_eq!(params.role, TunnelRole::Primary);
+    }
+
+    #[test]
+    fn xray_tun_split_default_captures_four_halves() {
+        let (_directory, vault, mut profile) = generated_tun_profile();
+        profile.tunnel_role = TunnelRole::Primary;
+        profile.routes.clear();
+        profile.xray_split_default = true;
+
+        let params = prepare_linux_xray_tun_params(&vault, &profile).unwrap();
+
+        assert_eq!(params.routes.len(), 4);
+        for destination in ["0.0.0.0/1", "128.0.0.0/1", "::/1", "8000::/1"] {
+            let route = params
+                .routes
+                .iter()
+                .find(|route| route.destination == destination.parse().unwrap())
+                .expect("split-default must cover both halves of each address family");
+            assert_eq!(route.via, None);
+        }
+    }
+
+    #[test]
+    fn xray_tun_explicit_single_family_routes_are_not_expanded() {
+        let (_directory, vault, mut profile) = generated_tun_profile();
+        for (destination, via) in [
+            ("0.0.0.0/0", "192.0.2.1"),
+            ("::/0", "2001:db8::1"),
+            ("10.20.0.0/16", "192.0.2.1"),
+            ("2001:db8:20::/48", "2001:db8::1"),
+        ] {
+            let mut explicit = route(destination);
+            explicit.metric = 37;
+            explicit.via = Some(via.parse().unwrap());
+            profile.routes = vec![explicit.clone()];
+            for split_default in [false, true] {
+                profile.xray_split_default = split_default;
+
+                let params = prepare_linux_xray_tun_params(&vault, &profile).unwrap();
+
+                assert_eq!(
+                    params.routes,
+                    vec![explicit.clone()],
+                    "explicit {destination}, split-default {split_default}"
+                );
+                assert!(params.dns_servers.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn xray_tun_explicit_partial_dual_family_routes_stay_scoped() {
+        let (_directory, vault, mut profile) = generated_tun_profile();
+        let expected = vec![route("10.20.0.0/16"), route("2001:db8:20::/48")];
+        profile.routes = expected.clone();
+        for split_default in [false, true] {
+            profile.xray_split_default = split_default;
+
+            let params = prepare_linux_xray_tun_params(&vault, &profile).unwrap();
+
+            assert_eq!(params.routes, expected);
+            assert!(params.dns_servers.is_empty());
+        }
+    }
+
+    #[test]
+    fn xray_tun_secondary_routes_stay_scoped_to_its_networks() {
+        let (_directory, vault, mut profile) = generated_tun_profile();
+        profile.tunnel_role = TunnelRole::Secondary;
+        profile.routes = vec![route("0.0.0.0/0"), route("::/0")];
+        for networks in [
+            vec!["10.20.0.0/16"],
+            vec!["2001:db8:20::/48"],
+            vec!["10.20.0.0/16", "2001:db8:20::/48"],
+        ] {
+            profile.tunnel_networks = networks
+                .iter()
+                .map(|network| network.parse().unwrap())
+                .collect();
+            let expected: Vec<_> = networks.iter().map(|network| route(network)).collect();
+            for split_default in [false, true] {
+                profile.xray_split_default = split_default;
+
+                let params = prepare_linux_xray_tun_params(&vault, &profile).unwrap();
+
+                assert_eq!(params.routes, expected);
+                assert_eq!(params.role, TunnelRole::Secondary);
+                assert!(params.dns_servers.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn xray_tun_empty_secondary_routes_do_not_become_full_tunnel() {
+        let (_directory, vault, mut profile) = generated_tun_profile();
+        profile.tunnel_role = TunnelRole::Secondary;
+        profile.routes = vec![route("0.0.0.0/0"), route("::/0")];
+        profile.tunnel_networks.clear();
+        for split_default in [false, true] {
+            profile.xray_split_default = split_default;
+
+            let params = prepare_linux_xray_tun_params(&vault, &profile).unwrap();
+
+            assert!(params.routes.is_empty());
+            assert!(params.dns_servers.is_empty());
+        }
+    }
+
+    #[test]
+    fn xray_tun_fake_dns_only_uses_captured_families() {
+        let (_directory, vault, mut profile) = generated_tun_profile();
+        profile.xray_dns.fake_dns = true;
+        for (destinations, ipv4, ipv6) in [
+            (vec!["0.0.0.0/0"], true, false),
+            (vec!["::/0"], false, true),
+            (vec![], true, true),
+            (
+                vec![
+                    "198.18.0.0/17",
+                    "198.18.128.0/17",
+                    "fc00::/19",
+                    "fc00:2000::/19",
+                ],
+                true,
+                true,
+            ),
+        ] {
+            profile.routes = destinations
+                .iter()
+                .map(|destination| route(destination))
+                .collect();
+            for split_default in [false, true] {
+                profile.xray_split_default = split_default;
+                for (strategy, expected) in [
+                    (None, None),
+                    (Some(XrayDnsQueryStrategy::UseIp), Some("UseIP")),
+                    (Some(XrayDnsQueryStrategy::UseIpv4), Some("UseIPv4")),
+                    (Some(XrayDnsQueryStrategy::UseIpv6), Some("UseIPv6")),
+                ] {
+                    if strategy == Some(XrayDnsQueryStrategy::UseIpv4) && !ipv4
+                        || strategy == Some(XrayDnsQueryStrategy::UseIpv6) && !ipv6
+                    {
+                        continue;
+                    }
+                    profile.xray_dns.query_strategy = strategy;
+                    let params = prepare_linux_xray_tun_params(&vault, &profile).unwrap();
+                    let config: serde_json::Value = serde_json::from_str(&params.config).unwrap();
+                    let pools = config["fakedns"].as_array().unwrap();
+                    let mut has_ipv4 = false;
+                    let mut has_ipv6 = false;
+                    for pool in pools {
+                        let destination = route(pool["ipPool"].as_str().unwrap()).destination;
+                        assert!(matches!(pool["poolSize"].as_u64(), Some(1..=65535)));
+                        match destination.network() {
+                            std::net::IpAddr::V4(_) => has_ipv4 = true,
+                            std::net::IpAddr::V6(_) => has_ipv6 = true,
+                        }
+                    }
+                    assert_eq!((has_ipv4, has_ipv6), (ipv4, ipv6));
+                    assert_eq!(
+                        config["dns"].get("queryStrategy"),
+                        expected
+                            .map(|strategy| serde_json::json!(strategy))
+                            .as_ref()
+                    );
+                    if !profile.routes.is_empty() {
+                        assert_eq!(params.routes, profile.routes);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn xray_tun_fake_dns_rejects_uncaptured_pools() {
+        let (_directory, vault, mut profile) = generated_tun_profile();
+        profile.xray_dns.fake_dns = true;
+        for destinations in [
+            vec!["10.20.0.0/16", "2001:db8::/32"],
+            vec!["198.18.0.0/17"],
+            vec!["fc00::/19"],
+        ] {
+            profile.routes = destinations
+                .iter()
+                .map(|destination| route(destination))
+                .collect();
+            assert!(prepare_linux_xray_tun_params(&vault, &profile).is_err());
+        }
+    }
+
+    #[test]
+    fn xray_tun_fake_dns_rejects_uncaptured_query_family() {
+        let (_directory, vault, mut profile) = generated_tun_profile();
+        profile.xray_dns.fake_dns = true;
+        for (destination, strategy) in [
+            ("0.0.0.0/0", XrayDnsQueryStrategy::UseIpv6),
+            ("::/0", XrayDnsQueryStrategy::UseIpv4),
+        ] {
+            profile.routes = vec![route(destination)];
+            profile.xray_dns.query_strategy = Some(strategy);
+            assert!(prepare_linux_xray_tun_params(&vault, &profile).is_err());
+        }
+    }
+
+    #[test]
+    fn xray_tun_explicit_dns_query_strategy_is_preserved() {
+        let (_directory, vault, mut profile) = generated_tun_profile();
+        for (strategy, expected) in [
+            (XrayDnsQueryStrategy::UseIp, "UseIP"),
+            (XrayDnsQueryStrategy::UseIpv4, "UseIPv4"),
+            (XrayDnsQueryStrategy::UseIpv6, "UseIPv6"),
+        ] {
+            profile.xray_dns.query_strategy = Some(strategy);
+
+            let params = prepare_linux_xray_tun_params(&vault, &profile).unwrap();
+            let config: serde_json::Value = serde_json::from_str(&params.config).unwrap();
+
+            assert_eq!(config["dns"]["queryStrategy"], expected);
+        }
+    }
+
+    #[test]
+    fn xray_tun_explicit_dual_family_dns_servers_are_captured() {
+        let (_directory, vault, mut profile) = generated_tun_profile();
+        profile.xray_tun_dns_servers = vec![
+            "192.0.2.53".parse().unwrap(),
+            "2001:db8::53".parse().unwrap(),
+        ];
+        for split_default in [false, true] {
+            profile.xray_split_default = split_default;
+
+            let params = prepare_linux_xray_tun_params(&vault, &profile).unwrap();
+
+            assert_eq!(params.dns_servers, profile.xray_tun_dns_servers);
+            for server in &params.dns_servers {
+                assert!(
+                    params
+                        .routes
+                        .iter()
+                        .any(|route| route.destination.contains(server)),
+                    "DNS server {server} must be covered, split-default {split_default}"
+                );
+            }
+        }
     }
 }

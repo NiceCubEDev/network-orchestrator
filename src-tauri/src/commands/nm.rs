@@ -10,12 +10,13 @@ use tauri::Emitter;
 pub(crate) async fn nm_list_connections() -> Result<NmListResult, String> {
     #[cfg(target_os = "linux")]
     {
-        use net_manager_core::daemon_protocol::method;
-        let client = crate::daemon_client::DaemonClient::system();
-        client
-            .request(method::NM_LIST, serde_json::Value::Null)
-            .await
-            .map_err(|e| crate::daemon_client::user_message(&e))
+        tauri::async_runtime::spawn_blocking(|| {
+            net_manager_engine::linux_services::nm_list(
+                &net_manager_engine::linux_engine::LinuxEngine::new("network-orchestrator"),
+            )
+        })
+        .await
+        .map_err(|_| "NetworkManager task failed".to_string())?
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -34,12 +35,15 @@ pub(crate) async fn nm_set_active(
 ) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
-        use net_manager_core::daemon_protocol::{method, NmSetActiveParams};
-        let client = crate::daemon_client::DaemonClient::system();
-        let _: serde_json::Value = client
-            .request(method::NM_SET_ACTIVE, NmSetActiveParams { uuid, active })
-            .await
-            .map_err(|e| crate::daemon_client::user_message(&e))?;
+        tauri::async_runtime::spawn_blocking(move || {
+            net_manager_engine::linux_services::nm_set_active(
+                &net_manager_engine::linux_engine::LinuxEngine::new("network-orchestrator"),
+                &uuid,
+                active,
+            )
+        })
+        .await
+        .map_err(|_| "NetworkManager task failed".to_string())??;
         let _ = app.emit("route-changed", ());
         Ok(())
     }

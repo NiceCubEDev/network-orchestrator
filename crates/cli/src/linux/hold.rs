@@ -85,6 +85,15 @@ pub fn run_foreground(ctx: &Ctx, profile: &Profile) -> Result<String, String> {
     );
     match end {
         WatchEnd::Signal => {
+            #[cfg(target_os = "linux")]
+            auth::run(ctx.root_user, || {
+                net_manager_engine::linux_runtime::disconnect_profile_with_root(
+                    &ctx.engine,
+                    &ctx.root,
+                    profile,
+                )
+            })?;
+            #[cfg(not(target_os = "linux"))]
             auth::run(ctx.root_user, || ctx.engine.disconnect(profile))?;
             Ok(format!("Disconnected \"{}\"", profile.name))
         }

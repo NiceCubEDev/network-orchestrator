@@ -3,16 +3,23 @@
 //! the same data (`subscription.json` in the vault); share links never reach
 //! the terminal, only the names the provider gave them.
 use super::auth;
-use super::commands::{self, Output};
+#[cfg(not(target_os = "linux"))]
+use super::commands;
+use super::commands::Output;
 use super::ctx::Ctx;
 use super::library;
+#[cfg(not(target_os = "linux"))]
 use net_manager_core::backend_settings::BackendSettingsStore;
+#[cfg(not(target_os = "linux"))]
 use net_manager_core::config_vault::SubscriptionEndpoint;
 use net_manager_core::models::{
-    NodePoolFilter, NodePoolSettings, Profile, SubscriptionEndpointInfo, TunnelBackend,
-    TunnelState, XrayMode,
+    NodePoolFilter, NodePoolSettings, Profile, SubscriptionEndpointInfo, TunnelState,
 };
-use net_manager_core::{node_pool, subscription, vpn, xray};
+#[cfg(not(target_os = "linux"))]
+use net_manager_core::models::{TunnelBackend, XrayMode};
+use net_manager_core::{node_pool, subscription};
+#[cfg(not(target_os = "linux"))]
+use net_manager_core::{vpn, xray};
 use net_manager_engine::linux_engine::LinuxEngine;
 use serde_json::{json, Value};
 use std::io::{BufRead, IsTerminal, Write};
@@ -89,10 +96,16 @@ fn role(row: &Row) -> String {
 /// Every endpoint as the clients see it: real servers first in subscription
 /// order, then the remembered keys that left the list ("missing").
 pub fn list_rows(ctx: &Ctx, profile: &Profile) -> Result<Vec<Row>, String> {
-    let mut rows = rows(
-        &subscription::list_endpoints(&ctx.vault(), &ctx.store(), &profile.id)
-            .map_err(|_| "The subscription's server list could not be read".to_string())?,
-    );
+    #[cfg(target_os = "linux")]
+    let infos = net_manager_engine::linux_profiles::ProfileService::new(
+        ctx.root.clone(),
+        ctx.engine.clone(),
+    )
+    .subscription_endpoints(&profile.id)?;
+    #[cfg(not(target_os = "linux"))]
+    let infos = subscription::list_endpoints(&ctx.vault(), &ctx.store(), &profile.id)
+        .map_err(|_| "The subscription's server list could not be read".to_string())?;
+    let mut rows = rows(&infos);
     if let Some(meta) = &profile.subscription {
         for row in &mut rows {
             row.backup = meta
@@ -121,6 +134,7 @@ fn subscription_profile(ctx: &Ctx, target: &str) -> Result<Profile, String> {
     Ok(profile)
 }
 
+#[cfg(not(target_os = "linux"))]
 fn read_endpoints(ctx: &Ctx, profile: &Profile) -> Result<Vec<SubscriptionEndpoint>, String> {
     ctx.vault()
         .read_subscription_endpoints(&profile.id)
@@ -311,6 +325,10 @@ fn is_running(ctx: &Ctx, profile: &Profile) -> Result<bool, String> {
 
 /// Makes `key` the profile's primary server; the connection must be down.
 fn apply(ctx: &Ctx, profile: &Profile, key: &str) -> Result<Profile, String> {
+    #[cfg(target_os = "linux")]
+    net_manager_engine::linux_profiles::ProfileService::new(ctx.root.clone(), ctx.engine.clone())
+        .switch_endpoint(&profile.id, key)?;
+    #[cfg(not(target_os = "linux"))]
     subscription::switch_endpoint_key(&ctx.vault(), &ctx.store(), &profile.id, key, |port| {
         profile.xray_mode == net_manager_core::models::XrayMode::Tun
             || std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).is_ok()
@@ -354,6 +372,7 @@ pub fn use_endpoint(ctx: &Ctx, target: &str, query: Option<&str>) -> Result<Outp
     ))
 }
 
+#[cfg(not(target_os = "linux"))]
 /// Changes the primary server and, when the connection was up, reconnects;
 /// if the new server does not come up the previous one is restored.
 pub fn switch(ctx: &Ctx, target: &str, query: Option<&str>) -> Result<Output, String> {
@@ -537,6 +556,10 @@ fn pinned_routes_of(ctx: &Ctx, profile: &Profile) -> Value {
 /// Replaces or extends the ordered backup chain. `keys` that resolve to the
 /// primary are rejected — the primary is never its own backup.
 fn save_backups(ctx: &Ctx, profile: &Profile, keys: &[String]) -> Result<Vec<Row>, String> {
+    #[cfg(target_os = "linux")]
+    net_manager_engine::linux_profiles::ProfileService::new(ctx.root.clone(), ctx.engine.clone())
+        .set_backups(&profile.id, keys)?;
+    #[cfg(not(target_os = "linux"))]
     subscription::set_backup_endpoints(&ctx.vault(), &ctx.store(), &profile.id, keys).map_err(
         |error| match error.kind() {
             std::io::ErrorKind::InvalidInput => error.to_string(),
@@ -673,6 +696,10 @@ fn backup_auto(ctx: &Ctx, target: &str, on: bool) -> Result<Output, String> {
     library::require_user(ctx)?;
     let profile = subscription_profile(ctx, target)?;
     let running = is_running(ctx, &profile).unwrap_or(true);
+    #[cfg(target_os = "linux")]
+    net_manager_engine::linux_profiles::ProfileService::new(ctx.root.clone(), ctx.engine.clone())
+        .set_auto_return(&profile.id, on)?;
+    #[cfg(not(target_os = "linux"))]
     subscription::set_auto_return_primary(&ctx.store(), &profile.id, on).map_err(|error| {
         match error.kind() {
             std::io::ErrorKind::InvalidInput => error.to_string(),
@@ -759,6 +786,10 @@ fn save_pool(
     profile: &Profile,
     settings: Option<NodePoolSettings>,
 ) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    net_manager_engine::linux_profiles::ProfileService::new(ctx.root.clone(), ctx.engine.clone())
+        .set_node_pool(&profile.id, settings)?;
+    #[cfg(not(target_os = "linux"))]
     node_pool::set_node_pool(&ctx.store(), &profile.id, settings).map_err(|error| {
         match error.kind() {
             std::io::ErrorKind::InvalidInput => error.to_string(),
@@ -928,6 +959,7 @@ fn report_text(report: &node_pool::NodePoolReport) -> String {
     text
 }
 
+#[cfg(not(target_os = "linux"))]
 /// `pool rebuild`: probe candidates through a temporary Xray and keep the
 /// members the filters plus real exit countries allow.
 fn pool_rebuild(ctx: &Ctx, target: &str) -> Result<Output, String> {
@@ -983,6 +1015,7 @@ fn pool_rebuild(ctx: &Ctx, target: &str) -> Result<Output, String> {
     ))
 }
 
+#[cfg(any(not(target_os = "linux"), test))]
 /// The country the node's flag emoji names, if any: regional indicators
 /// pair up to an ISO code (🇷🇺 → RU). A name is not proof — `verify`
 /// compares it with the real exit and flags a mismatch.
@@ -997,6 +1030,7 @@ pub(crate) fn flag_country(name: &str) -> Option<String> {
     (code.len() == 2).then_some(code)
 }
 
+#[cfg(not(target_os = "linux"))]
 /// `backup verify`: every failover candidate — primary, manual backups and
 /// pool members — is probed through its own temporary Xray and reports the
 /// country it really exits in. Nodes missing from the subscription are
@@ -1143,6 +1177,7 @@ fn pool(ctx: &Ctx, command: super::args::PoolCommand) -> Result<Output, String> 
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 pub fn refresh(ctx: &Ctx, target: &str) -> Result<Output, String> {
     library::require_user(ctx)?;
     let profile = subscription_profile(ctx, target)?;
@@ -1283,6 +1318,7 @@ fn block_on<F: std::future::Future>(future: F) -> Result<F::Output, String> {
         .map(|runtime| runtime.block_on(future))
 }
 
+#[cfg(not(target_os = "linux"))]
 /// The Xray `test` runs probes with: the configured or managed one.
 fn xray_executable(ctx: &Ctx) -> Result<std::path::PathBuf, String> {
     let setting = BackendSettingsStore::new(ctx.root.join("backend-settings.json"))
@@ -1325,6 +1361,7 @@ fn select_for_test(rows: &[Row], query: Option<&str>) -> Result<Vec<usize>, Stri
     Ok(found)
 }
 
+#[cfg(not(target_os = "linux"))]
 /// The config a probe runs: for a profile the daemon runs, the reduced one a
 /// connection would send, so the result says whether the server can work.
 fn probe_config(url: &str, port: u16, as_tunnel: bool) -> Result<Value, String> {
@@ -1337,6 +1374,7 @@ fn probe_config(url: &str, port: u16, as_tunnel: bool) -> Result<Value, String> 
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 pub fn test(
     ctx: &Ctx,
     target: &str,
@@ -1407,6 +1445,141 @@ pub fn test(
     Ok(render_probes(&probes, all, top))
 }
 
+#[cfg(target_os = "linux")]
+fn pool_rebuild(ctx: &Ctx, target: &str) -> Result<Output, String> {
+    library::require_user(ctx)?;
+    let profile = subscription_profile(ctx, target)?;
+    let running = is_running(ctx, &profile).unwrap_or(true);
+    let service = net_manager_engine::linux_profiles::ProfileService::new(
+        ctx.root.clone(),
+        ctx.engine.clone(),
+    );
+    let report = block_on(service.rebuild_node_pool(&profile.id))??
+        .ok_or("Set backup-pool filters before rebuilding the pool")?;
+    let mut value = report_json(&report)?;
+    value["requiresReconnect"] = json!(running);
+    Ok((
+        value,
+        format!("{}{}", report_text(&report), apply_note(running)),
+    ))
+}
+
+#[cfg(target_os = "linux")]
+pub fn verify(ctx: &Ctx, target: &str) -> Result<Output, String> {
+    library::require_user(ctx)?;
+    let profile = subscription_profile(ctx, target)?;
+    let service = net_manager_engine::linux_profiles::ProfileService::new(
+        ctx.root.clone(),
+        ctx.engine.clone(),
+    );
+    let checks = block_on(service.verify_subscription_exits(&profile.id))??;
+    let text = checks
+        .iter()
+        .map(|check| {
+            format!(
+                "  {:<9} {}  named={} exit={}{}",
+                check.role,
+                check.name,
+                check.named_country.as_deref().unwrap_or("?"),
+                check.exit_country.as_deref().unwrap_or("unreachable"),
+                if check.mismatch { "  MISMATCH" } else { "" },
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok((json!({"id": profile.id, "checks": checks}), text))
+}
+
+#[cfg(target_os = "linux")]
+pub fn refresh(ctx: &Ctx, target: &str) -> Result<Output, String> {
+    library::require_user(ctx)?;
+    let profile = subscription_profile(ctx, target)?;
+    let service = net_manager_engine::linux_profiles::ProfileService::new(
+        ctx.root.clone(),
+        ctx.engine.clone(),
+    );
+    let outcome = block_on(service.refresh_subscription(&profile.id, None))??;
+    let pool_text = outcome
+        .pool_report
+        .as_ref()
+        .map(|report| format!("\n{}", report_text(report)))
+        .unwrap_or_default();
+    let pool_value = outcome.pool_report.as_ref().map(report_json).transpose()?;
+    Ok((
+        json!({
+            "id": profile.id, "servers": outcome.endpoint_count, "skipped": outcome.skipped_count,
+            "fallbackUsed": outcome.fallback_used, "cleanupFailed": outcome.cleanup_failed,
+            "poolReport": pool_value,
+        }),
+        format!(
+            "Refreshed \"{}\": {} servers; {} unsupported skipped{}{}{}",
+            profile.name,
+            outcome.endpoint_count,
+            outcome.skipped_count,
+            if outcome.fallback_used {
+                "\nThe previous primary disappeared; a replacement primary was selected."
+            } else {
+                ""
+            },
+            if outcome.cleanup_failed {
+                "\nThe subscription was saved, but old managed-config cleanup failed."
+            } else {
+                ""
+            },
+            pool_text
+        ),
+    ))
+}
+
+#[cfg(target_os = "linux")]
+pub fn test(
+    ctx: &Ctx,
+    target: &str,
+    query: Option<&str>,
+    all: bool,
+    top: usize,
+) -> Result<Output, String> {
+    library::require_user(ctx)?;
+    let profile = subscription_profile(ctx, target)?;
+    let rows = list_rows(ctx, &profile)?
+        .into_iter()
+        .filter(|row| !row.missing)
+        .collect::<Vec<_>>();
+    let indexes = select_for_test(&rows, query)?;
+    let probes = block_on(async {
+        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(PROBE_PARALLELISM));
+        let mut jobs = tokio::task::JoinSet::new();
+        for index in indexes {
+            let gate = gate.clone();
+            let service = net_manager_engine::linux_profiles::ProfileService::new(
+                ctx.root.clone(),
+                ctx.engine.clone(),
+            );
+            let id = profile.id.clone();
+            let name = rows[index].name.clone();
+            jobs.spawn(async move {
+                let _permit = gate
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| "Server measurement was cancelled")?;
+                let result = service.measure_endpoint_delay(&id, index).await?;
+                Ok::<_, String>(Probe {
+                    number: index + 1,
+                    name,
+                    delay_ms: result.delay_ms,
+                    error: result.error,
+                })
+            });
+        }
+        let mut probes = Vec::with_capacity(jobs.len());
+        while let Some(result) = jobs.join_next().await {
+            probes.push(result.map_err(|_| "A delay-measurement worker failed")??);
+        }
+        Ok::<_, String>(probes)
+    })??;
+    Ok(render_probes(&rank(probes), all, top))
+}
+
 pub fn render_probes(probes: &[Probe], all: bool, top: usize) -> Output {
     let value = Value::Array(
         probes
@@ -1448,6 +1621,29 @@ pub fn render_probes(probes: &[Probe], all: bool, top: usize) -> Output {
     (value, text)
 }
 
+#[cfg(target_os = "linux")]
+pub fn switch(ctx: &Ctx, target: &str, query: Option<&str>) -> Result<Output, String> {
+    library::require_user(ctx)?;
+    let profile = subscription_profile(ctx, target)?;
+    let (index, rows) = chosen(ctx, &profile, query)?;
+    let outcome = auth::run(ctx.root_user, || {
+        net_manager_engine::linux_profiles::ProfileService::new(
+            ctx.root.clone(),
+            ctx.engine.clone(),
+        )
+        .switch_endpoint_live(&profile.id, &rows[index].key, ctx)
+    })?;
+    let name = &rows[index].name;
+    Ok((
+        json!({"id": profile.id, "server": name, "number": index + 1,
+        "key": rows[index].key, "connected": outcome.was_running}),
+        if outcome.was_running {
+            format!("Switched \"{}\" to {name} and reconnected", profile.name)
+        } else {
+            format!("\"{}\" now uses {name}", profile.name)
+        },
+    ))
+}
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,10 +1,17 @@
 use crate::commands::diagnostics::DiagnosticsInput;
-use crate::state::{AppState, RuntimeState};
+use crate::state::AppState;
+#[cfg(not(target_os = "linux"))]
+use crate::state::RuntimeState;
+#[cfg(not(target_os = "linux"))]
 use net_manager_core::backend_settings::BackendSettingsStore;
 use net_manager_core::config_vault::ConfigVault;
 use net_manager_core::models::*;
 use net_manager_core::profiles::ProfileStore;
-use net_manager_core::system_proxy::{ProxyAdapter, ProxySnapshot, SystemProxyManager};
+#[cfg(not(target_os = "linux"))]
+use net_manager_core::system_proxy::SystemProxyManager;
+#[cfg(not(target_os = "linux"))]
+use net_manager_core::system_proxy::{ProxyAdapter, ProxySnapshot};
+#[cfg(not(target_os = "linux"))]
 use net_manager_core::vpn::TunnelManager;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -70,8 +77,10 @@ pub(crate) fn os_route(dest: &str, prefix_len: u8) -> RouteEntry {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 pub(crate) struct NoopExecutor;
 
+#[cfg(not(target_os = "linux"))]
 impl net_manager_core::policy::RouteExecutor for NoopExecutor {
     fn add_route(&mut self, _route: &AppliedRoute) -> std::io::Result<()> {
         Ok(())
@@ -82,8 +91,10 @@ impl net_manager_core::policy::RouteExecutor for NoopExecutor {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 pub(crate) struct NoopProxyAdapter;
 
+#[cfg(not(target_os = "linux"))]
 impl ProxyAdapter for NoopProxyAdapter {
     fn snapshot(&mut self) -> std::io::Result<ProxySnapshot> {
         Ok(ProxySnapshot::default())
@@ -100,14 +111,17 @@ pub(crate) fn app_state(dir: &Path) -> AppState {
     AppState {
         profiles: ProfileStore::new(dir.join("profiles.json")),
         config_vault: ConfigVault::new(dir.join("configs")),
+        #[cfg(not(target_os = "linux"))]
         backend_settings: BackendSettingsStore::new(dir.join("backend-settings.json")),
+        #[cfg(not(target_os = "linux"))]
         managed_xray_root: dir.join("backends").join("xray"),
-        #[cfg(target_os = "linux")]
-        geo_assets_root: dir.join("geoassets"),
+        #[cfg(not(target_os = "linux"))]
         backend_install_lock: tokio::sync::Mutex::new(()),
+        #[cfg(not(target_os = "linux"))]
         backend_install_cancel: AtomicBool::new(false),
         shutting_down: AtomicBool::new(false),
         cleanup_complete: AtomicBool::new(false),
+        #[cfg(not(target_os = "linux"))]
         runtime: tokio::sync::Mutex::new(RuntimeState {
             tunnels: TunnelManager::new(),
             routes: crate::route_runtime::RouteRuntime::local_with_executor(
@@ -120,6 +134,7 @@ pub(crate) fn app_state(dir: &Path) -> AppState {
             )
             .unwrap(),
         }),
+        #[cfg(not(target_os = "linux"))]
         log: std::sync::Mutex::new(std::collections::VecDeque::new()),
         #[cfg(target_os = "linux")]
         openvpn_credentials: std::sync::Arc::new(

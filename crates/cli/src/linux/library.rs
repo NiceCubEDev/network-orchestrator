@@ -4,16 +4,23 @@ use super::commands::Output;
 use super::ctx::Ctx;
 use crate::render::row_of;
 use crate::target::{self, Input};
+#[cfg(not(target_os = "linux"))]
 use net_manager_core::daemon_protocol::{method, AlwaysOnListResult};
-use net_manager_core::models::{Profile, TunnelBackend, TunnelState};
+use net_manager_core::models::Profile;
+#[cfg(not(target_os = "linux"))]
+use net_manager_core::models::{TunnelBackend, TunnelState};
+#[cfg(not(target_os = "linux"))]
 use net_manager_core::profile_import;
 use net_manager_core::subscription::{self, SubscriptionImport};
+#[cfg(not(target_os = "linux"))]
 use net_manager_engine::linux_engine::LinuxEngine;
 use serde_json::json;
 use std::collections::HashSet;
+#[cfg(not(target_os = "linux"))]
 use std::net::{Ipv4Addr, TcpListener};
 use std::path::Path;
 
+#[cfg(not(target_os = "linux"))]
 fn loopback_port_available(port: u16) -> bool {
     TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok()
 }
@@ -50,6 +57,7 @@ pub fn require_user(ctx: &Ctx) -> Result<(), String> {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 fn io_message(error: std::io::Error) -> String {
     match error.kind() {
         std::io::ErrorKind::InvalidInput | std::io::ErrorKind::AlreadyExists => error.to_string(),
@@ -70,6 +78,13 @@ fn rename_to(ctx: &Ctx, id: &str, name: &str) -> Result<Profile, String> {
     if name.is_empty() || name.chars().count() > 128 || name.contains(['\r', '\n']) {
         return Err("The name must be 1-128 characters on one line".into());
     }
+    #[cfg(target_os = "linux")]
+    let document = net_manager_engine::linux_profiles::ProfileService::new(
+        ctx.root.clone(),
+        ctx.engine.clone(),
+    )
+    .rename(id, name)?;
+    #[cfg(not(target_os = "linux"))]
     let document = ctx
         .store()
         .update_profile(id, |profile| {
@@ -104,6 +119,13 @@ pub fn add_input(ctx: &Ctx, input: &str, name: Option<&str>) -> Result<Vec<Profi
                 .or_else(|| target::link_name(&link))
                 .unwrap_or_else(|| "Imported".into());
             let id = target::make_id(&name, &suffix);
+            #[cfg(target_os = "linux")]
+            net_manager_engine::linux_profiles::ProfileService::new(
+                ctx.root.clone(),
+                ctx.engine.clone(),
+            )
+            .import_link(&id, &name, &link)?;
+            #[cfg(not(target_os = "linux"))]
             profile_import::import_share_link(
                 &ctx.vault(),
                 &ctx.store(),
@@ -121,27 +143,47 @@ pub fn add_input(ctx: &Ctx, input: &str, name: Option<&str>) -> Result<Vec<Profi
                 .enable_all()
                 .build()
                 .map_err(|_| "Could not start the network runtime".to_string())?;
-            let fetched = runtime
-                .block_on(async {
-                    let client = subscription::http_client()?;
-                    subscription::fetch(&client, &url, &hwid).await
-                })
-                .map_err(|error| error.to_string())?;
-            subscription::import_body(
-                &ctx.vault(),
-                &ctx.store(),
-                &SubscriptionImport {
-                    id: &id,
-                    url: &url,
-                    hwid: &hwid,
-                    name: "",
-                    refresh_interval_minutes: None,
-                },
-                &fetched.body,
-                fetched.meta,
-                loopback_port_available,
-            )
-            .map_err(io_message)?;
+            #[cfg(target_os = "linux")]
+            runtime.block_on(
+                net_manager_engine::linux_profiles::ProfileService::new(
+                    ctx.root.clone(),
+                    ctx.engine.clone(),
+                )
+                .import_subscription(
+                    &SubscriptionImport {
+                        id: &id,
+                        url: &url,
+                        hwid: &hwid,
+                        name: "",
+                        refresh_interval_minutes: None,
+                    },
+                    None,
+                ),
+            )?;
+            #[cfg(not(target_os = "linux"))]
+            {
+                let fetched = runtime
+                    .block_on(async {
+                        let client = subscription::http_client()?;
+                        subscription::fetch(&client, &url, &hwid).await
+                    })
+                    .map_err(|error| error.to_string())?;
+                subscription::import_body(
+                    &ctx.vault(),
+                    &ctx.store(),
+                    &SubscriptionImport {
+                        id: &id,
+                        url: &url,
+                        hwid: &hwid,
+                        name: "",
+                        refresh_interval_minutes: None,
+                    },
+                    &fetched.body,
+                    fetched.meta,
+                    loopback_port_available,
+                )
+                .map_err(io_message)?;
+            }
         }
         Input::File { path, .. } => import_file(ctx, &path)?,
     }
@@ -159,6 +201,13 @@ fn import_file(ctx: &Ctx, path: &Path) -> Result<(), String> {
     let path = path
         .canonicalize()
         .map_err(|_| "The file could not be read".to_string())?;
+    #[cfg(target_os = "linux")]
+    let result = net_manager_engine::linux_profiles::ProfileService::new(
+        ctx.root.clone(),
+        ctx.engine.clone(),
+    )
+    .import_configs(&[path.to_string_lossy().into_owned()], None)?;
+    #[cfg(not(target_os = "linux"))]
     let result = profile_import::import_configs_into(
         &ctx.vault(),
         &ctx.store(),
@@ -167,7 +216,9 @@ fn import_file(ctx: &Ctx, path: &Path) -> Result<(), String> {
     )
     .map_err(io_message)?;
     match result.errors.first() {
-        Some(error) => Err(error.error.clone()),
+        Some(_) => Err(
+            "The selected config could not be imported; check its format and permissions".into(),
+        ),
         None => Ok(()),
     }
 }
@@ -196,6 +247,7 @@ pub fn rename(ctx: &Ctx, target: &str, name: &str) -> Result<Output, String> {
     ))
 }
 
+#[cfg(not(target_os = "linux"))]
 /// A running tunnel, or a profile enrolled in always-on, must be stopped
 /// first, exactly as in the app.
 fn ensure_removable(ctx: &Ctx, profile: &Profile) -> Result<(), String> {
@@ -228,13 +280,19 @@ fn ensure_removable(ctx: &Ctx, profile: &Profile) -> Result<(), String> {
 pub fn rm(ctx: &Ctx, target: &str) -> Result<Output, String> {
     require_user(ctx)?;
     let profile = ctx.find(target)?;
-    ensure_removable(ctx, &profile)?;
-    ctx.store()
-        .delete(&profile.id)
-        .map_err(|_| "The profile could not be deleted".to_string())?;
-    ctx.vault().remove_profile(&profile.id).map_err(|_| {
-        "Profile deleted, but its stored config could not be cleaned up".to_string()
-    })?;
+    #[cfg(target_os = "linux")]
+    net_manager_engine::linux_profiles::ProfileService::new(ctx.root.clone(), ctx.engine.clone())
+        .delete(&profile.id)?;
+    #[cfg(not(target_os = "linux"))]
+    {
+        ensure_removable(ctx, &profile)?;
+        ctx.store()
+            .delete(&profile.id)
+            .map_err(|_| "The profile could not be deleted".to_string())?;
+        ctx.vault().remove_profile(&profile.id).map_err(|_| {
+            "Profile deleted, but its stored config could not be cleaned up".to_string()
+        })?;
+    }
     Ok((
         json!({"removed": profile.id}),
         format!("Removed \"{}\"", profile.name),

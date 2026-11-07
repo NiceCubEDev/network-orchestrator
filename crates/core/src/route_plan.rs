@@ -399,4 +399,71 @@ mod tests {
         assert!(!map.warnings[0].contains("SECRET-NAME-77"));
         fs::remove_dir_all(&dir).unwrap();
     }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_tun_map_matches_dual_stack_split_and_explicit_capture() {
+        use crate::models::XrayMode;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("xray.json");
+        let config = crate::xray::generate_share_link_config_with_http(
+            "vless://11111111-2222-4333-8444-555555555555@192.0.2.1:443?type=raw&security=none",
+            10808,
+            10809,
+        )
+        .unwrap();
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        serde_json::to_writer(file, &config).unwrap();
+        let mut profile = Profile {
+            id: "xray-capture".into(),
+            name: "Xray capture".into(),
+            backend: TunnelBackend::Xray,
+            config_path: path,
+            interface_name: "xray-test".into(),
+            xray_mode: XrayMode::Tun,
+            xray_socks_port: Some(10808),
+            xray_http_port: Some(10809),
+            ..Default::default()
+        };
+        for (split, prefixes) in [
+            (false, vec!["0.0.0.0/0", "::/0"]),
+            (true, vec!["0.0.0.0/1", "128.0.0.0/1", "::/1", "8000::/1"]),
+        ] {
+            profile.xray_split_default = split;
+            let effective: Vec<_> = prefixes
+                .into_iter()
+                .map(|prefix| route_entry(prefix, "xray-test", 5))
+                .collect();
+            let map = build_route_map(&[(profile.clone(), true)], &effective);
+            assert!(map.diffs.is_empty(), "{:?}", map.diffs);
+            for destination in ["203.0.113.1", "2001:db8::1", "fd00::1"] {
+                assert_eq!(
+                    predicted_winner(destination.parse().unwrap(), &map.predicted)
+                        .map(|route| route.owner_profile_id.as_str()),
+                    Some(profile.id.as_str()),
+                );
+            }
+        }
+        profile.routes = vec![PolicyRoute {
+            destination: "2001:db8:1234::/48".parse().unwrap(),
+            metric: 17,
+            via: None,
+        }];
+        let map = build_route_map(
+            &[(profile, true)],
+            &[route_entry("2001:db8:1234::/48", "xray-test", 17)],
+        );
+        assert!(map.diffs.is_empty(), "{:?}", map.diffs);
+        assert!(predicted_winner("2001:db8:1234::1".parse().unwrap(), &map.predicted).is_some());
+        for destination in ["203.0.113.1", "2001:db8:5678::1"] {
+            assert!(predicted_winner(destination.parse().unwrap(), &map.predicted).is_none());
+        }
+    }
 }

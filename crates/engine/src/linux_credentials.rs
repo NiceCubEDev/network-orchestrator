@@ -88,7 +88,7 @@ impl OpenVpnCredentialStore {
         }
     }
 
-    /// Removes credentials from the session, the keyring and the legacy file.
+    /// Clears local credentials, then confirms keyring deletion or reports failure.
     pub fn forget(&self, profile_id: &str, legacy: Option<&Path>) -> Result<(), String> {
         self.session.lock().unwrap().remove(profile_id);
         let failed = |_| "cannot remove remembered OpenVPN credentials".to_string();
@@ -96,8 +96,11 @@ impl OpenVpnCredentialStore {
             remove_legacy_file(legacy).map_err(failed)?;
         }
         match self.keyring.delete(profile_id) {
-            Err(err) if err.kind() != io::ErrorKind::NotConnected => Err(failed(err)),
-            _ => Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::NotConnected => Err(
+                "cannot remove remembered OpenVPN credentials: secret service unavailable".into(),
+            ),
+            Err(err) => Err(failed(err)),
+            Ok(()) => Ok(()),
         }
     }
 }
@@ -483,6 +486,50 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn forget_unavailable_keyring_reports_failure_after_local_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("openvpn-credentials.json");
+        let keyring = FakeKeyring {
+            unavailable: true,
+            ..Default::default()
+        };
+        let entries = keyring.entries.clone();
+        let persistent = serde_json::to_vec(&credentials()).unwrap();
+        entries
+            .lock()
+            .unwrap()
+            .insert("p1".into(), persistent.clone());
+        let credentials_store = store(keyring);
+        assert_eq!(
+            credentials_store.remember("p1", &credentials()),
+            Some(SESSION_ONLY_NOTICE)
+        );
+        write_legacy(&legacy, &credentials());
+
+        let result = credentials_store.forget("p1", Some(&legacy));
+
+        assert!(
+            !legacy.exists(),
+            "plaintext cleanup must not depend on keyring availability"
+        );
+        assert_eq!(
+            credentials_store.load("p1", &legacy).unwrap(),
+            (None, None),
+            "a failed persistent deletion must still clear session credentials"
+        );
+        assert_eq!(
+            entries.lock().unwrap().get("p1"),
+            Some(&persistent),
+            "the inaccessible persistent secret has not been confirmed deleted"
+        );
+        let error = result.expect_err("unavailable keyring cannot confirm persistent deletion");
+        assert!(error.contains("unavailable"), "{error}");
+        assert!(!error.contains("private-user"));
+        assert!(!error.contains("private-password"));
+        assert!(!error.contains(&legacy.to_string_lossy().to_string()));
+    }
+
+    #[test]
     fn forget_clears_session_keyring_and_legacy_file() {
         let dir = unique_dir("ovpn-forget");
         let legacy = dir.join("openvpn-credentials.json");
@@ -490,6 +537,11 @@ pub(crate) mod tests {
         let entries = keyring.entries.clone();
         let credentials_store = store(keyring);
         credentials_store.remember("p1", &credentials());
+        credentials_store
+            .session
+            .lock()
+            .unwrap()
+            .insert("p1".into(), credentials());
         write_legacy(&legacy, &credentials());
 
         credentials_store.forget("p1", Some(&legacy)).unwrap();
@@ -498,13 +550,6 @@ pub(crate) mod tests {
         assert!(!legacy.exists());
         assert_eq!(credentials_store.load("p1", &legacy).unwrap(), (None, None));
 
-        let session = store(FakeKeyring {
-            unavailable: true,
-            ..Default::default()
-        });
-        session.remember("p1", &credentials());
-        session.forget("p1", None).unwrap();
-        assert_eq!(session.load("p1", &legacy).unwrap(), (None, None));
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

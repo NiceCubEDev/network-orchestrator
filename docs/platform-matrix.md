@@ -10,6 +10,8 @@ Sources of truth:
 - `get_platform_capabilities` → `src-tauri/src/commands/system.rs`
   (`PlatformCapabilities`, surfaced to the UI as `caps` via
   `usePlatformCapabilities()`)
+- Linux delegates these flags to `crates/engine/src/linux_system.rs`; both
+  frontends use the same services rather than independent GUI implementations.
 - `#[cfg(target_os = …)]` blocks in `crates/core` and `crates/daemon`
 - `caps.os === "linux"` / `caps.appUpdates` gates in `src/`
 
@@ -31,6 +33,7 @@ SOCKS/HTTP mode and the per-user system proxy. Everything that needs root
 | OpenVPN profile | ✅ | ✅ | ✅ helper, arm64 | Win/Linux as before; macOS: pinned self-contained OpenVPN from the app bundle run by the helper, routes/DNS installed by the helper, credentials in the Keychain |
 | Xray — SOCKS mode | ✅ | ✅ | ✅ native, arm64 | macOS: native client runs managed Xray via `TunnelManager` in `crates/macos-bridge/src/runtime.rs` |
 | Xray — TUN mode | ✅ manual | ✅ managed | ✅ helper, arm64 | Win: user sets iface name/IP; Linux: daemon generates config (`xrayMode: "tun"` default); macOS: the launchd helper creates the `utun`, hands its fd to Xray (`XRAY_TUN_FD`, Xray runs as the console user) and owns routes + DNS — `docs/plans/2026-10-14-16-macos-xray-tun.md`; one tunnel at a time |
+| Managed Xray TUN dual-stack capture | — | ✅ IPv4 + IPv6 | — | Linux primary defaults and four split-default halves; explicit/secondary scope preserved, captured-family FakeDNS, `/32` + `/128` ownership/recovery; requires daemon `xray.tun.ipv6` |
 | Xray backup nodes and pinned domain egress | — | ✅ app + CLI | — | One TUN, ordered HTTPS-probed backups with automatic primary return; pinned domains fail closed, including when a subscription node disappears |
 | Xray filtered pools and actual exit countries | — | ✅ app + CLI | — | Opt-in country/name filters, bounded candidate probes, explicit primary/backups/domain/DNS nodes excluded from automatic recruitment |
 | Standalone Xray policy migration | — | ✅ app + CLI | — | Stopped-profile preview/apply; representable routing/DNS/runtime settings, atomic refusal of unsupported semantics; wrapper listeners excluded |
@@ -53,7 +56,7 @@ SOCKS/HTTP mode and the per-user system proxy. Everything that needs root
 | Kernel route/rule inventory | — | ✅ | ❌ | `net.tables` via the daemon's rtnetlink: every table + all policy rules (`ip route`/`ip rule` equivalent); read-only, daemon-owned rows flagged by RTPROT |
 | Tailscale service row | — | ✅ | ✅ via the user's own daemon | `tailscaled` proxied through the daemon's LocalAPI client; surfaced under Profiles → Services; macOS: status/up/down through the Tailscale CLI plus the helper's `tailscale.protect` guard (tailnet prefix pins and bypass routes for Tailscale's own traffic next to a primary tunnel) — `docs/plans/2026-10-20-macos-tailscale.md` |
 | System proxy toggle | ✅ | ⚠️ GNOME via `gsettings`, KDE via `kwriteconfig`; other desktops hidden | ✅ `networksetup`, hardware services; ignored while a packet-tunnel VPN is primary | Win: registry; macOS: `system_proxy::macos::MacProxyAdapter`; Linux: `system_proxy::linux` — `GnomeProxyAdapter` (`org.gnome.system.proxy`) or `KdeProxyAdapter` (`kioslaverc`), offered only when one is usable |
-| Command line (`netorch`) | ❌ | ✅ `crates/cli` | ✅ `crates/cli` | Linux: CLI and GUI share `LinuxEngine`, profiles, credentials and the `netorch serve` user runtime; the system daemon owns privileged operations. macOS: bundle tool over the engine/helper — `docs/plans/2026-10-15-19-netorch-cli.md` |
+| Command line (`netorch`) | ❌ | ✅ full Linux business-operation surface | ✅ `crates/cli` | Linux: shared profile/subscription/network/provider/diagnostic/system/set services, credentials and `netorch serve`; GUI is an adapter, the daemon owns privileged operations. macOS: bundle tool over engine/helper — `docs/plans/2026-10-15-19-netorch-cli.md` |
 | In-app updater | ✅ | — | ❌ | `appUpdates` is `windows`-only; Linux ships `.deb`/`.rpm`/AUR → package manager |
 | Per-link DNS | — | ✅ | — | `crates/daemon/src/dns.rs`, systemd-resolved; Windows relies on pushed/adapter DNS |
 | Recovery prompt (leftover resources) | ✅ | ✅ | ✅ | Win: orphaned adapters/routes; Linux: stale daemon owners; macOS: the helper undoes a dead tunnel's routes/DNS on its own start; at launch the app lists what it still records for a tunnel that is not running (or a stale system proxy) and `recovery.cleanup` clears it on request, a running tunnel is never touched |
@@ -80,8 +83,10 @@ per-connection Diagnostics report (`core::diagnostics`) and a DNS tab on Network
 
 ## Profiles & subscriptions (identical on both)
 
-- Multiple profiles may run simultaneously; saved combinations = Sets
-  (localStorage `netmanager.connections.snippets`).
+- Multiple profiles may run simultaneously. Linux Sets use protected shared
+  `connection-sets.json` with insert-only browser migration; Windows retains
+  localStorage `netmanager.connections.snippets`. Linux CLI and GUI share capture,
+  apply, credential preflight, rollback and partial teardown reporting.
 - Subscription profiles: multi-endpoint list, per-endpoint delay,
   refresh interval, traffic quota display.
 - Import: URI/file batch import (`ImportModal`); standard WireGuard `.conf`
