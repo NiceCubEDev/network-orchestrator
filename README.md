@@ -330,10 +330,10 @@ For Debian/Ubuntu, distribute the single-file installers under
 the shared daemon; the GUI installer includes both `netorch` and that daemon.
 
 ```bash
-sh ./netorch-0.14.0-amd64.run --check  # preview without installing
-sudo sh ./netorch-0.14.0-amd64.run
+sh ./netorch-0.15.0-amd64.run --check  # preview without installing
+sudo sh ./netorch-0.15.0-amd64.run
 # The GUI installer also installs/reuses netorch:
-sudo sh ./network-orchestrator-0.14.0-amd64.run
+sudo sh ./network-orchestrator-0.15.0-amd64.run
 ```
 
 Run the installer from a newer release to update. It compares installed Debian

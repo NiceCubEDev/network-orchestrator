@@ -10,6 +10,10 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-11-07
+
+Core 0.15.0.
+
 ### Added
 
 - CLI access to Linux profile settings, subscriptions, network routes/rules and
