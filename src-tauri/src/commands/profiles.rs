@@ -221,7 +221,7 @@ fn validate_xray_routing(profile: &Profile) -> Result<(), String> {
         .into_iter()
         .flatten()
         {
-            crate::geo_assets::validate_geo_asset_url(url)
+            net_manager_engine::linux_geo_assets::validate_geo_asset_url(url)
                 .map_err(|err| format!("invalid Xray geo data URL: {err}"))?;
         }
     }
@@ -331,13 +331,30 @@ async fn ensure_profile_stopped(
         )
         .await;
     }
-    let mut runtime = state.runtime.lock().await;
-    if runtime.tunnels.status(profile).state == TunnelState::Running {
-        return Err(format!(
-            "profile '{}' is running; disconnect before {action}",
-            profile.id
-        ));
+    #[cfg(target_os = "linux")]
+    {
+        let status = crate::commands::tunnels::linux_profile_status(
+            &crate::daemon_client::DaemonClient::system(),
+            state,
+            profile,
+        )
+        .await?;
+        if status.state != TunnelState::Stopped {
+            return Err(format!("profile is active; disconnect before {action}"));
+        }
+        Ok(())
     }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let mut runtime = state.runtime.lock().await;
+        if runtime.tunnels.status(profile).state == TunnelState::Running {
+            return Err(format!(
+                "profile '{}' is running; disconnect before {action}",
+                profile.id
+            ));
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
     Ok(())
 }
 

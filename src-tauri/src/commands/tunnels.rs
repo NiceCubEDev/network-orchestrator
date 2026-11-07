@@ -1,29 +1,33 @@
 use crate::commands::profiles::loopback_port_available;
-use crate::state::{find_profile, AppState, RuntimeState};
+#[cfg(any(not(target_os = "linux"), test))]
+use crate::state::RuntimeState;
+use crate::state::{find_profile, AppState};
+#[cfg(not(target_os = "linux"))]
 use net_manager_core::analysis;
+#[cfg(not(target_os = "linux"))]
 use net_manager_core::connect_plan::{
     active_profile_conflicts, derive_installable_routes, has_target_interface,
     resolve_install_interface, wait_for_openvpn_pushed_routes, wait_for_tcp_listener,
 };
+#[cfg(not(target_os = "linux"))]
 use net_manager_core::explorer;
 use net_manager_core::models::*;
+#[cfg(any(not(target_os = "linux"), test))]
 use std::io::ErrorKind;
+#[cfg(not(target_os = "linux"))]
 use std::time::Duration;
 #[cfg(not(target_os = "linux"))]
 use std::time::Instant;
 use tauri::{Emitter, State};
 
 #[cfg(target_os = "linux")]
-use crate::openvpn_credentials::OpenVpnCredentialStore;
-#[cfg(target_os = "linux")]
 use net_manager_core::daemon_protocol::{
-    method, OpenVpnConnectResult, OpenVpnCredentials, OpenVpnDisconnectResult, OpenVpnProbeResult,
-    OpenVpnProfileParams, OpenVpnStatusResult, WireGuardConnectResult, WireGuardDisconnectResult,
-    WireGuardProfileParams, WireGuardStatusResult, XrayConnectResult, XrayDisconnectResult,
-    XrayProfileParams, XrayStatusResult,
+    method, OpenVpnCredentials, OpenVpnStatusResult, WireGuardStatusResult, XrayStatusResult,
 };
 #[cfg(target_os = "linux")]
 pub(crate) use net_manager_engine::linux::*;
+#[cfg(target_os = "linux")]
+use net_manager_engine::linux_credentials::OpenVpnCredentialStore;
 
 #[cfg(test)]
 fn select_connect_ports(
@@ -54,20 +58,20 @@ fn prepare_xray_listener_ports(
 async fn linux_xray_connect(
     client: &crate::daemon_client::DaemonClient,
     vault: &net_manager_core::config_vault::ConfigVault,
-    state: &AppState,
     profile: &Profile,
 ) -> Result<TunnelStatus, String> {
-    let mut params = prepare_linux_xray_tun_params(vault, profile)?;
-    if let Some(dir) = crate::geo_assets::ensure_geo_assets(state, profile).await? {
-        params.geo_assets = Some(crate::geo_assets::protocol_geo_assets(&dir)?);
-        check_xray_frame_size(&params)
-            .map_err(|_| "geo assets are too large for daemon protocol".to_string())?;
-    }
-    let result: XrayConnectResult = client
-        .request(method::XRAY_CONNECT, params)
+    let root = vault.root().to_path_buf();
+    let profile = profile.clone();
+    client
+        .engine_request(move |engine| {
+            engine.connect(
+                &net_manager_core::config_vault::ConfigVault::new(root),
+                &profile,
+                None,
+                &(),
+            )
+        })
         .await
-        .map_err(|err| crate::daemon_client::user_message(&err))?;
-    Ok(linux_xray_tunnel_status(result.status, profile))
 }
 
 /// Re-send the profile's current generated config to the running Xray tunnel:
@@ -79,20 +83,18 @@ async fn linux_xray_connect(
 async fn linux_xray_reload(
     client: &crate::daemon_client::DaemonClient,
     vault: &net_manager_core::config_vault::ConfigVault,
-    state: &AppState,
     profile: &Profile,
 ) -> Result<TunnelStatus, String> {
-    let mut params = prepare_linux_xray_tun_params(vault, profile)?;
-    if let Some(dir) = crate::geo_assets::ensure_geo_assets(state, profile).await? {
-        params.geo_assets = Some(crate::geo_assets::protocol_geo_assets(&dir)?);
-        check_xray_frame_size(&params)
-            .map_err(|_| "geo assets are too large for daemon protocol".to_string())?;
-    }
-    let result: XrayConnectResult = client
-        .request(method::XRAY_RELOAD, params)
+    let root = vault.root().to_path_buf();
+    let profile = profile.clone();
+    client
+        .engine_request(move |engine| {
+            engine.reload_xray(
+                &net_manager_core::config_vault::ConfigVault::new(root),
+                &profile,
+            )
+        })
         .await
-        .map_err(|err| crate::daemon_client::user_message(&err))?;
-    Ok(linux_xray_tunnel_status(result.status, profile))
 }
 
 #[cfg(target_os = "linux")]
@@ -100,15 +102,10 @@ pub(crate) async fn linux_xray_status_result(
     client: &crate::daemon_client::DaemonClient,
     profile: &Profile,
 ) -> Result<XrayStatusResult, String> {
+    let id = profile.id.clone();
     client
-        .request(
-            method::XRAY_STATUS,
-            XrayProfileParams {
-                profile_id: profile.id.clone(),
-            },
-        )
+        .engine_request(move |engine| engine.xray_status_result(&id))
         .await
-        .map_err(|err| crate::daemon_client::user_message(&err))
 }
 
 #[cfg(target_os = "linux")]
@@ -127,33 +124,17 @@ async fn linux_xray_disconnect(
     client: &crate::daemon_client::DaemonClient,
     profile: &Profile,
 ) -> Result<TunnelStatus, String> {
-    let result: XrayDisconnectResult = client
-        .request(
-            method::XRAY_DISCONNECT,
-            XrayProfileParams {
-                profile_id: profile.id.clone(),
-            },
-        )
+    let profile = profile.clone();
+    client
+        .engine_request(move |engine| engine.disconnect(&profile))
         .await
-        .map_err(|err| crate::daemon_client::user_message(&err))?;
-    if !result.stopped {
-        return Err("Xray daemon did not confirm disconnect".into());
-    }
-    Ok(TunnelStatus {
-        profile_id: profile.id.clone(),
-        state: TunnelState::Stopped,
-        message: None,
-        interface_name: None,
-        failover: None,
-        watchdog: None,
-    })
 }
 
 #[cfg(target_os = "linux")]
 async fn linux_openvpn_connect(
     client: &crate::daemon_client::DaemonClient,
     vault: &net_manager_core::config_vault::ConfigVault,
-    credential_store: &OpenVpnCredentialStore,
+    credential_store: &std::sync::Arc<OpenVpnCredentialStore>,
     profile: &Profile,
 ) -> Result<TunnelStatus, String> {
     linux_openvpn_connect_with_credentials(client, vault, credential_store, profile, None, false)
@@ -164,59 +145,65 @@ async fn linux_openvpn_connect(
 async fn linux_openvpn_connect_with_credentials(
     client: &crate::daemon_client::DaemonClient,
     vault: &net_manager_core::config_vault::ConfigVault,
-    credential_store: &OpenVpnCredentialStore,
+    credential_store: &std::sync::Arc<OpenVpnCredentialStore>,
     profile: &Profile,
     supplied_credentials: Option<OpenVpnCredentials>,
     remember: bool,
 ) -> Result<TunnelStatus, String> {
-    let explicit = supplied_credentials.is_some();
-    let (request, load_notice) = prepare_linux_openvpn_request(
-        vault,
-        credential_store,
-        profile,
-        supplied_credentials,
-        profile.effective_routes(),
-        method::OPENVPN_CONNECT,
-    )?;
-    let credentials = request.credentials.clone();
-    let result: OpenVpnConnectResult = client
-        .request(method::OPENVPN_CONNECT, request)
-        .await
-        .map_err(|err| crate::daemon_client::user_message(&err))?;
-    let notice = if !explicit {
-        load_notice
-    } else if remember {
+    let credentials = supplied_credentials.clone();
+    let root = vault.root().to_path_buf();
+    let connecting = profile.clone();
+    let source = credential_store.clone();
+    let mut status = client
+        .engine_request(move |engine| {
+            engine.connect(
+                &net_manager_core::config_vault::ConfigVault::new(root),
+                &connecting,
+                supplied_credentials,
+                source.as_ref(),
+            )
+        })
+        .await?;
+    let explicit = credentials.is_some();
+    let notice = if explicit && remember {
         credential_store.remember(&profile.id, credentials.as_ref().unwrap())
-    } else {
+    } else if explicit {
         let legacy = openvpn_credentials_path(vault, profile).ok();
         credential_store
             .forget(&profile.id, legacy.as_deref())
             .err()
             .map(|_| "OpenVPN started, but old remembered credentials could not be removed")
+    } else {
+        None
     };
-    Ok(finish_openvpn_connect(result.status, notice))
+    if let Some(notice) = notice {
+        status.message = Some(match status.message.take() {
+            Some(message) => format!("{message}; {notice}"),
+            None => notice.into(),
+        });
+    }
+    Ok(status)
 }
 
 #[cfg(target_os = "linux")]
 async fn linux_openvpn_probe(
     client: &crate::daemon_client::DaemonClient,
     vault: &net_manager_core::config_vault::ConfigVault,
-    credential_store: &OpenVpnCredentialStore,
+    credential_store: &std::sync::Arc<OpenVpnCredentialStore>,
     profile: &Profile,
 ) -> Result<Vec<AnalyzedRoute>, String> {
-    let (request, _) = prepare_linux_openvpn_request(
-        vault,
-        credential_store,
-        profile,
-        None,
-        Vec::new(),
-        method::OPENVPN_PROBE,
-    )?;
-    let result: OpenVpnProbeResult = client
-        .request(method::OPENVPN_PROBE, request)
+    let root = vault.root().to_path_buf();
+    let profile = profile.clone();
+    let source = credential_store.clone();
+    client
+        .engine_request(move |engine| {
+            engine.probe_openvpn_routes(
+                &net_manager_core::config_vault::ConfigVault::new(root),
+                &profile,
+                source.as_ref(),
+            )
+        })
         .await
-        .map_err(|err| crate::daemon_client::user_message(&err))?;
-    Ok(result.routes)
 }
 
 #[cfg(target_os = "linux")]
@@ -224,15 +211,10 @@ pub(crate) async fn linux_openvpn_status_result(
     client: &crate::daemon_client::DaemonClient,
     profile: &Profile,
 ) -> Result<OpenVpnStatusResult, String> {
+    let id = profile.id.clone();
     client
-        .request(
-            method::OPENVPN_STATUS,
-            OpenVpnProfileParams {
-                profile_id: profile.id.clone(),
-            },
-        )
+        .engine_request(move |engine| engine.openvpn_status_result(&id))
         .await
-        .map_err(|err| crate::daemon_client::user_message(&err))
 }
 
 #[cfg(target_os = "linux")]
@@ -250,26 +232,10 @@ async fn linux_openvpn_disconnect(
     client: &crate::daemon_client::DaemonClient,
     profile: &Profile,
 ) -> Result<TunnelStatus, String> {
-    let result: OpenVpnDisconnectResult = client
-        .request(
-            method::OPENVPN_DISCONNECT,
-            OpenVpnProfileParams {
-                profile_id: profile.id.clone(),
-            },
-        )
+    let profile = profile.clone();
+    client
+        .engine_request(move |engine| engine.disconnect(&profile))
         .await
-        .map_err(|err| crate::daemon_client::user_message(&err))?;
-    if !result.stopped {
-        return Err("OpenVPN daemon did not confirm disconnect".into());
-    }
-    Ok(TunnelStatus {
-        profile_id: profile.id.clone(),
-        state: TunnelState::Stopped,
-        message: None,
-        interface_name: None,
-        watchdog: None,
-        failover: None,
-    })
 }
 
 #[cfg(target_os = "linux")]
@@ -278,12 +244,18 @@ async fn linux_wireguard_connect(
     vault: &net_manager_core::config_vault::ConfigVault,
     profile: &Profile,
 ) -> Result<TunnelStatus, String> {
-    let params = wireguard_connect_params(vault, profile)?;
-    let result: WireGuardConnectResult = client
-        .request(method::WIREGUARD_CONNECT, params)
+    let root = vault.root().to_path_buf();
+    let profile = profile.clone();
+    client
+        .engine_request(move |engine| {
+            engine.connect(
+                &net_manager_core::config_vault::ConfigVault::new(root),
+                &profile,
+                None,
+                &(),
+            )
+        })
         .await
-        .map_err(|err| crate::daemon_client::user_message(&err))?;
-    Ok(linux_wireguard_tunnel_status(result.status))
 }
 
 #[cfg(target_os = "linux")]
@@ -291,16 +263,10 @@ pub(crate) async fn linux_wireguard_status_result(
     client: &crate::daemon_client::DaemonClient,
     profile: &Profile,
 ) -> Result<WireGuardStatusResult, String> {
-    let status: WireGuardStatusResult = client
-        .request(
-            method::WIREGUARD_STATUS,
-            WireGuardProfileParams {
-                profile_id: profile.id.clone(),
-            },
-        )
+    let id = profile.id.clone();
+    client
+        .engine_request(move |engine| engine.wireguard_status_result(&id))
         .await
-        .map_err(|err| crate::daemon_client::user_message(&err))?;
-    Ok(status)
 }
 
 #[cfg(target_os = "linux")]
@@ -318,28 +284,52 @@ async fn linux_wireguard_disconnect(
     client: &crate::daemon_client::DaemonClient,
     profile: &Profile,
 ) -> Result<TunnelStatus, String> {
-    let result: WireGuardDisconnectResult = client
-        .request(
-            method::WIREGUARD_DISCONNECT,
-            WireGuardProfileParams {
-                profile_id: profile.id.clone(),
-            },
-        )
+    let profile = profile.clone();
+    client
+        .engine_request(move |engine| engine.disconnect(&profile))
         .await
-        .map_err(|err| crate::daemon_client::user_message(&err))?;
-    if !result.stopped {
-        return Err("WireGuard daemon did not confirm disconnect".into());
-    }
-    Ok(TunnelStatus {
-        profile_id: profile.id.clone(),
-        state: TunnelState::Stopped,
-        message: None,
-        watchdog: None,
-        interface_name: None,
-        failover: None,
-    })
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) async fn linux_profile_status(
+    client: &crate::daemon_client::DaemonClient,
+    state: &AppState,
+    profile: &Profile,
+) -> Result<TunnelStatus, String> {
+    match profile.backend {
+        TunnelBackend::WireGuard => linux_wireguard_status(client, profile).await,
+        TunnelBackend::OpenVpn => linux_openvpn_status(client, profile).await,
+        TunnelBackend::Xray if profile.xray_mode == XrayMode::Tun => {
+            linux_xray_status(client, profile).await
+        }
+        _ => {
+            let root = state.data_dir().to_path_buf();
+            let id = profile.id.clone();
+            let interface = profile.interface_name.clone();
+            let proxy = profile.backend == TunnelBackend::Xray;
+            client
+                .engine_request(move |engine| {
+                    let engine = engine.with_data_root(root);
+                    if proxy {
+                        engine.local_proxy_status(&id)
+                    } else {
+                        engine.static_status(&id, &interface)
+                    }
+                })
+                .await
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn retain_linux_connection(state: &AppState, profile: Profile) -> Result<(), String> {
+    let root = state.data_dir().to_path_buf();
+    crate::daemon_client::DaemonClient::system()
+        .engine_request(move |engine| engine.with_data_root(root).retain_connection(&profile))
+        .await
+}
+
+#[cfg(any(not(target_os = "linux"), test))]
 async fn cleanup_stale_routes_before_connect(
     runtime: &mut RuntimeState,
     profile: &Profile,
@@ -386,6 +376,7 @@ async fn connect_profile_inner(
             &profile,
         )
         .await?;
+        retain_linux_connection(state, profile).await?;
         let _ = app.emit("route-changed", ());
         return Ok(status);
     }
@@ -398,6 +389,7 @@ async fn connect_profile_inner(
             &profile,
         )
         .await?;
+        retain_linux_connection(state, profile).await?;
         let _ = app.emit("route-changed", ());
         return Ok(status);
     }
@@ -408,7 +400,6 @@ async fn connect_profile_inner(
         let mut status = linux_xray_connect(
             &crate::daemon_client::DaemonClient::system(),
             &state.config_vault,
-            state,
             &profile,
         )
         .await?;
@@ -418,189 +409,195 @@ async fn connect_profile_inner(
                 None => notice,
             });
         }
+        retain_linux_connection(state, profile).await?;
         let _ = app.emit("route-changed", ());
         return Ok(status);
     }
-    if profile.backend != TunnelBackend::None {
-        state
-            .resolve_backend_executable(profile.backend)
-            .map_err(|e| e.to_string())?;
+    #[cfg(target_os = "linux")]
+    {
+        let root = state.data_dir().to_path_buf();
+        let vault = state.config_vault.root().to_path_buf();
+        let status = crate::daemon_client::DaemonClient::system()
+            .engine_request(move |engine| {
+                engine.with_data_root(root).connect(
+                    &net_manager_core::config_vault::ConfigVault::new(vault),
+                    &profile,
+                    None,
+                    &(),
+                )
+            })
+            .await?;
+        let _ = app.emit("route-changed", ());
+        Ok(status)
     }
-    // Xray TUN mode creates a Wintun interface, which requires elevation.
-    if profile.backend == TunnelBackend::Xray && profile.xray_mode == XrayMode::Tun {
-        let elevated = crate::elevation::is_elevated().map_err(|e| e.to_string())?;
-        if !elevated {
-            return Err(
-                "Xray TUN mode requires administrator privileges. Restart the app elevated.".into(),
-            );
+    #[cfg(not(target_os = "linux"))]
+    {
+        if profile.backend != TunnelBackend::None {
+            state
+                .resolve_backend_executable(profile.backend)
+                .map_err(|e| e.to_string())?;
         }
-        // TUN mode captures traffic at the interface level — system proxy is
-        // not needed and must not be applied.
-        if profile.use_system_proxy {
+        // Xray TUN mode creates a Wintun interface, which requires elevation.
+        if profile.backend == TunnelBackend::Xray && profile.xray_mode == XrayMode::Tun {
+            let elevated = crate::elevation::is_elevated().map_err(|e| e.to_string())?;
+            if !elevated {
+                return Err(
+                    "Xray TUN mode requires administrator privileges. Restart the app elevated."
+                        .into(),
+                );
+            }
+            // TUN mode captures traffic at the interface level — system proxy is
+            // not needed and must not be applied.
+            if profile.use_system_proxy {
+                profile.use_system_proxy = false;
+            }
+        }
+        // A profile imported from another platform must still connect where the
+        // system proxy is unavailable, just without touching proxy settings.
+        if !super::system::system_proxy_supported() {
             profile.use_system_proxy = false;
         }
-    }
-    // A profile imported from another platform must still connect where the
-    // system proxy is unavailable, just without touching proxy settings.
-    if !super::system::system_proxy_supported() {
-        profile.use_system_proxy = false;
-    }
-    let mut profiles = state.profiles.load().map_err(|e| e.to_string())?.profiles;
-    let mut runtime = state.runtime.lock().await;
-    cleanup_stale_routes_before_connect(&mut runtime, &profile).await?;
-    let port_notice = if profile.backend == TunnelBackend::Xray {
-        prepare_xray_listener_ports(state, &mut profile, &mut profiles)?
-    } else {
-        None
-    };
-    let candidate_analysis = analysis::analyze_profile(&profile)
-        .map_err(|e| format!("cannot analyze profile config: {e}"))?;
-    let conflicts =
-        active_profile_conflicts(&mut runtime.tunnels, &id, &candidate_analysis, &profiles)?;
-    if !conflicts.is_empty() {
-        let joined = conflicts
-            .iter()
-            .map(|c| c.message.as_str())
-            .collect::<Vec<_>>()
-            .join("; ");
-        return Err(format!(
-            "connection blocked by active profile conflict: {joined}"
-        ));
-    }
-    if profile.use_system_proxy {
-        if let Some(owner) = runtime.proxy.ownership() {
+        let mut profiles = state.profiles.load().map_err(|e| e.to_string())?.profiles;
+        let mut runtime = state.runtime.lock().await;
+        cleanup_stale_routes_before_connect(&mut runtime, &profile).await?;
+        let port_notice = if profile.backend == TunnelBackend::Xray {
+            prepare_xray_listener_ports(state, &mut profile, &mut profiles)?
+        } else {
+            None
+        };
+        let candidate_analysis = analysis::analyze_profile(&profile)
+            .map_err(|e| format!("cannot analyze profile config: {e}"))?;
+        let conflicts =
+            active_profile_conflicts(&mut runtime.tunnels, &id, &candidate_analysis, &profiles)?;
+        if !conflicts.is_empty() {
+            let joined = conflicts
+                .iter()
+                .map(|c| c.message.as_str())
+                .collect::<Vec<_>>()
+                .join("; ");
             return Err(format!(
-                "system proxy is already owned by profile '{}'",
-                owner.profile_id
+                "connection blocked by active profile conflict: {joined}"
             ));
         }
-    }
-    let mut status = runtime
-        .tunnels
-        .connect(&profile)
-        .map_err(|e| e.to_string())?;
-    if let Some(notice) = port_notice {
-        status.message = Some(match status.message.take() {
-            Some(existing) => format!("{existing}; {notice}"),
-            None => notice,
-        });
-    }
-
-    let mut proxy_applied = false;
-    if profile.use_system_proxy {
-        let port = profile.xray_socks_port.unwrap_or(0);
-        if !wait_for_tcp_listener(port, Duration::from_secs(10), Duration::from_millis(200)).await {
-            let mut message =
-                format!("timed out waiting for Xray SOCKS listener on 127.0.0.1:{port}");
-            if let Err(cleanup) = runtime.tunnels.disconnect(&profile) {
-                message.push_str(&format!("; cleanup disconnect failed: {cleanup}"));
+        if profile.use_system_proxy {
+            if let Some(owner) = runtime.proxy.ownership() {
+                return Err(format!(
+                    "system proxy is already owned by profile '{}'",
+                    owner.profile_id
+                ));
             }
-            return Err(message);
         }
-        if let Err(err) = runtime
-            .proxy
-            .apply(&profile.id, port, &profile.proxy_bypass)
-        {
-            let mut message = format!("failed to apply system proxy: {err}");
-            if let Err(cleanup) = runtime.tunnels.disconnect(&profile) {
-                message.push_str(&format!("; cleanup disconnect failed: {cleanup}"));
-            }
-            return Err(message);
+        let mut status = runtime
+            .tunnels
+            .connect(&profile)
+            .map_err(|e| e.to_string())?;
+        if let Some(notice) = port_notice {
+            status.message = Some(match status.message.take() {
+                Some(existing) => format!("{existing}; {notice}"),
+                None => notice,
+            });
         }
-        proxy_applied = true;
-    }
 
-    // The app is the sole route installer. When the user has specified
-    // explicit policy routes (`profile.routes`), install those. When they have
-    // not, derive routes from the backend's own route information (WireGuard
-    // AllowedIPs, OpenVPN pushed routes) and install them through
-    // `PolicyManager`. This ensures consistent ownership, rollback, and
-    // conflict detection regardless of whether policy routes are set.
-    let install_routes = if !profile.routes.is_empty() {
-        profile.routes.clone()
-    } else {
-        let pushed = if profile.backend == TunnelBackend::OpenVpn {
-            wait_for_openvpn_pushed_routes(
-                &mut runtime.tunnels,
-                &profile,
-                Duration::from_secs(20),
-                Duration::from_millis(250),
-            )
-            .await
-        } else {
-            Vec::new()
-        };
-        derive_installable_routes(&candidate_analysis, &pushed, profile.backend)
-    };
-
-    let wants_attach = profile.wait_for_interface || !profile.endpoint_bypasses.is_empty();
-    if !install_routes.is_empty() || wants_attach {
-        let install_interface = match resolve_install_interface(&profile) {
-            Some(name) => name,
-            None => {
-                if !install_routes.is_empty() {
-                    // No interface name available — skip route installation with a
-                    // notice. This happens for OpenVPN profiles without an explicit
-                    // interface name; the backend is up but routes are not installed.
-                    status.message = Some(
-                        "tunnel is up but routes were not installed: \
-                         set a target interface in the profile to enable app-owned routing"
-                            .into(),
-                    );
-                    let _ = app.emit("route-changed", ());
-                    return Ok(status);
-                }
-                // Bypass-only profile: nothing binds to a link by name.
-                String::new()
-            }
-        };
-        let install_profile = Profile {
-            interface_name: install_interface,
-            routes: install_routes,
-            ..profile.clone()
-        };
-        // Deferred attach profiles arm the daemon and return immediately —
-        // reconcile installs the routes when the link appears. Others keep
-        // polling briefly for the freshly created tunnel interface.
-        let interfaces = if profile.wait_for_interface {
-            explorer::list_interfaces().unwrap_or_default()
-        } else {
-            let mut matched_interfaces: Option<Vec<NetworkInterface>> = None;
-            let mut list_error: Option<String> = None;
-            for _ in 0..40 {
-                match explorer::list_interfaces() {
-                    Ok(interfaces) => {
-                        if has_target_interface(&install_profile, &interfaces) {
-                            matched_interfaces = Some(interfaces);
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        list_error = Some(e.to_string());
-                        break;
-                    }
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-            }
-            if let Some(err) = list_error {
-                let mut message = format!("failed to enumerate interfaces: {err}");
-                if proxy_applied {
-                    if let Err(cleanup) = runtime.proxy.restore(&id) {
-                        message.push_str(&format!("; proxy restore failed: {cleanup}"));
-                    }
-                }
+        let mut proxy_applied = false;
+        if profile.use_system_proxy {
+            let port = profile.xray_socks_port.unwrap_or(0);
+            if !wait_for_tcp_listener(port, Duration::from_secs(10), Duration::from_millis(200))
+                .await
+            {
+                let mut message =
+                    format!("timed out waiting for Xray SOCKS listener on 127.0.0.1:{port}");
                 if let Err(cleanup) = runtime.tunnels.disconnect(&profile) {
                     message.push_str(&format!("; cleanup disconnect failed: {cleanup}"));
                 }
                 return Err(message);
             }
-            match matched_interfaces {
-                Some(interfaces) => interfaces,
+            if let Err(err) = runtime
+                .proxy
+                .apply(&profile.id, port, &profile.proxy_bypass)
+            {
+                let mut message = format!("failed to apply system proxy: {err}");
+                if let Err(cleanup) = runtime.tunnels.disconnect(&profile) {
+                    message.push_str(&format!("; cleanup disconnect failed: {cleanup}"));
+                }
+                return Err(message);
+            }
+            proxy_applied = true;
+        }
+
+        // The app is the sole route installer. When the user has specified
+        // explicit policy routes (`profile.routes`), install those. When they have
+        // not, derive routes from the backend's own route information (WireGuard
+        // AllowedIPs, OpenVPN pushed routes) and install them through
+        // `PolicyManager`. This ensures consistent ownership, rollback, and
+        // conflict detection regardless of whether policy routes are set.
+        let install_routes = if !profile.routes.is_empty() {
+            profile.routes.clone()
+        } else {
+            let pushed = if profile.backend == TunnelBackend::OpenVpn {
+                wait_for_openvpn_pushed_routes(
+                    &mut runtime.tunnels,
+                    &profile,
+                    Duration::from_secs(20),
+                    Duration::from_millis(250),
+                )
+                .await
+            } else {
+                Vec::new()
+            };
+            derive_installable_routes(&candidate_analysis, &pushed, profile.backend)
+        };
+
+        let wants_attach = profile.wait_for_interface || !profile.endpoint_bypasses.is_empty();
+        if !install_routes.is_empty() || wants_attach {
+            let install_interface = match resolve_install_interface(&profile) {
+                Some(name) => name,
                 None => {
-                    let mut message = format!(
-                        "timed out waiting for interface '{}' to come up",
-                        install_profile.interface_name
-                    );
+                    if !install_routes.is_empty() {
+                        // No interface name available — skip route installation with a
+                        // notice. This happens for OpenVPN profiles without an explicit
+                        // interface name; the backend is up but routes are not installed.
+                        status.message = Some(
+                            "tunnel is up but routes were not installed: \
+                         set a target interface in the profile to enable app-owned routing"
+                                .into(),
+                        );
+                        let _ = app.emit("route-changed", ());
+                        return Ok(status);
+                    }
+                    // Bypass-only profile: nothing binds to a link by name.
+                    String::new()
+                }
+            };
+            let install_profile = Profile {
+                interface_name: install_interface,
+                routes: install_routes,
+                ..profile.clone()
+            };
+            // Deferred attach profiles arm the daemon and return immediately —
+            // reconcile installs the routes when the link appears. Others keep
+            // polling briefly for the freshly created tunnel interface.
+            let interfaces = if profile.wait_for_interface {
+                explorer::list_interfaces().unwrap_or_default()
+            } else {
+                let mut matched_interfaces: Option<Vec<NetworkInterface>> = None;
+                let mut list_error: Option<String> = None;
+                for _ in 0..40 {
+                    match explorer::list_interfaces() {
+                        Ok(interfaces) => {
+                            if has_target_interface(&install_profile, &interfaces) {
+                                matched_interfaces = Some(interfaces);
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            list_error = Some(e.to_string());
+                            break;
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                }
+                if let Some(err) = list_error {
+                    let mut message = format!("failed to enumerate interfaces: {err}");
                     if proxy_applied {
                         if let Err(cleanup) = runtime.proxy.restore(&id) {
                             message.push_str(&format!("; proxy restore failed: {cleanup}"));
@@ -611,37 +608,55 @@ async fn connect_profile_inner(
                     }
                     return Err(message);
                 }
-            }
-        };
-        if profile.wait_for_interface
-            && !install_profile.routes.is_empty()
-            && !has_target_interface(&install_profile, &interfaces)
-        {
-            status.message = Some(format!(
-                "routes are armed and will install when interface '{}' appears",
-                install_profile.interface_name
-            ));
-        }
-        if let Err(err) = runtime
-            .routes
-            .apply_profile(&install_profile, &interfaces)
-            .await
-        {
-            let mut message = err;
-            if proxy_applied {
-                if let Err(cleanup) = runtime.proxy.restore(&id) {
-                    message.push_str(&format!("; proxy restore failed: {cleanup}"));
+                match matched_interfaces {
+                    Some(interfaces) => interfaces,
+                    None => {
+                        let mut message = format!(
+                            "timed out waiting for interface '{}' to come up",
+                            install_profile.interface_name
+                        );
+                        if proxy_applied {
+                            if let Err(cleanup) = runtime.proxy.restore(&id) {
+                                message.push_str(&format!("; proxy restore failed: {cleanup}"));
+                            }
+                        }
+                        if let Err(cleanup) = runtime.tunnels.disconnect(&profile) {
+                            message.push_str(&format!("; cleanup disconnect failed: {cleanup}"));
+                        }
+                        return Err(message);
+                    }
                 }
+            };
+            if profile.wait_for_interface
+                && !install_profile.routes.is_empty()
+                && !has_target_interface(&install_profile, &interfaces)
+            {
+                status.message = Some(format!(
+                    "routes are armed and will install when interface '{}' appears",
+                    install_profile.interface_name
+                ));
             }
-            if let Err(cleanup) = runtime.tunnels.disconnect(&profile) {
-                message.push_str(&format!("; cleanup disconnect failed: {cleanup}"));
+            if let Err(err) = runtime
+                .routes
+                .apply_profile(&install_profile, &interfaces)
+                .await
+            {
+                let mut message = err;
+                if proxy_applied {
+                    if let Err(cleanup) = runtime.proxy.restore(&id) {
+                        message.push_str(&format!("; proxy restore failed: {cleanup}"));
+                    }
+                }
+                if let Err(cleanup) = runtime.tunnels.disconnect(&profile) {
+                    message.push_str(&format!("; cleanup disconnect failed: {cleanup}"));
+                }
+                return Err(message);
             }
-            return Err(message);
         }
-    }
 
-    let _ = app.emit("route-changed", ());
-    Ok(status)
+        let _ = app.emit("route-changed", ());
+        Ok(status)
+    }
 }
 
 #[tauri::command]
@@ -682,6 +697,7 @@ async fn connect_openvpn_with_credentials_inner(
             remember,
         )
         .await?;
+        retain_linux_connection(state, profile).await?;
         let _ = app.emit("route-changed", ());
         Ok(status)
     }
@@ -733,36 +749,44 @@ async fn disconnect_profile_inner(
         let _ = app.emit("route-changed", ());
         return Ok(status);
     }
-    let mut runtime = state.runtime.lock().await;
-    if runtime
-        .proxy
-        .ownership()
-        .map(|owner| owner.profile_id.as_str())
-        == Some(id.as_str())
+    #[cfg(target_os = "linux")]
     {
-        runtime
+        let root = state.data_dir().to_path_buf();
+        let status = crate::daemon_client::DaemonClient::system()
+            .engine_request(move |engine| engine.with_data_root(root).disconnect(&profile))
+            .await?;
+        let _ = app.emit("route-changed", ());
+        Ok(status)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let mut runtime = state.runtime.lock().await;
+        if runtime
             .proxy
-            .restore(&id)
-            .map_err(|e| format!("failed to restore system proxy: {e}"))?;
-    }
-    if runtime.routes.has_applied(&id).await? {
-        runtime.routes.remove_profile(&id).await?;
-    }
-    let status = runtime.tunnels.disconnect(&profile);
-    match status {
-        Ok(status) => {
-            let _ = app.emit("route-changed", ());
-            Ok(status)
+            .ownership()
+            .map(|owner| owner.profile_id.as_str())
+            == Some(id.as_str())
+        {
+            runtime
+                .proxy
+                .restore(&id)
+                .map_err(|e| format!("failed to restore system proxy: {e}"))?;
         }
-        Err(status_err) => Err(status_err.to_string()),
+        if runtime.routes.has_applied(&id).await? {
+            runtime.routes.remove_profile(&id).await?;
+        }
+        let status = runtime.tunnels.disconnect(&profile);
+        match status {
+            Ok(status) => {
+                let _ = app.emit("route-changed", ());
+                Ok(status)
+            }
+            Err(status_err) => Err(status_err.to_string()),
+        }
     }
 }
 
-/// Authoritative per-profile status: on Linux the network daemon owns WG,
-/// OpenVPN, and Xray-TUN tunnels, so those are queried over the daemon socket;
-/// everything else falls back to the in-process tunnel manager. Used by both
-/// `get_tunnel_statuses` and `get_route_map` so the UI never disagrees with
-/// the daemon about what is running.
+/// Authoritative shared-backend status. The GUI owns no Linux tunnel children.
 pub(crate) async fn collect_tunnel_statuses(
     state: &AppState,
     profiles: &[Profile],
@@ -772,48 +796,18 @@ pub(crate) async fn collect_tunnel_statuses(
         let mut statuses = Vec::with_capacity(profiles.len());
         let client = crate::daemon_client::DaemonClient::system();
         for profile in profiles {
-            if profile.backend == TunnelBackend::WireGuard {
-                statuses.push(
-                    linux_wireguard_status(&client, profile)
-                        .await
-                        .unwrap_or_else(|err| TunnelStatus {
-                            profile_id: profile.id.clone(),
-                            state: TunnelState::Failed,
-                            watchdog: None,
-                            message: Some(err),
-                            interface_name: None,
-                            failover: None,
-                        }),
-                );
-            } else if profile.backend == TunnelBackend::OpenVpn {
-                statuses.push(
-                    linux_openvpn_status(&client, profile)
-                        .await
-                        .unwrap_or_else(|err| TunnelStatus {
-                            profile_id: profile.id.clone(),
-                            watchdog: None,
-                            state: TunnelState::Failed,
-                            message: Some(err),
-                            interface_name: None,
-                            failover: None,
-                        }),
-                );
-            } else if profile.backend == TunnelBackend::Xray && profile.xray_mode == XrayMode::Tun {
-                statuses.push(
-                    linux_xray_status(&client, profile)
-                        .await
-                        .unwrap_or_else(|err| TunnelStatus {
-                            watchdog: None,
-                            profile_id: profile.id.clone(),
-                            state: TunnelState::Failed,
-                            message: Some(err),
-                            interface_name: None,
-                            failover: None,
-                        }),
-                );
-            } else {
-                statuses.push(state.runtime.lock().await.tunnels.status(profile));
-            }
+            statuses.push(
+                linux_profile_status(&client, state, profile)
+                    .await
+                    .unwrap_or_else(|error| TunnelStatus {
+                        profile_id: profile.id.clone(),
+                        state: TunnelState::Failed,
+                        message: Some(error),
+                        interface_name: None,
+                        failover: None,
+                        watchdog: None,
+                    }),
+            );
         }
         Ok(statuses)
     }
@@ -852,7 +846,7 @@ pub(crate) async fn openvpn_plan(
     {
         let (request, _) = prepare_linux_openvpn_request(
             &state.config_vault,
-            &state.openvpn_credentials,
+            state.openvpn_credentials.as_ref(),
             &profile,
             None,
             profile.effective_routes(),
@@ -887,7 +881,6 @@ pub(crate) async fn reload_xray_profile(
         linux_xray_reload(
             &crate::daemon_client::DaemonClient::system(),
             &state.config_vault,
-            &state,
             &profile,
         )
         .await
@@ -1075,10 +1068,10 @@ mod tests {
     use net_manager_core::daemon_protocol::{OpenVpnConnectionState, OpenVpnWarning};
 
     #[cfg(target_os = "linux")]
-    fn test_credential_store() -> OpenVpnCredentialStore {
-        OpenVpnCredentialStore::new(Box::new(
-            crate::openvpn_credentials::tests::FakeKeyring::default(),
-        ))
+    fn test_credential_store() -> std::sync::Arc<OpenVpnCredentialStore> {
+        std::sync::Arc::new(OpenVpnCredentialStore::new(Box::new(
+            crate::test_support::FakeKeyring::default(),
+        )))
     }
 
     #[cfg(target_os = "linux")]
@@ -1275,7 +1268,7 @@ mod tests {
                 std::io::Write::write_all(&mut file, &serde_json::to_vec(&credentials).unwrap())
             })
             .unwrap();
-        let keyring = crate::openvpn_credentials::tests::FakeKeyring::default();
+        let keyring = crate::test_support::FakeKeyring::default();
         let entries = keyring.entries.clone();
         let store = OpenVpnCredentialStore::new(Box::new(keyring));
 
@@ -1398,9 +1391,9 @@ mod tests {
             }
         });
         let client = crate::daemon_client::DaemonClient::new(socket);
-        let keyring = crate::openvpn_credentials::tests::FakeKeyring::default();
+        let keyring = crate::test_support::FakeKeyring::default();
         let entries = keyring.entries.clone();
-        let store = OpenVpnCredentialStore::new(Box::new(keyring));
+        let store = std::sync::Arc::new(OpenVpnCredentialStore::new(Box::new(keyring)));
         let result = linux_openvpn_connect_with_credentials(
             &client,
             &vault,
@@ -1455,7 +1448,7 @@ mod tests {
         assert_eq!(
             prepare_linux_openvpn_request(
                 &vault,
-                &store,
+                store.as_ref(),
                 &profile,
                 None,
                 Vec::new(),
@@ -1952,7 +1945,7 @@ mod tests {
         };
         let result = finish_openvpn_connect(
             status,
-            Some(crate::openvpn_credentials::SESSION_ONLY_NOTICE),
+            Some(net_manager_engine::linux_credentials::SESSION_ONLY_NOTICE),
         );
         assert_eq!(result.state, TunnelState::Running);
         let message = result.message.unwrap();
@@ -2040,10 +2033,7 @@ mod tests {
             }
         });
         let client = crate::daemon_client::DaemonClient::new(socket.clone());
-        let state = app_state(&dir);
-        let connected = linux_xray_connect(&client, &vault, &state, &p)
-            .await
-            .unwrap();
+        let connected = linux_xray_connect(&client, &vault, &p).await.unwrap();
         assert_eq!(connected.state, TunnelState::Running);
         assert!(connected.message.unwrap().contains("IPv6 is not covered"));
         let restarted_client = crate::daemon_client::DaemonClient::new(socket);

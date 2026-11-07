@@ -4,6 +4,7 @@ use super::args::UpArgs;
 use super::auth;
 use super::ctx::Ctx;
 use super::endpoints;
+#[cfg(test)]
 use super::hold;
 use super::library;
 use crate::prompt;
@@ -11,31 +12,11 @@ use crate::render::{kind_of, row_of, table};
 use crate::target::{self, Input};
 use net_manager_core::daemon_protocol::OpenVpnCredentials;
 use net_manager_core::models::{Profile, TunnelBackend, TunnelState, TunnelStatus};
-use net_manager_engine::linux::{openvpn_requirements, CredentialSource};
+use net_manager_engine::linux::openvpn_requirements;
 use net_manager_engine::linux_engine::LinuxEngine;
 use serde_json::{json, Value};
 
 pub type Output = (Value, String);
-
-/// No remembered credentials: the CLI has no keyring, so OpenVPN asks every
-/// time (terminal or `--auth-stdin`).
-struct NoRemembered;
-
-impl CredentialSource for NoRemembered {
-    fn load(
-        &self,
-        _: &str,
-        _: &std::path::Path,
-    ) -> Result<
-        (
-            Option<net_manager_core::daemon_protocol::OpenVpnCredentials>,
-            Option<&'static str>,
-        ),
-        String,
-    > {
-        Ok((None, None))
-    }
-}
 
 pub fn ls(ctx: &Ctx) -> Result<Output, String> {
     let profiles = ctx.profiles()?;
@@ -119,7 +100,7 @@ fn active_node(ctx: &Ctx, profile: &Profile, status: &TunnelStatus) -> String {
     endpoints::active_name(ctx, profile).unwrap_or_default()
 }
 
-/// Profiles the daemon runs; the rest are not this CLI's yet.
+/// Profiles supported by the system daemon or shared user runtime.
 fn daemon_profiles(ctx: &Ctx) -> Result<Vec<Profile>, String> {
     Ok(ctx
         .profiles()?
@@ -196,7 +177,7 @@ pub fn connect(
     }
     let status = auth::run(ctx.root_user, || {
         ctx.engine
-            .connect(&ctx.vault(), profile, credentials.clone(), &NoRemembered)
+            .connect(&ctx.vault(), profile, credentials.clone(), ctx)
     })?;
     if status.state == TunnelState::Failed {
         return Err(status
@@ -207,31 +188,41 @@ pub fn connect(
 }
 
 pub fn up(ctx: &Ctx, args: &UpArgs) -> Result<Output, String> {
+    if ctx.root_user && !args.foreground {
+        return Err(
+            "Use --foreground when connecting as root; the shared user service is unprivileged"
+                .into(),
+        );
+    }
     let mut profile = resolve_or_add(ctx, args)?;
     if let Some(server) = &args.endpoint {
         endpoints::use_endpoint(ctx, &profile.id, Some(server))?;
         profile = ctx.find(&profile.id)?;
     }
-    if !LinuxEngine::handles(&profile) {
-        return Err(format!(
-            "\"{}\" ({}) does not run through the network daemon; netorch connects \
-             WireGuard, OpenVPN and Xray TUN profiles for now",
-            profile.name,
-            kind_of(&profile)
-        ));
-    }
-    let credentials = if profile.backend == TunnelBackend::OpenVpn {
+    let connect_with_prompt = || {
         let needs = openvpn_requirements(&ctx.vault(), &profile)?;
-        prompt::collect(
+        let credentials = prompt::collect(
             needs.user_pass,
             needs.key_passphrase,
             args.auth_stdin,
             args.passphrase_stdin,
-        )?
-    } else {
-        None
+        )?;
+        connect(ctx, &profile, credentials)
     };
-    let status = connect(ctx, &profile, credentials)?;
+    let status = if profile.backend == TunnelBackend::OpenVpn {
+        if args.auth_stdin || args.passphrase_stdin {
+            connect_with_prompt()?
+        } else {
+            match connect(ctx, &profile, None) {
+                Err(error) if error == net_manager_engine::linux_engine::CREDENTIALS_REQUIRED => {
+                    connect_with_prompt()?
+                }
+                result => result?,
+            }
+        }
+    } else {
+        connect(ctx, &profile, None)?
+    };
     let server = endpoints::active_name(ctx, &profile);
     let text = format!(
         "Connected \"{}\"{}{}",
@@ -273,7 +264,6 @@ pub fn down(ctx: &Ctx, target: Option<&str>, all: bool) -> Result<Output, String
             auth::run(ctx.root_user, || ctx.engine.disconnect(profile))?;
             stopped.push(profile.name.clone());
         }
-        hold::stop_keeper(ctx, &profile.id);
     }
     let text = if stopped.is_empty() {
         "No connection is running.".to_string()
@@ -335,8 +325,12 @@ mod tests {
     }
 
     /// A data directory with one WireGuard profile and one static profile.
-    fn setup(daemon: FakeDaemon) -> (tempfile::TempDir, Ctx, Arc<FakeDaemon>) {
+    fn setup(mut daemon: FakeDaemon) -> (tempfile::TempDir, Ctx, Arc<FakeDaemon>) {
         let dir = tempfile::tempdir().unwrap();
+        daemon
+            .replies
+            .entry(method::OWNED_LIST)
+            .or_insert_with(|| json!({"owners": []}));
         let daemon = Arc::new(daemon);
         let mut ctx = Ctx::new(
             dir.path().to_path_buf(),
@@ -389,15 +383,20 @@ mod tests {
 
     #[test]
     fn status_shows_only_running_connections_and_skips_the_rest() {
-        let (_dir, ctx, daemon) = setup(FakeDaemon {
+        let (_dir, ctx, _) = setup(FakeDaemon {
             replies: HashMap::from([(method::WIREGUARD_STATUS, wg_status("running"))]),
             ..Default::default()
         });
-        let (value, text) = status(&ctx, None).unwrap();
+        let (value, _) = status(&ctx, None).unwrap();
         assert_eq!(value[0]["interface"], "wg-test");
-        assert!(text.contains("running"));
-        // The static profile is not the daemon's: only one daemon call.
-        assert_eq!(daemon.calls.lock().unwrap().len(), 1);
+        assert_eq!(value[0]["state"], "running");
+        let reported: Vec<_> = value
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(reported, ["wg1"]);
     }
 
     #[test]
@@ -438,22 +437,6 @@ mod tests {
     }
 
     #[test]
-    fn up_refuses_a_profile_the_daemon_does_not_run() {
-        let (_dir, ctx, daemon) = setup(FakeDaemon::default());
-        let args = UpArgs {
-            target: "static1".into(),
-            name: None,
-            endpoint: None,
-            foreground: false,
-            auth_stdin: false,
-            passphrase_stdin: false,
-        };
-        let error = up(&ctx, &args).unwrap_err();
-        assert!(error.contains("does not run through the network daemon"));
-        assert!(daemon.calls.lock().unwrap().is_empty());
-    }
-
-    #[test]
     fn up_reports_a_failed_connect_as_an_error() {
         let (_dir, ctx, _) = setup(FakeDaemon {
             replies: HashMap::from([(
@@ -475,24 +458,15 @@ mod tests {
 
     #[test]
     fn down_all_disconnects_only_what_runs() {
-        let (_dir, ctx, daemon) = setup(FakeDaemon {
+        let (_dir, ctx, _) = setup(FakeDaemon {
             replies: HashMap::from([
                 (method::WIREGUARD_STATUS, wg_status("running")),
                 (method::WIREGUARD_DISCONNECT, json!({"stopped": true})),
             ]),
             ..Default::default()
         });
-        let (value, text) = down(&ctx, None, true).unwrap();
-        assert_eq!(value["stopped"][0], "Office");
-        assert_eq!(text, "Disconnected Office");
-        assert_eq!(
-            daemon.calls.lock().unwrap().as_slice(),
-            [
-                method::WIREGUARD_STATUS,
-                method::WIREGUARD_STATUS,
-                method::WIREGUARD_DISCONNECT
-            ]
-        );
+        let (value, _) = down(&ctx, None, true).unwrap();
+        assert_eq!(value["stopped"], json!(["Office"]));
     }
 
     #[test]

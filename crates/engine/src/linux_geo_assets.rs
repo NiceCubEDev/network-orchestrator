@@ -10,7 +10,6 @@
 //! an executable. Refresh probes the `<url>.sha256` sidecar when published
 //! and verifies the downloaded payload against it.
 
-use crate::state::AppState;
 use net_manager_core::models::Profile;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -18,7 +17,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
-pub(crate) const MAX_GEO_ASSET_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_GEO_ASSET_BYTES: usize = 64 * 1024 * 1024;
 const REFRESH_AFTER_SECS: u64 = 24 * 60 * 60;
 const META_FILE: &str = "meta.json";
 
@@ -39,7 +38,7 @@ struct GeoAssetMeta {
     geosite_sha256: Option<String>,
 }
 
-pub(crate) fn validate_geo_asset_url(url: &str) -> Result<(), String> {
+pub fn validate_geo_asset_url(url: &str) -> Result<(), String> {
     let url = url.trim();
     if url.is_empty() || url.len() > 2048 || url.chars().any(char::is_control) {
         return Err("geo asset URL is invalid".into());
@@ -76,7 +75,7 @@ fn asset_dir_key(geoip_url: Option<&str>, geosite_url: Option<&str>) -> String {
     digest[..16].to_string()
 }
 
-pub(crate) fn profile_asset_dir(
+pub fn profile_asset_dir(
     root: &Path,
     geoip_url: Option<&str>,
     geosite_url: Option<&str>,
@@ -134,18 +133,18 @@ fn cache_is_fresh(dir: &Path, file: &str, url: &str, meta: &GeoAssetMeta) -> boo
             .is_some_and(|ts| now_unix().saturating_sub(ts) < REFRESH_AFTER_SECS)
 }
 
-fn warn_stale(state: Option<&AppState>, profile_name: &str, err: &str) {
-    if let Some(state) = state {
-        crate::commands::logs::record_log(
-            state,
-            crate::commands::logs::LogLevel::Warn,
-            format!("geo asset refresh failed for '{profile_name}', using cached copy: {err}"),
-        );
+type Warning<'a> = dyn Fn(&str) + Send + Sync + 'a;
+
+fn warn_stale(warning: Option<&Warning<'_>>, profile_name: &str, error: &str) {
+    if let Some(warning) = warning {
+        warning(&format!(
+            "geo asset refresh failed for '{profile_name}', using cached copy: {error}"
+        ));
     }
 }
 
 async fn ensure_with_fetch(
-    state: Option<&AppState>,
+    warning: Option<&Warning<'_>>,
     root: &Path,
     profile: &Profile,
     fetch: &Fetch,
@@ -162,6 +161,20 @@ async fn ensure_with_fetch(
     }
     let dir = profile_asset_dir(root, geoip_url, geosite_url);
     std::fs::create_dir_all(&dir).map_err(|_| "geo asset directory is unavailable".to_string())?;
+    net_manager_core::config_security::protect_path(&dir)
+        .map_err(|_| "geo asset directory is unavailable".to_string())?;
+    let lock_path = dir.join("cache.lock");
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|_| "geo asset cache lock is unavailable".to_string())?;
+    net_manager_core::config_security::protect_path(&lock_path)
+        .map_err(|_| "geo asset cache lock is unavailable".to_string())?;
+    lock.lock()
+        .map_err(|_| "geo asset cache lock is unavailable".to_string())?;
     let mut meta = load_meta(&dir);
 
     for (file, url, key) in [
@@ -196,7 +209,7 @@ async fn ensure_with_fetch(
                     if sha256_hex(&bytes) != expected {
                         let err = "geo asset digest mismatch".to_string();
                         if target.is_file() {
-                            warn_stale(state, &profile.name, &err);
+                            warn_stale(warning, &profile.name, &err);
                             continue;
                         }
                         return Err(err);
@@ -216,7 +229,7 @@ async fn ensure_with_fetch(
                 }
                 meta.fetched_at_unix = Some(now_unix());
             }
-            Err(err) if target.is_file() => warn_stale(state, &profile.name, &err),
+            Err(err) if target.is_file() => warn_stale(warning, &profile.name, &err),
             Err(err) => return Err(err),
         }
     }
@@ -234,7 +247,7 @@ async fn ensure_with_fetch(
 /// Encodes the cached dat files for inline daemon transport: each present
 /// file becomes a base64 field, absent files stay `None` so the daemon falls
 /// back to its managed copy for that file.
-pub(crate) fn protocol_geo_assets(
+pub fn protocol_geo_assets(
     dir: &Path,
 ) -> Result<net_manager_core::daemon_protocol::XrayGeoAssets, String> {
     use base64::Engine;
@@ -256,12 +269,42 @@ pub(crate) fn protocol_geo_assets(
     })
 }
 
+/// Shared synchronous entry point for CLI calls and GUI blocking workers.
+/// Without overrides there is no HTTP client, runtime or cache allocation.
+pub fn prepare_blocking(
+    root: &Path,
+    profile: &Profile,
+) -> Result<(Option<PathBuf>, Vec<String>), String> {
+    if ![
+        profile.xray_geoip_url.as_deref(),
+        profile.xray_geosite_url.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|url| !url.trim().is_empty())
+    {
+        return Ok((None, Vec::new()));
+    }
+    if unsafe { libc::geteuid() } == 0 {
+        return Err("Prepare custom geo assets by running netorch as your own user".into());
+    }
+    let warnings = std::sync::Mutex::new(Vec::new());
+    let warning = |message: &str| warnings.lock().unwrap().push(message.to_owned());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| "Geo asset runtime is unavailable")?;
+    let directory = runtime.block_on(ensure_geo_assets(root, profile, Some(&warning)))?;
+    Ok((directory, warnings.into_inner().unwrap()))
+}
+
 /// Downloads configured overrides into the per-profile cache and returns the
 /// directory holding them for inline transport, or `None` when the profile
 /// uses the managed geo data.
-pub(crate) async fn ensure_geo_assets(
-    state: &AppState,
+pub async fn ensure_geo_assets(
+    root: &Path,
     profile: &Profile,
+    warning: Option<&Warning<'_>>,
 ) -> Result<Option<PathBuf>, String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -299,13 +342,19 @@ pub(crate) async fn ensure_geo_assets(
             Ok(bytes)
         }) as Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send>>
     };
-    ensure_with_fetch(Some(state), &state.geo_assets_root, profile, &fetch).await
+    ensure_with_fetch(warning, root, profile, &fetch).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::unique_dir;
+    fn unique_dir(name: &str) -> PathBuf {
+        tempfile::Builder::new()
+            .prefix(name)
+            .tempdir()
+            .unwrap()
+            .keep()
+    }
     use std::collections::HashMap;
     use std::sync::Mutex;
 

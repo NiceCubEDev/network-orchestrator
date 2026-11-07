@@ -1,8 +1,10 @@
 use crate::state::AppState;
+#[cfg(any(not(target_os = "linux"), test))]
 use net_manager_core::models::*;
 use std::sync::atomic::Ordering;
 use tauri::{Emitter, Manager};
 
+#[cfg(any(not(target_os = "linux"), test))]
 pub(crate) async fn cleanup_all(state: &AppState) -> Result<(), String> {
     let profiles = state.profiles.load().map_err(|e| e.to_string())?.profiles;
     let mut runtime = state.runtime.lock().await;
@@ -56,7 +58,11 @@ pub(crate) async fn disconnect_all(
             crate::daemon_client::user_message(&err)
         )),
     }
-    if let Err(err) = stop_local_tunnels(state).await {
+    let root = state.data_dir().to_path_buf();
+    if let Err(err) = client
+        .engine_request(move |engine| engine.with_data_root(root).disconnect_local_proxies())
+        .await
+    {
         errors.push(err);
     }
     if errors.is_empty() {
@@ -66,46 +72,21 @@ pub(crate) async fn disconnect_all(
     }
 }
 
-/// Stop the tunnels this UI process runs itself; daemon owners are untouched.
-#[cfg(target_os = "linux")]
-async fn stop_local_tunnels(state: &AppState) -> Result<(), String> {
-    let document = state
-        .profiles
-        .load()
-        .map_err(|_| "cannot read profiles for local cleanup".to_string())?;
-    let mut runtime = state.runtime.lock().await;
-    let mut failed = false;
-    for profile in &document.profiles {
-        if profile.backend == TunnelBackend::WireGuard
-            || (profile.backend == TunnelBackend::Xray && profile.xray_mode == XrayMode::Tun)
-        {
-            continue;
-        }
-        if runtime.tunnels.status(profile).state == TunnelState::Running
-            && runtime.tunnels.disconnect(profile).is_err()
-        {
-            failed = true;
-        }
+/// Linux backends are shared with CLI and outlive the window. Closing the GUI
+/// must not disconnect another client's session.
+async fn exit_cleanup(state: &AppState) -> Result<(), String> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        cleanup_all(state).await
     }
-    if failed {
-        Err("local process cleanup failed".to_string())
-    } else {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = state;
         Ok(())
     }
 }
 
-/// Cleanup before the UI process exits. On Linux daemon owners outlive the
-/// UI, so only UI-owned processes are stopped, best effort: a failure must
-/// not block Quit (the children also get SIGTERM when the UI dies).
-async fn exit_cleanup(state: &AppState) -> Result<(), String> {
-    if should_cleanup_on_ui_exit() {
-        return cleanup_all(state).await;
-    }
-    #[cfg(target_os = "linux")]
-    let _ = stop_local_tunnels(state).await;
-    Ok(())
-}
-
+#[cfg(any(not(target_os = "linux"), test))]
 fn should_cleanup_on_ui_exit() -> bool {
     !cfg!(target_os = "linux")
 }
@@ -278,161 +259,5 @@ mod tests {
         }
         let err = cleanup_all(&state).await.unwrap_err();
         assert!(err.contains("route ownership:"), "{err}");
-    }
-
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn disconnect_all_requests_daemon_cleanup_and_stops_local_runtime() {
-        use net_manager_core::daemon_protocol::{self, method, RequestFrame, ResponseFrame};
-        use serde_json::json;
-        use tokio::io::{AsyncWriteExt, BufReader};
-        use tokio::net::UnixListener;
-
-        let dir = unique_dir("disconnect-all");
-        let state = app_state(&dir);
-        let mut profile = profile("if0");
-        profile.backend = TunnelBackend::None;
-        profile.routes.push(PolicyRoute {
-            destination: "10.77.0.0/16".parse().unwrap(),
-            metric: 5,
-            via: None,
-        });
-        state.profiles.upsert(profile.clone()).unwrap();
-        state
-            .runtime
-            .lock()
-            .await
-            .tunnels
-            .connect(&profile)
-            .unwrap();
-        let socket = dir.join("daemon.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let (reader, mut writer) = stream.into_split();
-            let mut reader = BufReader::new(reader);
-            let hello: RequestFrame = serde_json::from_slice(
-                &daemon_protocol::read_frame(&mut reader, 1024)
-                    .await
-                    .unwrap()
-                    .unwrap(),
-            )
-            .unwrap();
-            assert_eq!(hello.method, method::HELLO);
-            writer
-                .write_all(
-                    &daemon_protocol::encode_line(&ResponseFrame::ok(
-                        hello.id,
-                        json!({"protocol":1,"daemonVersion":"test","uid":1000,"capabilities":[]}),
-                    ))
-                    .unwrap(),
-                )
-                .await
-                .unwrap();
-            let request: RequestFrame = serde_json::from_slice(
-                &daemon_protocol::read_frame(&mut reader, 1024)
-                    .await
-                    .unwrap()
-                    .unwrap(),
-            )
-            .unwrap();
-            assert_eq!(request.method, method::RECOVERY_CLEANUP);
-            writer
-                .write_all(
-                    &daemon_protocol::encode_line(&ResponseFrame::ok(
-                        request.id,
-                        json!({"removedOwners":["static"],"failed":[]}),
-                    ))
-                    .unwrap(),
-                )
-                .await
-                .unwrap();
-        });
-
-        disconnect_all(&state, &crate::daemon_client::DaemonClient::new(socket))
-            .await
-            .unwrap();
-        server.await.unwrap();
-        assert_eq!(
-            state.runtime.lock().await.tunnels.status(&profile).state,
-            TunnelState::Stopped
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn linux_exit_stops_local_processes_without_daemon_rpc() {
-        use std::time::Duration;
-        use tokio::net::UnixListener;
-
-        let dir = unique_dir("exit-local-only");
-        let state = app_state(&dir);
-        let socket = dir.join("daemon.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
-        state.runtime.lock().await.routes = crate::route_runtime::RouteRuntime::Daemon(
-            crate::daemon_client::DaemonClient::new(socket),
-        );
-        let mut profile = profile("if0");
-        profile.backend = TunnelBackend::None;
-        profile.routes.push(PolicyRoute {
-            destination: "10.79.0.0/16".parse().unwrap(),
-            metric: 5,
-            via: None,
-        });
-        state.profiles.upsert(profile.clone()).unwrap();
-        state
-            .runtime
-            .lock()
-            .await
-            .tunnels
-            .connect(&profile)
-            .unwrap();
-
-        exit_cleanup(&state).await.unwrap();
-
-        assert_eq!(
-            state.runtime.lock().await.tunnels.status(&profile).state,
-            TunnelState::Stopped
-        );
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), listener.accept())
-                .await
-                .is_err(),
-            "UI exit must not talk to the daemon"
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn disconnect_all_stops_local_runtime_even_if_daemon_is_unavailable() {
-        let dir = unique_dir("disconnect-all-no-daemon");
-        let state = app_state(&dir);
-        let mut profile = profile("if0");
-        profile.backend = TunnelBackend::None;
-        profile.routes.push(PolicyRoute {
-            destination: "10.78.0.0/16".parse().unwrap(),
-            metric: 5,
-            via: None,
-        });
-        state.profiles.upsert(profile.clone()).unwrap();
-        state
-            .runtime
-            .lock()
-            .await
-            .tunnels
-            .connect(&profile)
-            .unwrap();
-
-        let error = disconnect_all(
-            &state,
-            &crate::daemon_client::DaemonClient::new(dir.join("missing.sock")),
-        )
-        .await
-        .unwrap_err();
-        assert!(error.contains("daemon"));
-        assert_eq!(
-            state.runtime.lock().await.tunnels.status(&profile).state,
-            TunnelState::Stopped
-        );
     }
 }

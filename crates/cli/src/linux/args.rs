@@ -82,9 +82,10 @@ pub enum Command {
     Version,
     /// Print shell completions
     Completions { shell: Shell },
-    /// Background process that keeps a connection up (started by `up`)
+    /// Shared unprivileged runtime (normally started on demand)
+    #[cfg(target_os = "linux")]
     #[command(hide = true)]
-    Hold { target: String },
+    Serve,
 }
 
 #[derive(Subcommand)]

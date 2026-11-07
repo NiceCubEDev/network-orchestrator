@@ -85,7 +85,7 @@ fn rename_to(ctx: &Ctx, id: &str, name: &str) -> Result<Profile, String> {
 }
 
 /// Saves what `input` points at: a share link, a subscription URL or a
-/// `.conf` / `.ovpn` file. A subscription can add several profiles.
+/// `.conf` / `.ovpn` / `.json` file. A subscription can add several profiles.
 pub fn add_input(ctx: &Ctx, input: &str, name: Option<&str>) -> Result<Vec<Profile>, String> {
     require_user(ctx)?;
     let before: HashSet<String> = ctx.profiles()?.into_iter().map(|p| p.id).collect();
@@ -94,7 +94,7 @@ pub fn add_input(ctx: &Ctx, input: &str, name: Option<&str>) -> Result<Vec<Profi
         Input::Saved(_) => {
             return Err(
                 "That is not a vless:// / hysteria2:// link, an https:// subscription \
-                        URL or an existing .conf / .ovpn file."
+                        URL or an existing .conf / .ovpn / .json file."
                     .into(),
             )
         }

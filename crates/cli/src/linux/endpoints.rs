@@ -9,7 +9,8 @@ use super::library;
 use net_manager_core::backend_settings::BackendSettingsStore;
 use net_manager_core::config_vault::SubscriptionEndpoint;
 use net_manager_core::models::{
-    NodePoolFilter, NodePoolSettings, Profile, SubscriptionEndpointInfo, TunnelBackend, TunnelState,
+    NodePoolFilter, NodePoolSettings, Profile, SubscriptionEndpointInfo, TunnelBackend,
+    TunnelState, XrayMode,
 };
 use net_manager_core::{node_pool, subscription, vpn, xray};
 use net_manager_engine::linux_engine::LinuxEngine;
@@ -1355,7 +1356,7 @@ pub fn test(
     let indexes = select_for_test(&rows, query)?;
     let executable = xray_executable(ctx)?;
     eprintln!("Measuring {} servers...", indexes.len());
-    let as_tunnel = LinuxEngine::handles(&profile);
+    let as_tunnel = profile.xray_mode == XrayMode::Tun;
     let jobs: Vec<(usize, String)> = indexes
         .iter()
         .map(|&index| (index, endpoints[index].url.clone()))

@@ -1092,10 +1092,28 @@ pub(crate) async fn diagnose_profile(
                         pushed_routes: Vec::new(),
                     },
                 ),
-                None => (
-                    runtime.tunnels.status(&profile),
-                    runtime.tunnels.protocol_health(&profile),
-                ),
+                None => {
+                    let status = crate::commands::tunnels::linux_profile_status(
+                        &crate::daemon_client::DaemonClient::system(),
+                        &state,
+                        &profile,
+                    )
+                    .await?;
+                    let health = ProtocolHealth {
+                        state: if status.state == TunnelState::Failed {
+                            ProtocolHealthState::Failed
+                        } else {
+                            ProtocolHealthState::Unknown
+                        },
+                        summary: "Shared runtime state; proxy traffic is not verified".into(),
+                        last_handshake_unix: None,
+                        rx_bytes: None,
+                        tx_bytes: None,
+                        log_tail: None,
+                        pushed_routes: Vec::new(),
+                    };
+                    (status, health)
+                }
             },
         },
     };
@@ -1119,8 +1137,12 @@ pub(crate) async fn diagnose_profile(
             None
         }
     };
-    let proxy_owner = runtime.proxy.ownership().map(|o| o.profile_id.clone());
     drop(runtime);
+    let proxy_owner = state
+        .proxy_ownership()
+        .await
+        .map_err(|error| error.to_string())?
+        .map(|ownership| ownership.profile_id);
     let managed = state
         .config_vault
         .is_managed_profile_path(&profile.id, &profile.config_path);

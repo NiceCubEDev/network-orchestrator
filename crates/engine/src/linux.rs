@@ -11,8 +11,8 @@ use net_manager_core::daemon_protocol::{
 };
 use net_manager_core::models::*;
 
-/// Remembered OpenVPN credentials (the system keyring or, without one, the
-/// process). The app and the CLI each bring their own store.
+/// Remembered OpenVPN credentials. Linux frontends share the Secret Service
+/// adapter in `linux_credentials`; root callers use no remembered credentials.
 pub trait CredentialSource {
     /// Remembered credentials plus an optional user notice. `legacy` is the
     /// old plaintext file, migrated and deleted on first access.
@@ -21,6 +21,16 @@ pub trait CredentialSource {
         profile_id: &str,
         legacy: &std::path::Path,
     ) -> Result<(Option<OpenVpnCredentials>, Option<&'static str>), String>;
+}
+
+impl CredentialSource for () {
+    fn load(
+        &self,
+        _: &str,
+        _: &std::path::Path,
+    ) -> Result<(Option<OpenVpnCredentials>, Option<&'static str>), String> {
+        Ok((None, None))
+    }
 }
 
 /// The `wireguard.connect` request: the managed config plus the routes the

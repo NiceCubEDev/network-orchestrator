@@ -4,11 +4,9 @@ mod commands;
 #[cfg(target_os = "linux")]
 mod daemon_client;
 mod elevation;
-#[cfg(target_os = "linux")]
-mod geo_assets;
 mod lifecycle;
 #[cfg(target_os = "linux")]
-mod openvpn_credentials;
+mod profile_watcher;
 mod route_runtime;
 mod state;
 #[cfg(test)]
@@ -60,8 +58,17 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .setup(|app| {
+            #[cfg(target_os = "linux")]
+            let data_dir =
+                net_manager_engine::linux_paths::from_environment(&app.config().identifier)
+                    .map_err(std::io::Error::other)?;
+            #[cfg(not(target_os = "linux"))]
             let data_dir = app.path().app_data_dir()?;
+            #[cfg(target_os = "linux")]
+            let profile_path = data_dir.join("profiles.json");
             app.manage(state::build_state(data_dir)?);
+            #[cfg(target_os = "linux")]
+            tauri::async_runtime::spawn(profile_watcher::watch(app.handle().clone(), profile_path));
             #[cfg(target_os = "linux")]
             {
                 app.handle().plugin(tauri_plugin_autostart::init(

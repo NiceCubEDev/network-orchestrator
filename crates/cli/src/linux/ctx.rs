@@ -4,33 +4,21 @@ use net_manager_core::config_vault::ConfigVault;
 use net_manager_core::models::Profile;
 use net_manager_core::profiles::ProfileStore;
 use net_manager_engine::linux_engine::LinuxEngine;
+use net_manager_engine::linux_paths::{self, APPLICATION_ID};
 use std::path::PathBuf;
-
-/// Directory name the Tauri app uses under `$XDG_DATA_HOME`.
-const APP_DIR: &str = "com.netmanager.app";
 
 pub struct Ctx {
     pub root: PathBuf,
     pub engine: LinuxEngine,
     /// Whether this process is root; tests set it directly.
     pub root_user: bool,
+    #[cfg(target_os = "linux")]
+    credentials: net_manager_engine::linux_credentials::OpenVpnCredentialStore,
 }
 
 pub fn is_root() -> bool {
     // SAFETY: geteuid never fails.
     unsafe { libc::geteuid() == 0 }
-}
-
-/// The app's data directory from the environment, so profiles are shared
-/// with the GUI. Relative `XDG_DATA_HOME` values are ignored, as the XDG
-/// specification says.
-pub fn data_root(xdg: Option<PathBuf>, home: Option<PathBuf>) -> Result<PathBuf, String> {
-    if let Some(dir) = xdg.filter(|dir| dir.is_absolute()) {
-        return Ok(dir.join(APP_DIR));
-    }
-    home.filter(|dir| dir.is_absolute())
-        .map(|home| home.join(".local").join("share").join(APP_DIR))
-        .ok_or_else(|| "The home directory could not be found".to_string())
 }
 
 /// Home of the user who ran `sudo`: where their app data is, even though
@@ -53,16 +41,15 @@ pub fn default_root() -> Result<PathBuf, String> {
     if is_root() {
         // Root needs no polkit prompt, so `sudo netorch up` works; it only
         // reads the invoking user's data (writing would leave root-owned files).
-        return data_root(None, sudo_user_home()).map_err(|_| {
-            "Run netorch as your own user, or with sudo from your account. \
+        return linux_paths::data_root(APPLICATION_ID, None, None, sudo_user_home()).map_err(
+            |_| {
+                "Run netorch as your own user, or with sudo from your account. \
              Use --data-dir to point root at a data directory."
-                .to_string()
-        });
+                    .to_string()
+            },
+        );
     }
-    data_root(
-        std::env::var_os("XDG_DATA_HOME").map(PathBuf::from),
-        std::env::var_os("HOME").map(PathBuf::from),
-    )
+    linux_paths::from_environment(APPLICATION_ID)
 }
 
 impl Ctx {
@@ -70,10 +57,15 @@ impl Ctx {
         if !root.is_absolute() {
             return Err("The data directory must be an absolute path".into());
         }
+        let engine = engine.with_data_root(root.clone());
         Ok(Self {
             root,
             engine,
             root_user: is_root(),
+            #[cfg(target_os = "linux")]
+            credentials: net_manager_engine::linux_credentials::OpenVpnCredentialStore::new(
+                Box::new(net_manager_engine::linux_credentials::SecretServiceStore),
+            ),
         })
     }
 
@@ -112,24 +104,24 @@ impl Ctx {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn xdg_data_home_wins_over_home() {
-        let root = data_root(Some("/x/data".into()), Some("/home/u".into())).unwrap();
-        assert_eq!(root, PathBuf::from("/x/data/com.netmanager.app"));
-    }
-
-    #[test]
-    fn home_is_the_fallback_and_relative_values_are_ignored() {
-        let root = data_root(Some("rel".into()), Some("/home/u".into())).unwrap();
-        assert_eq!(
-            root,
-            PathBuf::from("/home/u/.local/share/com.netmanager.app")
-        );
-        assert!(data_root(None, Some("rel".into())).is_err());
-        assert!(data_root(None, None).is_err());
+impl net_manager_engine::linux::CredentialSource for Ctx {
+    fn load(
+        &self,
+        profile_id: &str,
+        legacy: &std::path::Path,
+    ) -> Result<
+        (
+            Option<net_manager_core::daemon_protocol::OpenVpnCredentials>,
+            Option<&'static str>,
+        ),
+        String,
+    > {
+        #[cfg(target_os = "linux")]
+        if !self.root_user {
+            return self.credentials.load(profile_id, legacy);
+        }
+        let _ = (profile_id, legacy);
+        // A root invocation must not migrate or rewrite the user's secrets.
+        Ok((None, None))
     }
 }

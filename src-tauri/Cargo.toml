@@ -32,7 +32,6 @@ tauri-plugin-single-instance = "2"
 net-manager-engine = { path = "../crates/engine" }
 tauri-plugin-autostart = "2"
 libc = "0.2"
-dbus-secret-service = { version = "4.1", features = ["crypto-rust"] }
 webkit2gtk = "=2.0.2"
 
 [target.'cfg(target_os = "windows")'.dependencies]

@@ -2847,7 +2847,6 @@ name = "net-manager-app"
 version = "0.0.0"
 dependencies = [
  "base64 0.22.1",
- "dbus-secret-service",
  "futures-util",
  "libc",
  "net-manager-core",
@@ -2913,9 +2912,13 @@ name = "net-manager-engine"
 version = "0.13.0"
 dependencies = [
  "base64 0.22.1",
+ "dbus-secret-service",
+ "libc",
  "net-manager-core",
+ "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
 ]

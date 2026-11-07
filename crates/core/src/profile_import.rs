@@ -381,7 +381,13 @@ pub fn import_configs_into(
             backend,
             config_path,
             routes: import.routes,
-            xray_mode: XrayMode::platform_default(),
+            // Imported JSON is not a daemon-validated generated TUN config.
+            // Keep arbitrary Xray configs in the unprivileged local runtime.
+            xray_mode: if cfg!(target_os = "linux") && backend == TunnelBackend::Xray {
+                XrayMode::Socks
+            } else {
+                XrayMode::platform_default()
+            },
             ..Default::default()
         };
         if let Err(err) = store.upsert(profile) {

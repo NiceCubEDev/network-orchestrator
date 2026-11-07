@@ -1,19 +1,22 @@
-use net_manager_core::models::{AppliedProfileRoutes, AppliedRoute, NetworkInterface, Profile};
-#[cfg(target_os = "linux")]
+use net_manager_core::models::{AppliedProfileRoutes, AppliedRoute};
+#[cfg(any(not(target_os = "linux"), test))]
+use net_manager_core::models::{NetworkInterface, Profile};
+#[cfg(all(target_os = "linux", test))]
 use net_manager_core::policy::plan_profile;
 use net_manager_core::policy::PolicyManager;
-use net_manager_core::route_state::{
-    AppliedRouteDocument, AppliedRouteStore, APPLIED_ROUTE_DOCUMENT_VERSION,
-};
+use net_manager_core::route_state::AppliedRouteStore;
+#[cfg(any(not(target_os = "linux"), test))]
+use net_manager_core::route_state::{AppliedRouteDocument, APPLIED_ROUTE_DOCUMENT_VERSION};
 use std::io;
 use std::path::Path;
 
 #[cfg(target_os = "linux")]
 use crate::daemon_client::{user_message, DaemonClient};
 #[cfg(target_os = "linux")]
+use net_manager_core::daemon_protocol::{method, OwnedListResult, OwnedResource};
+#[cfg(all(target_os = "linux", test))]
 use net_manager_core::daemon_protocol::{
-    method, AttachSpecParams, OwnedListResult, OwnedResource, OwnerParams, RoutesApplyParams,
-    RoutesApplyResult, RoutesRemoveResult,
+    AttachSpecParams, OwnerParams, RoutesApplyParams, RoutesApplyResult, RoutesRemoveResult,
 };
 
 #[allow(dead_code)]
@@ -98,6 +101,7 @@ impl RouteRuntime {
         }
     }
 
+    #[cfg(any(not(target_os = "linux"), test))]
     fn persist(&self) -> Result<(), String> {
         match self {
             Self::Local { policies, store } => store
@@ -111,6 +115,7 @@ impl RouteRuntime {
         }
     }
 
+    #[cfg(any(not(target_os = "linux"), test))]
     pub(crate) async fn apply_profile(
         &mut self,
         profile: &Profile,
@@ -159,6 +164,7 @@ impl RouteRuntime {
         }
     }
 
+    #[cfg(any(not(target_os = "linux"), test))]
     pub(crate) async fn remove_profile(&mut self, id: &str) -> Result<(), String> {
         match self {
             Self::Local { policies, .. } => {
@@ -208,6 +214,7 @@ impl RouteRuntime {
             .unwrap_or_default())
     }
 
+    #[cfg(any(not(target_os = "linux"), test))]
     pub(crate) async fn applied_profile_ids(&mut self) -> Result<Vec<String>, String> {
         Ok(self
             .snapshot()

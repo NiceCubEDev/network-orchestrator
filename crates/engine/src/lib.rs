@@ -16,8 +16,16 @@ mod geo;
 pub mod linux;
 #[cfg(any(target_os = "linux", feature = "linux-engine"))]
 pub mod linux_compat;
+#[cfg(target_os = "linux")]
+pub mod linux_credentials;
 #[cfg(any(target_os = "linux", feature = "linux-engine"))]
 pub mod linux_engine;
+#[cfg(target_os = "linux")]
+pub mod linux_geo_assets;
+#[cfg(any(target_os = "linux", feature = "linux-engine"))]
+pub mod linux_paths;
+#[cfg(target_os = "linux")]
+pub mod linux_session;
 #[cfg(unix)]
 pub mod privileged;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
