@@ -6,8 +6,23 @@
 use crate::analysis;
 use crate::models::*;
 use crate::vpn::TunnelManager;
+use ipnet::IpNet;
 use std::net::{Ipv4Addr, TcpStream};
 use std::time::{Duration, Instant};
+
+/// Detect a full address-family union even when no single route is `/0`.
+pub fn full_coverage(routes: impl IntoIterator<Item = IpNet>) -> (bool, bool) {
+    let networks: Vec<_> = routes.into_iter().collect();
+    let aggregated = IpNet::aggregate(&networks);
+    (
+        aggregated
+            .iter()
+            .any(|net| matches!(net, IpNet::V4(net) if net.prefix_len() == 0)),
+        aggregated
+            .iter()
+            .any(|net| matches!(net, IpNet::V6(net) if net.prefix_len() == 0)),
+    )
+}
 
 pub fn has_target_interface(profile: &Profile, interfaces: &[NetworkInterface]) -> bool {
     interfaces.iter().any(|iface| {
@@ -15,6 +30,29 @@ pub fn has_target_interface(profile: &Profile, interfaces: &[NetworkInterface]) 
             && (iface.friendly_name == profile.interface_name
                 || iface.name == profile.interface_name)
     })
+}
+
+/// Exact Linux-managed Xray TUN capture, shared by execution and route analysis.
+pub fn linux_xray_tun_routes(profile: &Profile) -> Vec<PolicyRoute> {
+    let routes = profile.effective_routes();
+    if profile.tunnel_role != TunnelRole::Primary || !routes.is_empty() {
+        return routes;
+    }
+    let route = |destination: &str| PolicyRoute {
+        destination: destination.parse().unwrap(),
+        metric: 5,
+        via: None,
+    };
+    if profile.xray_split_default {
+        vec![
+            route("0.0.0.0/1"),
+            route("128.0.0.0/1"),
+            route("::/1"),
+            route("8000::/1"),
+        ]
+    } else {
+        vec![route("0.0.0.0/0"), route("::/0")]
+    }
 }
 
 pub fn unknown_route_conflicts(
@@ -186,6 +224,25 @@ mod tests {
     use super::*;
     use std::net::TcpListener;
     use std::path::PathBuf;
+
+    #[test]
+    fn full_coverage_detects_decomposed_ipv4_and_ipv6_unions() {
+        let networks: Vec<IpNet> = [
+            "0.0.0.0/2",
+            "64.0.0.0/2",
+            "128.0.0.0/2",
+            "192.0.0.0/2",
+            "::/2",
+            "4000::/2",
+            "8000::/2",
+            "c000::/2",
+        ]
+        .into_iter()
+        .map(|network| network.parse().unwrap())
+        .collect();
+        assert_eq!(full_coverage(networks.iter().copied()), (true, true));
+        assert_eq!(full_coverage(networks[..3].iter().copied()), (false, false));
+    }
 
     fn profile(interface_name: &str) -> Profile {
         Profile {

@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Profile, TunnelStatus } from "../types";
+import { OpenVpnCredentials, Profile, TunnelStatus } from "../types";
 import { useT } from "../i18n";
 import Modal from "./Modal";
 
@@ -10,6 +10,8 @@ interface OpenVpnCredentialsModalProps {
   onClose: () => void;
   /** Called after `connect_openvpn_with_credentials` succeeded. */
   onConnected: (profile: Profile, status: TunnelStatus) => void;
+  /** Collect without connecting when a shared set must preflight all credentials first. */
+  onSubmitCredentials?: (profile: Profile, credentials: OpenVpnCredentials, remember: boolean) => Promise<void>;
 }
 
 /** Prompts for OpenVPN credentials and connects with them. */
@@ -17,6 +19,7 @@ export default function OpenVpnCredentialsModal({
   profile,
   onClose,
   onConnected,
+  onSubmitCredentials,
 }: OpenVpnCredentialsModalProps) {
   const t = useT();
   const [username, setUsername] = useState("");
@@ -58,14 +61,20 @@ export default function OpenVpnCredentialsModal({
     setBusy(true);
     setError(null);
     try {
+      const credentials: OpenVpnCredentials = {
+        ...(username ? { authUserPass: { username, password } } : {}),
+        ...(keyPassphrase ? { privateKeyPassphrase: keyPassphrase } : {}),
+      };
+      if (onSubmitCredentials) {
+        await onSubmitCredentials(profile, credentials, remember);
+        reset();
+        return;
+      }
       const status = await invoke<TunnelStatus>(
         "connect_openvpn_with_credentials",
         {
           id: profile.id,
-          credentials: {
-            ...(username ? { authUserPass: { username, password } } : {}),
-            ...(keyPassphrase ? { privateKeyPassphrase: keyPassphrase } : {}),
-          },
+          credentials,
           remember,
         },
       );
@@ -81,7 +90,7 @@ export default function OpenVpnCredentialsModal({
   return (
     <Modal
       open={profile !== null}
-      title={t("ovpn.title")}
+      title={profile ? `${t("ovpn.title")} — ${profile.name}` : t("ovpn.title")}
       onClose={close}
       maxWidth="420px"
       footer={
@@ -95,7 +104,7 @@ export default function OpenVpnCredentialsModal({
             onClick={() => void submit()}
             disabled={busy}
           >
-            {busy ? t("common.connecting") : t("common.connect")}
+            {onSubmitCredentials ? t("native.diag.ok") : busy ? t("common.connecting") : t("common.connect")}
           </button>
         </>
       }

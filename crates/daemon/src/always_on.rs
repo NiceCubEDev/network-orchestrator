@@ -1,8 +1,8 @@
 use crate::core::DaemonCore;
 use crate::validate::{validate_apply, validate_iface_name, validate_owner};
-use crate::wireguard::parse_wireguard_config;
 use net_manager_core::daemon_protocol::AlwaysOnDefinition;
 use net_manager_core::models::AppliedRoute;
+use net_manager_core::wireguard_config::parse_wireguard_config;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::ffi::CString;
@@ -54,12 +54,37 @@ pub struct ReplayReport {
     pub failed: usize,
 }
 
+fn wireguard_plan(
+    profile: &net_manager_core::daemon_protocol::WireGuardConnectParams,
+) -> io::Result<net_manager_core::wireguard_config::WireGuardPlan> {
+    let mut plan =
+        parse_wireguard_config(&profile.config, &profile.routes).map_err(|_| invalid_data())?;
+    net_manager_core::models::validate_secondary(
+        profile.role,
+        &profile.routes,
+        &profile.dns_domains,
+    )
+    .map_err(|_| invalid_data())?;
+    plan.interface_name = profile.interface_name.clone();
+    if profile.role == net_manager_core::models::TunnelRole::Secondary {
+        if plan.full_ipv4 || plan.full_ipv6 {
+            return Err(invalid_data());
+        }
+        plan.dns_domains = if plan.dns_servers.is_empty() {
+            Vec::new()
+        } else {
+            profile.dns_domains.clone()
+        };
+    }
+    Ok(plan)
+}
+
 pub fn validate_definition(definition: &AlwaysOnDefinition) -> io::Result<()> {
     let owner = definition.owner();
     validate_owner(&owner).map_err(|_| invalid_data())?;
     match definition {
         AlwaysOnDefinition::WireGuard(profile) => {
-            parse_wireguard_config(&profile.config, &profile.routes).map_err(|_| invalid_data())?;
+            wireguard_plan(profile)?;
         }
         AlwaysOnDefinition::StaticRoutes(profile) => {
             if owner.starts_with("wg:")
@@ -113,9 +138,7 @@ pub fn apply_definition(
     }
     match definition {
         AlwaysOnDefinition::WireGuard(profile) => {
-            let mut plan = parse_wireguard_config(&profile.config, &profile.routes)
-                .map_err(|_| invalid_data())?;
-            plan.interface_name = profile.interface_name.clone();
+            let plan = wireguard_plan(profile)?;
             core.connect_wireguard(uid, &profile.profile_id, plan)?;
         }
         AlwaysOnDefinition::StaticRoutes(profile) => {
@@ -423,6 +446,64 @@ mod tests {
             role: Default::default(),
             dns_domains: Vec::new(),
         })
+    }
+
+    fn secondary_definition(allowed: &str) -> AlwaysOnDefinition {
+        use net_manager_core::models::{PolicyRoute, TunnelRole};
+        AlwaysOnDefinition::WireGuard(WireGuardConnectParams {
+            profile_id: "office".into(),
+            config: format!("[Interface]\nPrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\nAddress = 10.77.0.2/24\nDNS = 10.77.0.1, untrusted.example\n[Peer]\nPublicKey = AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=\nAllowedIPs = {allowed}\nEndpoint = 192.0.2.1:51820\n"),
+            routes: vec![PolicyRoute { destination: "10.77.0.0/24".parse().unwrap(), metric: 5, via: None }],
+            interface_name: Some("office".into()),
+            role: TunnelRole::Secondary,
+            dns_domains: vec!["office.example".into()],
+        })
+    }
+
+    #[test]
+    fn enrollment_and_replay_reject_secondary_full_capture_and_invalid_scope() {
+        let AlwaysOnDefinition::WireGuard(mut full_profile) =
+            secondary_definition("0.0.0.0/0, ::/0")
+        else {
+            unreachable!()
+        };
+        full_profile.routes = vec![net_manager_core::models::PolicyRoute {
+            destination: "0.0.0.0/0".parse().unwrap(),
+            metric: 5,
+            via: None,
+        }];
+        let full = AlwaysOnDefinition::WireGuard(full_profile);
+        assert!(validate_definition(&full).is_err());
+        let dir = test_dir("secondary-full");
+        let (mut core, recorder) = fake_core(&dir);
+        assert!(apply_definition(&mut core, 1000, &full).is_err());
+        assert!(recorder.ops().is_empty());
+        let AlwaysOnDefinition::WireGuard(mut invalid) = secondary_definition("10.77.0.0/24")
+        else {
+            unreachable!()
+        };
+        invalid.routes.clear();
+        assert!(validate_definition(&AlwaysOnDefinition::WireGuard(invalid.clone())).is_err());
+        invalid.routes.push(net_manager_core::models::PolicyRoute {
+            destination: "10.77.0.0/24".parse().unwrap(),
+            metric: 5,
+            via: None,
+        });
+        invalid.dns_domains = vec!["bad..domain".into()];
+        assert!(validate_definition(&AlwaysOnDefinition::WireGuard(invalid)).is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn secondary_replay_scopes_dns_to_explicit_profile_domains() {
+        let AlwaysOnDefinition::WireGuard(profile) = secondary_definition("10.77.0.0/24") else {
+            unreachable!()
+        };
+        let plan = wireguard_plan(&profile).unwrap();
+        assert_eq!(plan.dns_domains, ["office.example"]);
+        assert_eq!(plan.interface_name.as_deref(), Some("office"));
+        assert!(!plan.full_ipv4 && !plan.full_ipv6);
+        assert!(validate_definition(&AlwaysOnDefinition::WireGuard(profile)).is_ok());
     }
 
     #[test]

@@ -4,7 +4,11 @@ import type {
   PoolProbeEntry, Profile, ProfileInspection, RouteEntry, RouteMap, TunnelStatus, VpnAuthMode,
   XrayPolicyPreview,
   ServiceCheck, ServiceCheckOutcome, ServiceCheckResult,
+  ConnectionSetCredentialInput,
 } from "../types.ts";
+import type { ConnectionSnippet } from "../components/profiles/sets";
+
+const CONNECTION_SETS_KEY = "netmanager.sandbox.connectionSets";
 
 // This module intentionally has no I/O imports, fetch, or process calls.
 // It models UI transitions only; Rust tests verify actual backend behavior.
@@ -43,6 +47,126 @@ export class SandboxBackend {
   private serviceResults = new Map<string, ServiceCheckResult[]>();
   private serviceDue = new Map<string, number>();
   private serviceAttempts = new Map<string, Map<string, number>>();
+
+  private connectionSets: ConnectionSnippet[] = [];
+  private rememberedOpenVpn = new Set<string>();
+
+  private validateConnectionSets(value: unknown, requireMembers: boolean): ConnectionSnippet[] {
+    const idValid = (id: unknown): id is string => typeof id === "string" && /^[A-Za-z0-9_.-]{1,128}$/.test(id) && id !== "." && id !== "..";
+    if (!Array.isArray(value) || value.length > 256 || JSON.stringify(value).length > 1024 * 1024) throw new Error("Invalid connection sets");
+    const ids = new Set<string>();
+    return value.map((raw: unknown) => {
+      if (!raw || typeof raw !== "object") throw new Error("Invalid connection set");
+      const set = raw as Record<string, unknown>;
+      if (Object.keys(set).some((key) => !["id", "name", "profileIds"].includes(key)) ||
+        !idValid(set.id) || ids.has(set.id) || typeof set.name !== "string" || !set.name.trim() ||
+        [...set.name].length > 128 || /[\p{Cc}]/u.test(set.name) || !Array.isArray(set.profileIds) ||
+        set.profileIds.length > 256 || !set.profileIds.every(idValid) || new Set(set.profileIds).size !== set.profileIds.length) {
+        throw new Error("Invalid connection set");
+      }
+      ids.add(set.id);
+      const profileIds = set.profileIds as string[];
+      const missing = profileIds.filter((id) => !this.profiles.some((profile) => profile.id === id));
+      if (requireMembers && missing.length) throw new Error(`Missing connection-set members: ${missing.join(", ")}`);
+      return { id: set.id, name: set.name, profileIds: [...profileIds] };
+    });
+  }
+
+  private loadConnectionSets(): ConnectionSnippet[] {
+    if (typeof localStorage !== "undefined") {
+      const raw = localStorage.getItem(CONNECTION_SETS_KEY);
+      if (raw !== null) {
+        if (raw.length > 1024 * 1024) throw new Error("Connection-set store is too large");
+        const document = JSON.parse(raw) as { version: number; sets: unknown };
+        if (document.version !== 1) throw new Error("Unsupported connection-set version");
+        this.connectionSets = this.validateConnectionSets(document.sets, false);
+      }
+    }
+    return this.connectionSets;
+  }
+
+  private saveConnectionSets(sets: ConnectionSnippet[]): void {
+    const checked = this.validateConnectionSets(sets, false);
+    // Persist before acknowledging migration: a failed write must retain the legacy key.
+    if (typeof localStorage !== "undefined") localStorage.setItem(CONNECTION_SETS_KEY, JSON.stringify({ version: 1, sets: checked }));
+    this.connectionSets = checked;
+  }
+
+  private connectionSet(id: unknown): ConnectionSnippet {
+    const set = this.loadConnectionSets().find((item) => item.id === id);
+    if (!set) throw new Error("Connection set not found");
+    return set;
+  }
+
+  private setCredentialInputs(value: unknown): Record<string, ConnectionSetCredentialInput> {
+    if (value === undefined || value === null) return {};
+    if (typeof value !== "object" || Array.isArray(value) || Object.keys(value).length > 256) throw new Error("Invalid connection-set credential inputs");
+    const encoder = new TextEncoder();
+    const safe = (value: unknown, limit: number, empty: boolean) => typeof value === "string" &&
+      (empty || value.length > 0) && encoder.encode(value).length <= limit && !/[\p{Cc}]/u.test(value);
+    for (const [id, raw] of Object.entries(value)) {
+      if (!this.profiles.some((profile) => profile.id === id && profile.backend === "openVpn") || !raw || typeof raw !== "object") throw new Error("Invalid connection-set credential inputs");
+      const input = raw as Partial<ConnectionSetCredentialInput>;
+      const credentials = input.credentials;
+      if (Object.keys(input).some((key) => !["credentials", "remember"].includes(key)) ||
+        !credentials || typeof credentials !== "object" || (input.remember !== undefined && typeof input.remember !== "boolean") ||
+        (!credentials.authUserPass && !credentials.privateKeyPassphrase) ||
+        (credentials.authUserPass && (!safe(credentials.authUserPass.username, 256, false) || !safe(credentials.authUserPass.password, 4096, true))) ||
+        (credentials.privateKeyPassphrase !== undefined && !safe(credentials.privateKeyPassphrase, 4096, false))) {
+        throw new Error("Invalid connection-set credentials");
+      }
+    }
+    return value as Record<string, ConnectionSetCredentialInput>;
+  }
+
+  private applyConnectionSet(id: unknown, down: boolean, credentialInputs?: unknown): unknown {
+    const inputs = this.setCredentialInputs(credentialInputs);
+    const set = this.connectionSet(id);
+    this.validateConnectionSets([set], true);
+    const enrolled = new Set(this.enrollment.profiles.map((item) => item.profileId));
+    const targets = set.profileIds.map((member) => this.find(member));
+    if (!down && targets.filter((p) => (p.tunnelRole ?? "primary") === "primary" &&
+      (["wireGuard", "openVpn"].includes(p.backend) || p.backend === "xray" && p.xrayMode === "tun")).length > 1) {
+      throw new Error("A connection set cannot start multiple primary tunnels");
+    }
+    for (const p of targets) {
+      if (enrolled.has(p.id) && (down || !this.running.has(p.id))) throw new Error(`Member ${p.id} is always-on`);
+      if (!down && !this.running.has(p.id)) {
+        if (p.backend === "openVpn" && !inputs[p.id]?.credentials?.authUserPass && !this.rememberedOpenVpn.has(p.id)) throw new Error(`OpenVPN credentials required: ${p.id}`);
+        if (p.backend === "none" && !p.routes.length) throw new Error("Static-routes profile has no routes");
+        if (p.tunnelRole === "secondary" && !(p.tunnelNetworks?.length || p.routes.length)) throw new Error("Secondary connection requires networks");
+      }
+    }
+    if (!down) {
+      for (const p of this.profiles) {
+        if (p.backend === "openVpn" && this.running.has(p.id) && !set.profileIds.includes(p.id) && !enrolled.has(p.id) &&
+          !inputs[p.id]?.credentials?.authUserPass && !this.rememberedOpenVpn.has(p.id)) throw new Error(`OpenVPN credentials required: ${p.id}`);
+      }
+    }
+    const before = new Set(this.running);
+    const outcomes: { profileId: string; action: string; status: TunnelStatus | null; error: string | null }[] = [];
+    try {
+      for (const p of this.profiles) {
+        const member = set.profileIds.includes(p.id);
+        if (enrolled.has(p.id) || down && !member) continue;
+        const running = this.running.has(p.id);
+        const action = running && (down || !member) ? "disconnect" : !down && member && !running ? "connect" : "unchanged";
+        if (action === "disconnect") this.dispatch("disconnect_profile", { id: p.id });
+        if (action === "connect") {
+          const input = inputs[p.id];
+          this.dispatch(p.backend === "openVpn" && input ? "connect_openvpn_with_credentials" : "connect_profile", {
+            id: p.id, ...(input ? { credentials: input.credentials, remember: input.remember } : {}),
+          });
+        }
+        if (member || action !== "unchanged") outcomes.push({ profileId: p.id, action, status: this.statuses().find((s) => s.profileId === p.id) ?? null, error: null });
+      }
+    } catch (error) {
+      this.running = before;
+      for (const p of this.profiles) this.resetServiceWorker(p);
+      throw error;
+    }
+    return { setId: set.id, outcomes };
+  }
 
   private serviceBindings(p: Profile): Set<string> {
     return new Set([
@@ -633,6 +757,33 @@ export class SandboxBackend {
     switch (command) {
       case "get_platform_capabilities": return { os: "linux", systemProxy: false, wireguardStandardImport: false, managedXrayInstall: true, elevationRelaunch: false, appUpdates: false, executableExtensions: [] };
       case "get_profiles": return this.profiles;
+      case "list_connection_sets": return this.loadConnectionSets();
+      case "get_connection_set": return this.connectionSet(args.id);
+      case "put_connection_set": {
+        const [set] = this.validateConnectionSets([args.set], true);
+        const sets = this.loadConnectionSets();
+        this.saveConnectionSets([...sets.filter((old) => old.id !== set.id), set]);
+        return set;
+      }
+      case "delete_connection_set": {
+        this.connectionSet(args.id);
+        this.saveConnectionSets(this.loadConnectionSets().filter((set) => set.id !== args.id));
+        return null;
+      }
+      case "import_connection_sets": {
+        const incoming = this.validateConnectionSets(args.sets, false);
+        const sets = [...this.loadConnectionSets()];
+        for (const set of incoming) if (!sets.some((old) => old.id === set.id)) sets.push(set);
+        this.saveConnectionSets(sets);
+        return sets;
+      }
+      case "capture_connection_set": {
+        const [set] = this.validateConnectionSets([{ id: args.id, name: args.name, profileIds: this.profiles.filter((p) => this.running.has(p.id)).map((p) => p.id) }], true);
+        this.saveConnectionSets([...this.loadConnectionSets().filter((old) => old.id !== set.id), set]);
+        return set;
+      }
+      case "apply_connection_set": return this.applyConnectionSet(args.id, false, args.credentialInputs);
+      case "down_connection_set": return this.applyConnectionSet(args.id, true);
       case "get_interfaces": return this.interfaces();
       case "get_routes": return this.routes();
       case "get_tunnel_statuses": return this.statuses();
@@ -664,7 +815,12 @@ export class SandboxBackend {
         const p = this.find(args.id);
         if (this.running.has(p.id)) throw new Error("Profile is already running");
         if (p.backend === "none" && !p.routes.length) throw new Error("Static-routes profile has no routes");
-        if (p.backend === "openVpn" && command === "connect_profile") throw "OpenVPN credentials required";
+        if (p.backend === "openVpn" && command === "connect_profile" && !this.rememberedOpenVpn.has(p.id)) throw "OpenVPN credentials required";
+        if (p.backend === "openVpn" && command === "connect_openvpn_with_credentials") {
+          const inputs = this.setCredentialInputs({ [p.id]: { credentials: args.credentials, remember: args.remember ?? false } });
+          if (!inputs[p.id].credentials.authUserPass) throw new Error("OpenVPN credentials required");
+          if (args.remember) this.rememberedOpenVpn.add(p.id);
+        }
         this.running.add(p.id);
         this.resetServiceWorker(p);
         return this.statuses().find((s) => s.profileId === p.id);

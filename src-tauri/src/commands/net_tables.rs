@@ -4,9 +4,7 @@
 //! report `available: false` or return the daemon error.
 
 #[cfg(target_os = "linux")]
-use net_manager_core::daemon_protocol::{
-    method, NetDnsProbeParams, NetIntentDelParams, NetRouteDelParams, NetRuleDelParams,
-};
+use net_manager_core::daemon_protocol::NetDnsProbeParams;
 use net_manager_core::daemon_protocol::{
     NetDnsProbeResult, NetDnsStatusResult, NetEditResult, NetExplainResult, NetIntentListResult,
     NetIntentResult, NetIntentSetParams, NetRouteAddParams, NetRuleAddParams, NetTablesResult,
@@ -14,21 +12,15 @@ use net_manager_core::daemon_protocol::{
 };
 
 #[cfg(target_os = "linux")]
-async fn request<P: serde::Serialize, T: serde::de::DeserializeOwned>(
-    method_name: &'static str,
-    params: P,
-) -> Result<T, String> {
-    crate::daemon_client::DaemonClient::system()
-        .request::<P, T>(method_name, params)
-        .await
-        .map_err(|e| crate::daemon_client::user_message(&e))
+fn engine() -> net_manager_engine::linux_engine::LinuxEngine {
+    net_manager_engine::linux_engine::LinuxEngine::new("netmanager-gui")
 }
 
 #[tauri::command]
 pub(crate) async fn get_net_tables() -> Result<NetTablesResult, String> {
     #[cfg(target_os = "linux")]
     {
-        request(method::NET_TABLES, serde_json::Value::Null).await
+        net_manager_engine::linux_network::tables(&engine())
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -46,8 +38,7 @@ pub(crate) async fn get_net_tables() -> Result<NetTablesResult, String> {
 pub(crate) async fn net_route_add(params: NetRouteAddParams) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
-        request::<_, serde_json::Value>(method::NET_ROUTE_ADD, &params).await?;
-        Ok(())
+        net_manager_engine::linux_network::route_add(&engine(), params)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -63,7 +54,7 @@ pub(crate) async fn net_route_add(params: NetRouteAddParams) -> Result<(), Strin
 pub(crate) async fn net_route_del(route: SystemRoute) -> Result<NetEditResult, String> {
     #[cfg(target_os = "linux")]
     {
-        request(method::NET_ROUTE_DEL, NetRouteDelParams { route }).await
+        net_manager_engine::linux_network::route_delete(&engine(), route)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -77,8 +68,7 @@ pub(crate) async fn net_route_del(route: SystemRoute) -> Result<NetEditResult, S
 pub(crate) async fn net_rule_add(params: NetRuleAddParams) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
-        request::<_, serde_json::Value>(method::NET_RULE_ADD, &params).await?;
-        Ok(())
+        net_manager_engine::linux_network::rule_add(&engine(), params)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -93,7 +83,7 @@ pub(crate) async fn net_rule_add(params: NetRuleAddParams) -> Result<(), String>
 pub(crate) async fn net_rule_del(rule: SystemRule) -> Result<NetEditResult, String> {
     #[cfg(target_os = "linux")]
     {
-        request(method::NET_RULE_DEL, NetRuleDelParams { rule }).await
+        net_manager_engine::linux_network::rule_delete(&engine(), rule)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -108,7 +98,7 @@ pub(crate) async fn net_rule_del(rule: SystemRule) -> Result<NetEditResult, Stri
 pub(crate) async fn net_explain() -> Result<NetExplainResult, String> {
     #[cfg(target_os = "linux")]
     {
-        request(method::NET_EXPLAIN, serde_json::Value::Null).await
+        net_manager_engine::linux_network::explain(&engine())
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -125,7 +115,7 @@ pub(crate) async fn net_explain() -> Result<NetExplainResult, String> {
 pub(crate) async fn net_dns_status() -> Result<NetDnsStatusResult, String> {
     #[cfg(target_os = "linux")]
     {
-        request(method::NET_DNS_STATUS, serde_json::Value::Null).await
+        net_manager_engine::linux_network::dns_status(&engine())
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -156,18 +146,18 @@ pub(crate) async fn net_dns_probe(
             ),
         };
         let family = match family.as_deref() {
+            None | Some("ipv4") => Some(IpFamily::Ipv4),
             Some("ipv6") => Some(IpFamily::Ipv6),
-            _ => Some(IpFamily::Ipv4),
+            Some(_) => return Err("invalid DNS record family".into()),
         };
-        request(
-            method::NET_DNS_PROBE,
+        net_manager_engine::linux_network::dns_probe(
+            &engine(),
             NetDnsProbeParams {
                 hostname,
                 server,
                 family,
             },
         )
-        .await
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -181,7 +171,7 @@ pub(crate) async fn net_dns_probe(
 pub(crate) async fn net_intent_list() -> Result<NetIntentListResult, String> {
     #[cfg(target_os = "linux")]
     {
-        request(method::NET_INTENT_LIST, serde_json::Value::Null).await
+        net_manager_engine::linux_network::intent_list(&engine())
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -197,7 +187,7 @@ pub(crate) async fn net_intent_list() -> Result<NetIntentListResult, String> {
 pub(crate) async fn net_intent_set(params: NetIntentSetParams) -> Result<NetIntentResult, String> {
     #[cfg(target_os = "linux")]
     {
-        request(method::NET_INTENT_SET, &params).await
+        net_manager_engine::linux_network::intent_set(&engine(), params)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -211,7 +201,7 @@ pub(crate) async fn net_intent_set(params: NetIntentSetParams) -> Result<NetInte
 pub(crate) async fn net_intent_del(id: String) -> Result<NetIntentResult, String> {
     #[cfg(target_os = "linux")]
     {
-        request(method::NET_INTENT_DEL, NetIntentDelParams { id }).await
+        net_manager_engine::linux_network::intent_delete(&engine(), &id)
     }
     #[cfg(not(target_os = "linux"))]
     {

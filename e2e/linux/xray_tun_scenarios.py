@@ -50,6 +50,313 @@ def rpc(method, params):
     return response["result"]
 
 
+def ipv6_scenarios(directory, vless_id):
+    """IPv6 transport, payload and DNS stay inside disposable namespaces."""
+    client_ip, peer_ip = "fd73:6e65:746f::1", "fd73:6e65:746f::2"
+    endpoint, payload_ip = "fd79:6e65:746f::3", "fd75:6e65:746f::1"
+    scope = "fd75:6e65:746f::/64"
+    previous_defaults = docker_exec(client_name, "ip", "-6", "route", "show", "default")
+    added = []
+    fixture_pid = "/run/xray-ipv6-fixture.pid"
+    fixture_count = "/run/xray-ipv6-dns-count"
+    observer_pid = "/run/xray-ipv6-observer.pid"
+    observer_stats = "/run/xray-ipv6-observer.json"
+    observer = r"""
+import json, os, signal, socket, sys
+from pathlib import Path
+stats = {"endpoint": 0, "direct_payload": 0}
+destination = socket.inet_pton(socket.AF_INET6, "fd75:6e65:746f::1")
+endpoint = socket.inet_pton(socket.AF_INET6, "fd79:6e65:746f::3")
+path = Path("/run/xray-ipv6-observer.json")
+def save():
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(stats))
+    os.replace(temporary, path)
+def stop(*_):
+    save()
+    sys.exit(0)
+signal.signal(signal.SIGTERM, stop)
+with socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0003)) as capture:
+    capture.bind(("eth0", 0))
+    save()
+    Path("/run/xray-ipv6-observer.pid").write_text(str(os.getpid()))
+    while True:
+        packet, address = capture.recvfrom(65535)
+        if address[2] != socket.PACKET_OUTGOING or len(packet) < 54:
+            continue
+        if packet[12:14] != b"\x86\xdd":
+            continue
+        target = packet[38:54]
+        if target == destination:
+            stats["direct_payload"] += 1
+            save()
+        elif target == endpoint:
+            stats["endpoint"] += 1
+            save()
+"""
+    fixture = r"""
+import http.server, os, socket, struct, threading
+from pathlib import Path
+class HTTP6(http.server.ThreadingHTTPServer):
+    address_family = socket.AF_INET6
+class Handler(http.server.SimpleHTTPRequestHandler):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, directory="/opt/netorch/e2e", **kwargs)
+    def do_GET(self):
+        if self.client_address[0] != "fd75:6e65:746f::1":
+            self.send_error(403, "payload must arrive through the proxy")
+            return
+        super().do_GET()
+http = HTTP6(("fd75:6e65:746f::1", 8766), Handler)
+threading.Thread(target=http.serve_forever, daemon=True).start()
+dns = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+dns.bind(("fd75:6e65:746f::1", 53))
+count = 0
+Path("/run/xray-ipv6-dns-count").write_text("0")
+Path("/run/xray-ipv6-fixture.pid").write_text(str(os.getpid()))
+while True:
+    packet, address = dns.recvfrom(4096)
+    if address[0] != "fd75:6e65:746f::1":
+        continue
+    offset = 12
+    labels = []
+    while packet[offset]:
+        size = packet[offset]
+        labels.append(packet[offset + 1:offset + 1 + size].decode("ascii").lower())
+        offset += size + 1
+    offset += 1
+    kind, cls = struct.unpack_from("!HH", packet, offset)
+    answer = labels == ["xray-ipv6-e2e", "test"] and kind == 28 and cls == 1
+    response = packet[:2] + struct.pack("!HHHHH", 0x8180, 1, int(answer), 0, 0)
+    response += packet[12:offset + 4]
+    if answer:
+        response += b"\xc0\x0c" + struct.pack("!HHIH", 28, 1, 30, 16)
+        response += socket.inet_pton(socket.AF_INET6, "fd75:6e65:746f::1")
+        count += 1
+        Path("/run/xray-ipv6-dns-count").write_text(str(count))
+    dns.sendto(response, address)
+"""
+    active = None
+
+    def addresses(interface):
+        links = json.loads(docker_exec(client_name, "ip", "-j", "addr", "show", "dev", interface))
+        return {
+            (item["family"], item["local"], item["prefixlen"])
+            for item in links[0]["addr_info"] if item["scope"] == "global"
+        }
+
+    def payload(interface, dual):
+        route = docker_exec(client_name, "ip", "-6", "route", "get", payload_ip)
+        assert f"dev {interface}" in route, "IPv6 payload escaped TUN"
+        body = docker_exec(
+            client_name, "curl", "-g", "-6", "--noproxy", "*", "--fail",
+            "--silent", "--show-error", "--max-time", "8",
+            f"http://[{payload_ip}]:8766/server-health.txt",
+        )
+        assert body == "netorch-e2e-server", "IPv6 HTTP did not cross Xray"
+        if dual:
+            route4 = docker_exec(client_name, "ip", "-4", "route", "get", "10.75.0.1")
+            assert f"dev {interface}" in route4
+            body4 = docker_exec(
+                client_name, "curl", "--noproxy", "*", "--fail", "--silent",
+                "--show-error", "--max-time", "8", "http://10.75.0.1:8765/server-health.txt",
+            )
+            assert body4 == "netorch-e2e-server"
+
+    def dns(interface, full):
+        resolved = docker_exec(client_name, "resolvectl", "status", interface)
+        expected_domain = "~." if full else "xray-ipv6-e2e.test"
+        assert payload_ip in resolved and expected_domain in resolved
+        route = docker_exec(client_name, "ip", "-6", "route", "get", payload_ip)
+        assert f"dev {interface}" in route, "IPv6 DNS escaped TUN"
+        before = int(docker_exec(server_name, "cat", fixture_count))
+        docker_exec(client_name, "resolvectl", "flush-caches")
+        answer = docker_exec(client_name, "resolvectl", "--type=AAAA", "query", "xray-ipv6-e2e.test")
+        assert payload_ip in answer
+        assert int(docker_exec(server_name, "cat", fixture_count)) > before
+
+    def cleaned(interface, assigned, full):
+        assert not any(owner["owner"] == f"xray:{active}" for owner in rpc("owned.list", None)["owners"])
+        links = json.loads(docker_exec(client_name, "ip", "-j", "addr", "show"))
+        assert all(link["ifname"] != interface for link in links), "IPv6 TUN survived cleanup"
+        remaining = {
+            (item["family"], item["local"], item["prefixlen"])
+            for link in links for item in link["addr_info"]
+        }
+        assert not assigned & remaining, "Xray addresses survived cleanup"
+        for family in ("-4", "-6"):
+            routes = docker_exec(client_name, "ip", family, "route", "show", "table", "all", "proto", "79")
+            rules = docker_exec(client_name, "ip", family, "rule", "show")
+            assert interface not in routes and endpoint not in routes
+            assert "proto 79" not in rules, "Xray policy rule survived cleanup"
+        assert payload_ip not in docker_exec(client_name, "resolvectl", "dns"), "IPv6 DNS server survived cleanup"
+        assert "xray-ipv6-e2e.test" not in docker_exec(client_name, "resolvectl", "domain"), "Xray DNS domain survived cleanup"
+        if full:
+            assert "~." not in docker_exec(client_name, "resolvectl", "domain").split(), "Xray default DNS domain survived cleanup"
+        try:
+            docker_exec(client_name, "pgrep", "-x", "xray")
+        except RuntimeError:
+            pass
+        else:
+            raise RuntimeError("Xray child survived IPv6 cleanup")
+
+    try:
+        for container in (client_name, server_name):
+            for interface in ("all", "eth0", "lo"):
+                docker_exec(container, "sysctl", "-q", "-w", f"net.ipv6.conf.{interface}.disable_ipv6=0")
+        for container, interface, address in (
+            (client_name, "eth0", f"{client_ip}/64"),
+            (server_name, "eth0", f"{peer_ip}/64"),
+            (server_name, "lo", f"{endpoint}/128"),
+            (server_name, "lo", f"{payload_ip}/128"),
+        ):
+            docker_exec(container, "ip", "-6", "addr", "add", address, "dev", interface, "nodad")
+            added.append((container, interface, address))
+        docker_exec(client_name, "ip", "-6", "route", "replace", "default", "via", peer_ip, "dev", "eth0")
+        config = {
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "listen": "::", "port": 11002, "protocol": "vless",
+                "settings": {"decryption": "none", "clients": [{"id": vless_id}]},
+                "streamSettings": {"network": "raw", "security": "none"},
+            }],
+            "outbounds": [{"protocol": "freedom", "settings": {
+                "finalRules": [{"action": "allow", "ip": [payload_ip, "10.75.0.1"]}],
+            }}],
+        }
+        proxy_fixture.write_container_json(server_name, "/tmp/netorch-xray-tun-ipv6.json", config)
+        proxy_fixture.start_xray(server_name, "/tmp/netorch-xray-tun-ipv6.json", "tun-ipv6")
+        proxy_fixture.run("docker", "exec", "-d", server_name, "python3", "-c", fixture)
+        for _ in range(50):
+            try:
+                docker_exec(server_name, "cat", fixture_pid)
+                docker_exec(
+                    client_name, "python3", "-c",
+                    "import socket,sys; socket.create_connection((sys.argv[1],11002),0.5).close()",
+                    endpoint,
+                )
+                break
+            except RuntimeError:
+                time.sleep(0.1)
+        else:
+            raise RuntimeError("isolated IPv6 peer did not start")
+        uri = f"vless://{vless_id}@[{endpoint}]:11002?type=raw&security=none"
+        generated = proxy_fixture.generate_client(uri, directory, "ipv6").read_text()
+        proxy_fixture.run("docker", "exec", "-d", client_name, "python3", "-c", observer)
+        for _ in range(50):
+            try:
+                docker_exec(client_name, "cat", observer_pid)
+                json.loads(docker_exec(client_name, "cat", observer_stats))
+                break
+            except RuntimeError:
+                time.sleep(0.1)
+        else:
+            raise RuntimeError("isolated eth0 packet observer did not start")
+        for dual, full in ((False, False), (True, False), (True, True)):
+            active = f"xray-ipv6-{int(dual)}-{int(full)}"
+            observed_before = json.loads(docker_exec(client_name, "cat", observer_stats))
+            destinations = ["0.0.0.0/0", "::/0"] if full else (
+                ["10.75.0.0/24", scope] if dual else [scope]
+            )
+            params = {
+                "profileId": active, "config": generated,
+                "routes": [{"destination": destination, "metric": 5} for destination in destinations],
+                "dnsServers": [payload_ip],
+                "dnsDomains": [] if full else ["xray-ipv6-e2e.test"],
+                "role": "primary" if full or not dual else "secondary",
+            }
+            status = rpc("xray.connect", params)["status"]
+            assert status["state"] == "running"
+            assert status["ipv4Covered"] == full and status["ipv6Covered"] == full
+            interface = status["interfaceName"]
+            assigned = addresses(interface)
+            assert sum(family == "inet6" and prefix == 128 for family, _, prefix in assigned) == 1
+            assert sum(family == "inet" and prefix == 32 for family, _, prefix in assigned) == int(dual)
+            assert len(assigned) == 1 + int(dual)
+            if not full:
+                installed = []
+                for family in ("-4", "-6"):
+                    routes = json.loads(docker_exec(
+                        client_name, "ip", "-j", family, "route", "show", "table", "all", "proto", "79",
+                    ))
+                    installed.extend(route["dst"] for route in routes if route.get("dev") == interface)
+                    assert "proto 79" not in docker_exec(client_name, "ip", family, "rule", "show")
+                assert set(installed) == set(destinations), "scoped Xray widened its route capture"
+            bypass = docker_exec(client_name, "ip", "-6", "route", "show", "proto", "79")
+            assert endpoint in bypass and f"via {peer_ip}" in bypass and "dev eth0" in bypass
+            if full:
+                rules = docker_exec(client_name, "ip", "-6", "rule", "show")
+                match = re.search(r"fwmark (0x[0-9a-f]+) lookup ([0-9]+) proto 79", rules)
+                assert match
+                marked = docker_exec(client_name, "ip", "-6", "route", "get", endpoint, "mark", match.group(1))
+                assert f"via {peer_ip}" in marked and "dev eth0" in marked
+            assert status["dnsApplied"]
+            payload(interface, dual)
+            dns(interface, full)
+            reloaded = rpc("xray.reload", params)["status"]
+            assert reloaded["state"] == "running" and addresses(interface) == assigned
+            assert reloaded["dnsApplied"]
+            payload(interface, dual)
+            dns(interface, full)
+            if dual:
+                old_pid = docker_exec(client_name, "pgrep", "-x", "xray")
+                docker_exec(client_name, "kill", "-KILL", old_pid)
+                for _ in range(50):
+                    time.sleep(0.2)
+                    try:
+                        new_pid = docker_exec(client_name, "pgrep", "-x", "xray")
+                        if new_pid != old_pid and addresses(interface) == assigned:
+                            payload(interface, dual)
+                            dns(interface, full)
+                            break
+                    except RuntimeError:
+                        continue
+                else:
+                    raise RuntimeError("dual-stack Xray did not restore IPv6 payload/DNS after child death")
+            # This observes the selected TCP and UDP-DNS probes, not all
+            # possible protocols: only VLESS's distinct endpoint may use eth0.
+            observed = json.loads(docker_exec(client_name, "cat", observer_stats))
+            assert observed["endpoint"] > observed_before["endpoint"], "packet observer missed Xray transport"
+            assert observed["direct_payload"] == 0, "TCP/DNS payload leaked directly onto eth0"
+            if not full:
+                rpc("xray.disconnect", {"profileId": active})
+            else:
+                docker_exec(client_name, "systemctl", "kill", "-s", "KILL", "network-orchestrator.service")
+                for _ in range(30):
+                    time.sleep(0.5)
+                    try:
+                        owners = rpc("owned.list", None)["owners"]
+                    except RuntimeError:
+                        continue
+                    if not any(owner["owner"] == f"xray:{active}" for owner in owners):
+                        break
+                else:
+                    raise RuntimeError("daemon did not recover dual-stack Xray")
+            cleaned(interface, assigned, full)
+            print(f"ok   IPv6 payload/cleanup dual={dual} full={full}", flush=True)
+            active = None
+    finally:
+        if active:
+            try:
+                rpc("xray.disconnect", {"profileId": active})
+            except RuntimeError:
+                pass
+        proxy_fixture.stop_xray(server_name, "tun-ipv6")
+        for container, pid_file in ((client_name, observer_pid), (server_name, fixture_pid)):
+            docker_exec(
+                container, "python3", "-c",
+                "import os,signal,sys; from pathlib import Path; p=Path(sys.argv[1]); "
+                "pid=int(p.read_text()) if p.exists() else None; "
+                "os.kill(pid,signal.SIGTERM) if pid else None",
+                pid_file,
+            )
+        docker_exec(client_name, "ip", "-6", "route", "del", "default", "via", peer_ip, "dev", "eth0")
+        for route in previous_defaults.splitlines():
+            docker_exec(client_name, "ip", "-6", "route", "replace", *route.split())
+        for container, interface, address in reversed(added):
+            docker_exec(container, "ip", "-6", "addr", "del", address, "dev", interface)
+
+
 print("\n=== Xray TUN split tunnel across two containers", flush=True)
 proxy_fixture.run("cargo", "build", "-q", "-p", "net-manager-core", "--example", "xray_e2e_config")
 docker_exec(client_name, "install", "-d", "-m", "0755", XRAY_DIR)
@@ -390,7 +697,10 @@ try:
         assert not table_routes.strip()
         docker_exec(client_name, "ip", "-4", "route", "replace", *original_default)
         print("ok   crash recovery removed Xray process, TUN, rules and DNS link", flush=True)
+
+        print("\n=== Xray TUN isolated IPv6 payload, DNS and dual-stack recovery", flush=True)
+        ipv6_scenarios(Path(directory), vless_id)
 finally:
     proxy_fixture.stop_xray(server_name, "tun-server")
 
-print("ALL 16 XRAY TUN CHECKS PASSED", flush=True)
+print("ALL XRAY TUN IPv4/IPv6 CHECKS PASSED", flush=True)

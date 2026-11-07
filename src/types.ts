@@ -563,6 +563,17 @@ export interface TunnelStatus {
   watchdog?: WatchdogStatus | null;
 }
 
+/** Input only: never persist these fields in profile/set documents or logs. */
+export interface OpenVpnCredentials {
+  authUserPass?: { username: string; password: string };
+  privateKeyPassphrase?: string;
+}
+
+export interface ConnectionSetCredentialInput {
+  credentials: OpenVpnCredentials;
+  remember: boolean;
+}
+
 export interface AutoConnectResult {
   failedCount: number;
   startupFailed: boolean;

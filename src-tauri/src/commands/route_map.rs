@@ -1,16 +1,25 @@
 use crate::state::AppState;
+#[cfg(not(target_os = "linux"))]
 use net_manager_core::explorer;
-use net_manager_core::models::{
-    PlannedRoute, Profile, RouteMap, TunnelBackend, TunnelState, TunnelStatus,
-};
+use net_manager_core::models::RouteMap;
+#[cfg(not(target_os = "linux"))]
+use net_manager_core::models::{PlannedRoute, Profile, TunnelBackend};
+#[cfg(any(not(target_os = "linux"), test))]
+use net_manager_core::models::{TunnelState, TunnelStatus};
+#[cfg(not(target_os = "linux"))]
 use net_manager_core::route_plan::build_route_map;
+#[cfg(not(target_os = "linux"))]
 use std::collections::HashMap;
 use tauri::State;
+
+#[cfg(all(target_os = "linux", test))]
+pub(crate) use net_manager_engine::linux_network::select_route_profiles;
 
 /// Pair each profile with its live running flag, and when a daemon-managed
 /// tunnel reports its real interface name, copy it onto the cloned profile so
 /// planned routes match effective kernel routes by interface instead of
 /// producing phantom `InterfaceMismatch` diffs.
+#[cfg(not(target_os = "linux"))]
 pub(crate) fn select_route_profiles(
     profiles: &[Profile],
     statuses: &[TunnelStatus],
@@ -47,46 +56,60 @@ pub(crate) async fn get_route_map(
     include_inactive: bool,
     state: State<'_, AppState>,
 ) -> Result<RouteMap, String> {
-    let profiles = state.profiles.load().map_err(|e| e.to_string())?.profiles;
-
-    let statuses = super::tunnels::collect_tunnel_statuses(state.inner(), &profiles).await?;
-    let running: HashMap<String, bool> = statuses
-        .iter()
-        .map(|status| {
-            (
-                status.profile_id.clone(),
-                status.state == TunnelState::Running,
-            )
-        })
-        .collect();
-
-    let mut pushed_routes = Vec::new();
+    #[cfg(target_os = "linux")]
     {
-        let runtime = state.runtime.lock().await;
-        for profile in &profiles {
-            if running.get(&profile.id).copied().unwrap_or(false)
-                && profile.backend == TunnelBackend::OpenVpn
-            {
-                for route in runtime.tunnels.openvpn_pushed_routes(&profile.id) {
-                    pushed_routes.push(PlannedRoute {
-                        destination: route.destination,
-                        owner_profile_id: profile.id.clone(),
-                        owner_name: profile.name.clone(),
-                        source: route.source,
-                        interface_name: None,
-                        metric: route.metric,
-                        active: true,
-                    });
+        let engine = net_manager_engine::linux_engine::LinuxEngine::new("netmanager-gui")
+            .with_data_root(state.data_dir().to_path_buf());
+        return net_manager_engine::linux_network::route_map(
+            &engine,
+            &state.profiles,
+            include_inactive,
+        )
+        .await;
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let profiles = state.profiles.load().map_err(|e| e.to_string())?.profiles;
+
+        let statuses = super::tunnels::collect_tunnel_statuses(state.inner(), &profiles).await?;
+        let running: HashMap<String, bool> = statuses
+            .iter()
+            .map(|status| {
+                (
+                    status.profile_id.clone(),
+                    status.state == TunnelState::Running,
+                )
+            })
+            .collect();
+
+        let mut pushed_routes = Vec::new();
+        {
+            let runtime = state.runtime.lock().await;
+            for profile in &profiles {
+                if running.get(&profile.id).copied().unwrap_or(false)
+                    && profile.backend == TunnelBackend::OpenVpn
+                {
+                    for route in runtime.tunnels.openvpn_pushed_routes(&profile.id) {
+                        pushed_routes.push(PlannedRoute {
+                            destination: route.destination,
+                            owner_profile_id: profile.id.clone(),
+                            owner_name: profile.name.clone(),
+                            source: route.source,
+                            interface_name: None,
+                            metric: route.metric,
+                            active: true,
+                        });
+                    }
                 }
             }
         }
-    }
 
-    let selected = select_route_profiles(&profiles, &statuses, include_inactive);
-    let effective = explorer::list_routes().await.map_err(|e| e.to_string())?;
-    let mut map = build_route_map(&selected, &effective);
-    map.pushed_routes = pushed_routes;
-    Ok(map)
+        let selected = select_route_profiles(&profiles, &statuses, include_inactive);
+        let effective = explorer::list_routes().await.map_err(|e| e.to_string())?;
+        let mut map = build_route_map(&selected, &effective);
+        map.pushed_routes = pushed_routes;
+        Ok(map)
+    }
 }
 
 #[cfg(test)]

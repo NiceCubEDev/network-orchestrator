@@ -1,18 +1,32 @@
+#[cfg(not(target_os = "linux"))]
 use crate::elevation;
-use crate::state::{existing_profile_for_update, find_profile, AppState};
-#[cfg(test)]
+use crate::state::AppState;
+#[cfg(not(target_os = "linux"))]
+use crate::state::{existing_profile_for_update, find_profile};
+#[cfg(all(test, not(target_os = "linux")))]
 use net_manager_core::config_security;
+#[cfg(not(target_os = "linux"))]
 use net_manager_core::config_vault::{ConfigImport, ConfigVault};
 use net_manager_core::models::*;
-use std::collections::{HashMap, HashSet};
+#[cfg(not(target_os = "linux"))]
+use std::collections::HashMap;
+#[cfg(not(target_os = "linux"))]
+use std::collections::HashSet;
+#[cfg(target_os = "linux")]
+use std::future::Future;
+#[cfg(not(target_os = "linux"))]
 use std::net::{Ipv4Addr, TcpListener};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(not(target_os = "linux"))]
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, Manager, State};
 
+#[cfg(not(target_os = "linux"))]
 use net_manager_core::subscription::MAX_SUBSCRIPTION_BODY_BYTES;
 static SUBSCRIPTION_REFRESH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+#[cfg(not(target_os = "linux"))]
 fn validate_refresh_interval(minutes: Option<u32>) -> Result<(), String> {
     if minutes.is_none_or(|minutes| matches!(minutes, 15 | 60 | 360)) {
         Ok(())
@@ -40,9 +54,10 @@ fn should_auto_refresh(profile: &Profile, now: u64, active: bool) -> bool {
             .as_ref()
             .is_some_and(|subscription| subscription_refresh_due(subscription, now))
 }
+#[cfg(not(target_os = "linux"))]
 use net_manager_core::subscription::{DELAY_PROBE_TIMEOUT, DELAY_PROBE_URL};
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "linux")))]
 pub(crate) fn select_available_socks_port(
     used: &HashSet<u16>,
     available: impl Fn(u16) -> bool,
@@ -50,6 +65,7 @@ pub(crate) fn select_available_socks_port(
     net_manager_core::profile_import::select_available_socks_port(used, available)
         .map_err(|e| e.to_string())
 }
+#[cfg(not(target_os = "linux"))]
 fn select_generated_ports(
     preferred_socks: Option<u16>,
     preferred_http: Option<u16>,
@@ -64,14 +80,17 @@ fn select_generated_ports(
     )
     .map_err(|e| e.to_string())
 }
+#[cfg(not(target_os = "linux"))]
 pub(crate) fn profile_listener_ports(profiles: &[Profile], exclude_id: &str) -> HashSet<u16> {
     net_manager_core::profile_import::profile_listener_ports(profiles, exclude_id)
 }
 
+#[cfg(not(target_os = "linux"))]
 pub(crate) fn loopback_port_available(port: u16) -> bool {
     TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok()
 }
 
+#[cfg(not(target_os = "linux"))]
 pub(crate) fn store_generated_xray(
     vault: &ConfigVault,
     profile_id: &str,
@@ -80,7 +99,7 @@ pub(crate) fn store_generated_xray(
     vault.store_generated_xray(profile_id, plaintext_json)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "linux")))]
 pub(crate) fn rewrite_generated_proxy_ports(
     vault: &ConfigVault,
     profile: &mut Profile,
@@ -96,6 +115,7 @@ pub(crate) fn rewrite_generated_proxy_ports(
     .map_err(|err| err.to_string())
 }
 
+#[cfg(not(target_os = "linux"))]
 pub(crate) fn remove_managed_revision(
     vault: &ConfigVault,
     profile_id: &str,
@@ -128,6 +148,7 @@ fn redact_batch_import_for_ipc(mut result: BatchImportResult) -> BatchImportResu
     result
 }
 
+#[cfg(not(target_os = "linux"))]
 fn preserve_canonical_subscription(profile: &mut Profile, stored: Option<&Profile>) {
     profile.subscription = if profile.backend == TunnelBackend::Xray {
         stored.and_then(|profile| profile.subscription.clone())
@@ -139,6 +160,7 @@ fn preserve_canonical_subscription(profile: &mut Profile, stored: Option<&Profil
 /// Linux multinode: the node pins live on the profile but are edited through
 /// `set_pinned_routes`, never through the generic form save — restore the
 /// stored value so editing other fields cannot drop them.
+#[cfg(not(target_os = "linux"))]
 fn preserve_pinned_policies(profile: &mut Profile, stored: Option<&Profile>) {
     profile.pinned_policies = if profile.backend == TunnelBackend::Xray {
         stored.map_or_else(Vec::new, |profile| profile.pinned_policies.clone())
@@ -147,6 +169,7 @@ fn preserve_pinned_policies(profile: &mut Profile, stored: Option<&Profile>) {
     };
 }
 
+#[cfg(not(target_os = "linux"))]
 fn preserve_service_checks(profile: &mut Profile, stored: Option<&Profile>) {
     profile.xray_service_checks = if profile.backend == TunnelBackend::Xray {
         stored
@@ -160,6 +183,7 @@ fn preserve_service_checks(profile: &mut Profile, stored: Option<&Profile>) {
 /// Named `netorch proxy` exits are owned by the proxy commands, never the
 /// generic form save — restore the stored spec so ordinary edits keep the
 /// aliases, and a non-Xray backend drops them entirely.
+#[cfg(not(target_os = "linux"))]
 fn preserve_named_proxy_exits(profile: &mut Profile, stored: Option<&Profile>) {
     profile.xray_proxy_exits = if profile.backend == TunnelBackend::Xray {
         stored
@@ -170,6 +194,7 @@ fn preserve_named_proxy_exits(profile: &mut Profile, stored: Option<&Profile>) {
     };
 }
 
+#[cfg(not(target_os = "linux"))]
 fn preserve_migrated_xray_settings(profile: &mut Profile, stored: Option<&Profile>) {
     if profile.backend != TunnelBackend::Xray {
         profile.xray_sockopts = None;
@@ -199,6 +224,7 @@ fn preserve_migrated_xray_settings(profile: &mut Profile, stored: Option<&Profil
     // the existing Linux form owns its editable toggle.
 }
 
+#[cfg(not(target_os = "linux"))]
 fn preserve_generated_xray_source(profile: &mut Profile, stored: Option<&Profile>) {
     let generated = stored.filter(|existing| {
         profile.backend == TunnelBackend::Xray
@@ -209,25 +235,16 @@ fn preserve_generated_xray_source(profile: &mut Profile, stored: Option<&Profile
     profile.xray_http_port = generated.and_then(|existing| existing.xray_http_port);
 }
 
+#[cfg(not(target_os = "linux"))]
 fn validate_xray_routing(profile: &Profile) -> Result<(), String> {
     if profile.backend == TunnelBackend::Xray {
         net_manager_core::xray::validate_routing_policy_selectors(&profile.domain_policies)
             .map_err(|err| format!("invalid Xray routing rule: {err}"))?;
-        #[cfg(target_os = "linux")]
-        for url in [
-            profile.xray_geoip_url.as_deref(),
-            profile.xray_geosite_url.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            net_manager_engine::linux_geo_assets::validate_geo_asset_url(url)
-                .map_err(|err| format!("invalid Xray geo data URL: {err}"))?;
-        }
     }
     Ok(())
 }
 
+#[cfg(not(target_os = "linux"))]
 fn validate_managed_save_path(
     vault: &ConfigVault,
     stored: Option<&Profile>,
@@ -252,112 +269,23 @@ fn validate_managed_save_path(
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
-async fn ensure_linux_wireguard_stopped(
-    client: &crate::daemon_client::DaemonClient,
-    profile: &Profile,
-    action: &str,
-) -> Result<(), String> {
-    let status = crate::commands::tunnels::linux_wireguard_status(client, profile).await?;
-    if status.state != TunnelState::Stopped {
-        return Err(format!(
-            "profile '{}' is active; disconnect before {action}",
-            profile.id
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-async fn ensure_linux_openvpn_stopped(
-    client: &crate::daemon_client::DaemonClient,
-    profile: &Profile,
-    action: &str,
-) -> Result<(), String> {
-    let status = crate::commands::tunnels::linux_openvpn_status(client, profile).await?;
-    if status.state != TunnelState::Stopped {
-        return Err(format!(
-            "profile '{}' is active; disconnect before {action}",
-            profile.id
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-async fn ensure_linux_xray_stopped(
-    client: &crate::daemon_client::DaemonClient,
-    profile: &Profile,
-    action: &str,
-) -> Result<(), String> {
-    let status = crate::commands::tunnels::linux_xray_status(client, profile).await?;
-    if status.state != TunnelState::Stopped {
-        return Err(format!(
-            "Xray TUN profile is active; disconnect before {action}"
-        ));
-    }
-    Ok(())
-}
-
+#[cfg(not(target_os = "linux"))]
 async fn ensure_profile_stopped(
     state: &AppState,
     profile: &Profile,
     action: &str,
 ) -> Result<(), String> {
-    #[cfg(target_os = "linux")]
-    if profile.backend == TunnelBackend::WireGuard {
-        return ensure_linux_wireguard_stopped(
-            &crate::daemon_client::DaemonClient::system(),
-            profile,
-            action,
-        )
-        .await;
+    let mut runtime = state.runtime.lock().await;
+    if runtime.tunnels.status(profile).state == TunnelState::Running {
+        return Err(format!(
+            "profile '{}' is running; disconnect before {action}",
+            profile.id
+        ));
     }
-    #[cfg(target_os = "linux")]
-    if profile.backend == TunnelBackend::OpenVpn {
-        return ensure_linux_openvpn_stopped(
-            &crate::daemon_client::DaemonClient::system(),
-            profile,
-            action,
-        )
-        .await;
-    }
-    #[cfg(target_os = "linux")]
-    if profile.backend == TunnelBackend::Xray && profile.xray_mode == XrayMode::Tun {
-        return ensure_linux_xray_stopped(
-            &crate::daemon_client::DaemonClient::system(),
-            profile,
-            action,
-        )
-        .await;
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let status = crate::commands::tunnels::linux_profile_status(
-            &crate::daemon_client::DaemonClient::system(),
-            state,
-            profile,
-        )
-        .await?;
-        if status.state != TunnelState::Stopped {
-            return Err(format!("profile is active; disconnect before {action}"));
-        }
-        Ok(())
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let mut runtime = state.runtime.lock().await;
-        if runtime.tunnels.status(profile).state == TunnelState::Running {
-            return Err(format!(
-                "profile '{}' is running; disconnect before {action}",
-                profile.id
-            ));
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
     Ok(())
 }
 
+#[cfg(not(target_os = "linux"))]
 #[tauri::command]
 pub(crate) async fn get_profiles(state: State<'_, AppState>) -> Result<Vec<Profile>, String> {
     state
@@ -367,6 +295,7 @@ pub(crate) async fn get_profiles(state: State<'_, AppState>) -> Result<Vec<Profi
         .map_err(|e| e.to_string())
 }
 
+#[cfg(not(target_os = "linux"))]
 #[tauri::command]
 pub(crate) async fn reorder_profiles(
     backend: TunnelBackend,
@@ -380,6 +309,7 @@ pub(crate) async fn reorder_profiles(
     Ok(redact_profiles_for_ipc(doc.profiles))
 }
 
+#[cfg(not(target_os = "linux"))]
 #[tauri::command]
 pub(crate) async fn save_profile(
     mut profile: Profile,
@@ -394,21 +324,8 @@ pub(crate) async fn save_profile(
     preserve_named_proxy_exits(&mut profile, stored.as_ref());
     preserve_migrated_xray_settings(&mut profile, stored.as_ref());
     preserve_generated_xray_source(&mut profile, stored.as_ref());
-    #[cfg(target_os = "linux")]
-    if profile.backend == TunnelBackend::Xray
-        && profile.xray_mode == XrayMode::Tun
-        && (profile.xray_socks_port.is_none() || profile.xray_http_port.is_none())
-    {
-        return Err("Xray TUN requires a generated share-link profile".into());
-    }
     validate_xray_routing(&profile)?;
     if let Some(existing) = &stored {
-        #[cfg(target_os = "linux")]
-        crate::commands::always_on::ensure_not_enrolled(
-            &crate::daemon_client::DaemonClient::system(),
-            existing,
-        )
-        .await?;
         ensure_profile_stopped(&state, existing, "editing").await?;
     }
     validate_managed_save_path(&state.config_vault, stored.as_ref(), &profile)?;
@@ -447,18 +364,13 @@ pub(crate) async fn save_profile(
     Ok(redact_profiles_for_ipc(doc.profiles))
 }
 
+#[cfg(not(target_os = "linux"))]
 #[tauri::command]
 pub(crate) async fn delete_profile(
     id: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<Profile>, String> {
     let profile = find_profile(&state.profiles, &id)?;
-    #[cfg(target_os = "linux")]
-    crate::commands::always_on::ensure_not_enrolled(
-        &crate::daemon_client::DaemonClient::system(),
-        &profile,
-    )
-    .await?;
     ensure_profile_stopped(&state, &profile, "deleting").await?;
     {
         let mut runtime = state.runtime.lock().await;
@@ -473,15 +385,10 @@ pub(crate) async fn delete_profile(
         .config_vault
         .remove_profile(&id)
         .map_err(|err| format!("profile deleted, but managed config cleanup failed: {err}"))?;
-    #[cfg(target_os = "linux")]
-    if profile.backend == TunnelBackend::OpenVpn {
-        state.openvpn_credentials.forget(&id, None).map_err(|_| {
-            "profile deleted, but remembered OpenVPN credentials could not be removed".to_string()
-        })?;
-    }
     Ok(redact_profiles_for_ipc(doc.profiles))
 }
 
+#[cfg(not(target_os = "linux"))]
 #[tauri::command]
 pub(crate) async fn save_vless_profile(
     mut profile: Profile,
@@ -539,6 +446,7 @@ pub(crate) async fn save_vless_profile(
     Ok(redact_profiles_for_ipc(doc.profiles))
 }
 
+#[cfg(not(target_os = "linux"))]
 fn generate_endpoint_config(
     uri: &str,
     socks_port: u16,
@@ -550,6 +458,7 @@ fn generate_endpoint_config(
 
 /// Render WireGuard `[Interface]`/`[Peer]` config text from user-supplied
 /// fields. Values are written verbatim; the caller validates them.
+#[cfg(not(target_os = "linux"))]
 pub(crate) fn render_wireguard_config(fields: &WireGuardFields) -> String {
     let mut out = String::new();
     out.push_str("[Interface]\n");
@@ -572,6 +481,7 @@ pub(crate) fn render_wireguard_config(fields: &WireGuardFields) -> String {
     out
 }
 
+#[cfg(not(target_os = "linux"))]
 #[tauri::command]
 pub(crate) async fn save_wireguard_profile(
     mut profile: Profile,
@@ -605,12 +515,6 @@ pub(crate) async fn save_wireguard_profile(
     preserve_named_proxy_exits(&mut profile, stored.as_ref());
     preserve_migrated_xray_settings(&mut profile, stored.as_ref());
     if let Some(existing) = &stored {
-        #[cfg(target_os = "linux")]
-        crate::commands::always_on::ensure_not_enrolled(
-            &crate::daemon_client::DaemonClient::system(),
-            existing,
-        )
-        .await?;
         ensure_profile_stopped(&state, existing, "editing").await?;
     }
     let body = render_wireguard_config(&fields).into_bytes();
@@ -641,10 +545,12 @@ pub(crate) async fn save_wireguard_profile(
     Ok(redact_profiles_for_ipc(doc.profiles))
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "linux")))]
 pub(crate) use net_manager_core::profile_import::detect_backend;
+#[cfg(not(target_os = "linux"))]
 pub(crate) use net_manager_core::profile_import::{generate_import_id, import_configs_into};
 
+#[cfg(not(target_os = "linux"))]
 #[tauri::command]
 pub(crate) async fn import_share_link(
     link: String,
@@ -673,6 +579,7 @@ pub(crate) async fn import_share_link(
     }))
 }
 
+#[cfg(not(target_os = "linux"))]
 #[tauri::command]
 pub(crate) async fn import_configs_batch(
     paths: Vec<String>,
@@ -693,16 +600,18 @@ pub(crate) async fn import_configs_batch(
     .map_err(|e| e.to_string())
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "linux")))]
 use net_manager_core::subscription::base64_decode;
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "linux")))]
 use net_manager_core::subscription::parse_subscription_body;
 
 // Subscription metadata parsing lives in the core so the native client
 // shares it; these names keep the Tauri call sites and tests stable.
+#[cfg(not(target_os = "linux"))]
 use net_manager_core::subscription::ResponseMeta as SubscriptionResponseMeta;
 
 /// Fetch a subscription and import its supported share links.
+#[cfg(not(target_os = "linux"))]
 pub(crate) async fn import_subscription_into(
     vault: &ConfigVault,
     store: &net_manager_core::profiles::ProfileStore,
@@ -726,6 +635,7 @@ pub(crate) async fn import_subscription_into(
     )
 }
 
+#[cfg(not(target_os = "linux"))]
 async fn read_subscription_response(mut response: reqwest::Response) -> Result<String, String> {
     let mut bytes = Vec::new();
     while let Some(chunk) = response
@@ -741,7 +651,7 @@ async fn read_subscription_response(mut response: reqwest::Response) -> Result<S
     String::from_utf8(bytes).map_err(|_| "subscription body is not UTF-8".to_string())
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "linux")))]
 fn import_subscription_body_into(
     vault: &ConfigVault,
     store: &net_manager_core::profiles::ProfileStore,
@@ -760,6 +670,7 @@ fn import_subscription_body_into(
     )
 }
 
+#[cfg(not(target_os = "linux"))]
 fn import_subscription_body_into_with_metadata(
     vault: &ConfigVault,
     store: &net_manager_core::profiles::ProfileStore,
@@ -794,6 +705,7 @@ fn import_subscription_body_into_with_metadata(
     })
 }
 
+#[cfg(not(target_os = "linux"))]
 #[tauri::command]
 pub(crate) async fn import_subscription(
     url: String,
@@ -826,6 +738,7 @@ pub(crate) struct SubscriptionRefreshResult {
     pub pool_report: Option<net_manager_core::node_pool::NodePoolReport>,
 }
 
+#[cfg(not(target_os = "linux"))]
 fn subscription_profile(
     store: &net_manager_core::profiles::ProfileStore,
     id: &str,
@@ -844,6 +757,7 @@ fn subscription_profile(
     Ok(profile)
 }
 
+#[cfg(not(target_os = "linux"))]
 async fn refresh_subscription_into(
     vault: &ConfigVault,
     store: &net_manager_core::profiles::ProfileStore,
@@ -853,6 +767,7 @@ async fn refresh_subscription_into(
     refresh_subscription_into_with_ports(vault, store, client, id, loopback_port_available).await
 }
 
+#[cfg(not(target_os = "linux"))]
 async fn refresh_subscription_into_with_ports(
     vault: &ConfigVault,
     store: &net_manager_core::profiles::ProfileStore,
@@ -883,7 +798,7 @@ async fn refresh_subscription_into_with_ports(
     refresh_subscription_body_into_with_metadata(vault, store, id, &body, available, meta)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "linux")))]
 fn refresh_subscription_body_into(
     vault: &ConfigVault,
     store: &net_manager_core::profiles::ProfileStore,
@@ -901,6 +816,7 @@ fn refresh_subscription_body_into(
     )
 }
 
+#[cfg(not(target_os = "linux"))]
 fn refresh_subscription_body_into_with_metadata(
     vault: &ConfigVault,
     store: &net_manager_core::profiles::ProfileStore,
@@ -923,6 +839,7 @@ fn refresh_subscription_body_into_with_metadata(
     })
 }
 
+#[cfg(not(target_os = "linux"))]
 async fn finish_subscription_refresh(
     state: &AppState,
     id: &str,
@@ -961,6 +878,7 @@ async fn finish_subscription_refresh(
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 fn record_subscription_refresh_failure(
     store: &net_manager_core::profiles::ProfileStore,
     id: &str,
@@ -971,6 +889,7 @@ fn record_subscription_refresh_failure(
         .map_err(|_| "failed to store subscription refresh state".to_string())
 }
 
+#[cfg(not(target_os = "linux"))]
 fn set_subscription_refresh_interval_into(
     store: &net_manager_core::profiles::ProfileStore,
     id: &str,
@@ -986,6 +905,7 @@ fn set_subscription_refresh_interval_into(
 }
 
 /// The profile a role change applies to: static routes create no tunnel.
+#[cfg(not(target_os = "linux"))]
 fn tunnel_profile(
     store: &net_manager_core::profiles::ProfileStore,
     id: &str,
@@ -1003,6 +923,7 @@ fn tunnel_profile(
     Ok(profile)
 }
 
+#[cfg(not(target_os = "linux"))]
 fn set_tunnel_role_into(
     store: &net_manager_core::profiles::ProfileStore,
     id: &str,
@@ -1016,6 +937,7 @@ fn set_tunnel_role_into(
     Ok(redact_profiles_for_ipc(document.profiles))
 }
 
+#[cfg(not(target_os = "linux"))]
 fn set_tunnel_networks_into(
     store: &net_manager_core::profiles::ProfileStore,
     id: &str,
@@ -1033,6 +955,7 @@ fn set_tunnel_networks_into(
 
 /// Primary takes all traffic; secondary only its own networks. A running
 /// connection is stopped first so the role applies to a fresh start.
+#[cfg(not(target_os = "linux"))]
 #[tauri::command]
 pub(crate) async fn set_tunnel_role(
     id: String,
@@ -1046,6 +969,7 @@ pub(crate) async fn set_tunnel_role(
 
 /// Networks (CIDR or single addresses) and split-DNS domains of a secondary
 /// connection, typed as text; validated here, never trusted by the daemon.
+#[cfg(not(target_os = "linux"))]
 #[tauri::command]
 pub(crate) async fn set_tunnel_networks(
     id: String,
@@ -1058,6 +982,7 @@ pub(crate) async fn set_tunnel_networks(
     set_tunnel_networks_into(&state.profiles, &id, &networks, &dns_domains)
 }
 
+#[cfg(not(target_os = "linux"))]
 #[tauri::command]
 pub(crate) async fn set_subscription_refresh_interval(
     profile_id: String,
@@ -1073,6 +998,7 @@ pub(crate) async fn set_subscription_refresh_interval(
     )
 }
 
+#[cfg(not(target_os = "linux"))]
 #[tauri::command]
 pub(crate) async fn refresh_subscription(
     id: String,
@@ -1103,6 +1029,7 @@ pub(crate) async fn refresh_subscription(
 }
 
 pub(crate) async fn run_subscription_refresh_loop(app: tauri::AppHandle) {
+    #[cfg(not(target_os = "linux"))]
     let Ok(client) = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .user_agent(net_manager_core::subscription::SUBSCRIPTION_USER_AGENT)
@@ -1129,18 +1056,41 @@ pub(crate) async fn run_subscription_refresh_loop(app: tauri::AppHandle) {
                 continue;
             }
             let _guard = SUBSCRIPTION_REFRESH_LOCK.lock().await;
-            let Ok(current) = subscription_profile(&state.profiles, &profile.id) else {
+            #[cfg(target_os = "linux")]
+            let selected = {
+                let id = profile.id.clone();
+                linux_profiles_operation(state.inner(), move |service| {
+                    service.subscription_profile(&id)
+                })
+                .await
+            };
+            #[cfg(not(target_os = "linux"))]
+            let selected = subscription_profile(&state.profiles, &profile.id);
+            let Ok(current) = selected else {
                 continue;
             };
             if !should_auto_refresh(&current, unix_now(), false) {
                 continue;
             }
+            #[cfg(target_os = "linux")]
+            let active = {
+                let candidate = current.clone();
+                linux_profiles_operation(state.inner(), move |service| {
+                    service.ensure_editable(&candidate)
+                })
+                .await
+                .is_err()
+            };
+            #[cfg(not(target_os = "linux"))]
             let active = ensure_profile_stopped(&state, &current, "refreshing subscription")
                 .await
                 .is_err();
             if !should_auto_refresh(&current, unix_now(), active) {
                 continue;
             }
+            #[cfg(target_os = "linux")]
+            let refresh = linux_refresh_subscription(state.inner(), &current.id).await;
+            #[cfg(not(target_os = "linux"))]
             let refresh = refresh_subscription_into(
                 &state.config_vault,
                 &state.profiles,
@@ -1151,7 +1101,12 @@ pub(crate) async fn run_subscription_refresh_loop(app: tauri::AppHandle) {
 
             match refresh {
                 Ok(result) => {
-                    match finish_subscription_refresh(state.inner(), &current.id, result).await {
+                    #[cfg(not(target_os = "linux"))]
+                    let completed =
+                        finish_subscription_refresh(state.inner(), &current.id, result).await;
+                    #[cfg(target_os = "linux")]
+                    let completed: Result<_, String> = Ok(result);
+                    match completed {
                         Ok(result) => {
                             let _ = app.emit("subscription-refreshed", (&current.id, &result));
                         }
@@ -1161,7 +1116,10 @@ pub(crate) async fn run_subscription_refresh_loop(app: tauri::AppHandle) {
                         }
                     }
                 }
-                Err(_) => {
+                Err(_error) => {
+                    #[cfg(target_os = "linux")]
+                    let error = _error.as_str();
+                    #[cfg(not(target_os = "linux"))]
                     let error = if record_subscription_refresh_failure(
                         &state.profiles,
                         &current.id,
@@ -1182,6 +1140,7 @@ pub(crate) async fn run_subscription_refresh_loop(app: tauri::AppHandle) {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SubscriptionDelayResult {
@@ -1189,6 +1148,7 @@ pub(crate) struct SubscriptionDelayResult {
     pub error: Option<String>,
 }
 
+#[cfg(not(target_os = "linux"))]
 async fn measure_delay_with_process(
     uri: &str,
     command: tokio::process::Command,
@@ -1199,6 +1159,7 @@ async fn measure_delay_with_process(
         .await
 }
 
+#[cfg(not(target_os = "linux"))]
 #[tauri::command]
 pub(crate) async fn measure_subscription_endpoint_delay(
     profile_id: String,
@@ -1239,6 +1200,7 @@ pub(crate) async fn measure_subscription_endpoint_delay(
     )
 }
 
+#[cfg(not(target_os = "linux"))]
 #[tauri::command]
 pub(crate) async fn get_subscription_endpoints(
     profile_id: String,
@@ -1254,6 +1216,7 @@ pub(crate) async fn get_subscription_endpoints(
 }
 
 /// Node key of the new primary (16 hex chars, never the share-link URL).
+#[cfg(not(target_os = "linux"))]
 #[tauri::command]
 pub(crate) async fn switch_subscription_endpoint(
     profile_id: String,
@@ -1272,6 +1235,7 @@ pub(crate) async fn switch_subscription_endpoint(
     )
 }
 
+#[cfg(not(target_os = "linux"))]
 fn switch_subscription_endpoint_into(
     vault: &ConfigVault,
     store: &net_manager_core::profiles::ProfileStore,
@@ -1292,6 +1256,7 @@ fn switch_subscription_endpoint_into(
 
 /// Ordered backup nodes tried after the primary fails its HTTPS probes.
 /// Keys are kept even when a node left the subscription (it may reappear).
+#[cfg(not(target_os = "linux"))]
 #[tauri::command]
 pub(crate) async fn set_subscription_backups(
     profile_id: String,
@@ -1315,6 +1280,7 @@ pub(crate) async fn set_subscription_backups(
 
 /// Probe the primary over HTTPS while a backup carries traffic and switch
 /// back when it answers again. Enabled unless explicitly turned off.
+#[cfg(not(target_os = "linux"))]
 #[tauri::command]
 pub(crate) async fn set_subscription_auto_return(
     profile_id: String,
@@ -1334,6 +1300,7 @@ pub(crate) async fn set_subscription_auto_return(
 
 /// Domain selectors pinned to one node: while that node is down or gone the
 /// selectors are blocked, never sent direct or through another node.
+#[cfg(not(target_os = "linux"))]
 #[tauri::command]
 pub(crate) async fn set_pinned_routes(
     profile_id: String,
@@ -1345,7 +1312,7 @@ pub(crate) async fn set_pinned_routes(
     if profile.backend != TunnelBackend::Xray {
         return Err("node-pinned rules need an Xray subscription".into());
     }
-    let candidate = if profile
+    let _candidate = if profile
         .xray_service_checks
         .iter()
         .any(|check| check.background)
@@ -1354,8 +1321,6 @@ pub(crate) async fn set_pinned_routes(
         candidate.pinned_policies = routes.clone();
         net_manager_core::profiles::validate_profile(&candidate)
             .map_err(|_| "The pinned-route configuration is invalid".to_string())?;
-        #[cfg(target_os = "linux")]
-        acknowledge_service_checks(&candidate, &candidate.xray_service_checks).await?;
         Some(candidate)
     } else {
         None
@@ -1366,29 +1331,11 @@ pub(crate) async fn set_pinned_routes(
         &profile_id,
         routes,
     );
-    #[cfg(target_os = "linux")]
-    if saved.is_err() {
-        if let Some(candidate) = candidate {
-            acknowledge_service_checks(&candidate, &[]).await?;
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    let _ = candidate;
     let doc = saved.map_err(|e| e.to_string())?;
     Ok(redact_profiles_for_ipc(doc.profiles))
 }
 
-fn require_service_check_user() -> Result<(), String> {
-    #[cfg(target_os = "linux")]
-    {
-        // SAFETY: geteuid has no preconditions.
-        if unsafe { libc::geteuid() } == 0 {
-            return Err("Run service-check operations as your own user, without sudo".into());
-        }
-    }
-    Ok(())
-}
-
+#[cfg(not(target_os = "linux"))]
 fn service_check_profile(state: &AppState, profile_id: &str) -> Result<Profile, String> {
     let profile = find_profile(&state.profiles, profile_id)
         .map_err(|_| "The requested profile could not be selected".to_string())?;
@@ -1398,6 +1345,7 @@ fn service_check_profile(state: &AppState, profile_id: &str) -> Result<Profile, 
     Ok(profile)
 }
 
+#[cfg(not(target_os = "linux"))]
 fn service_check_endpoints(
     state: &AppState,
     profile: &Profile,
@@ -1411,76 +1359,13 @@ fn service_check_endpoints(
         .map_err(|_| "The saved endpoint list could not be read".to_string())
 }
 
-#[cfg(target_os = "linux")]
-async fn acknowledge_service_checks(
-    profile: &Profile,
-    checks: &[ServiceCheck],
-) -> Result<(), String> {
-    use net_manager_core::daemon_protocol::{
-        method, XrayProfileParams, XrayServiceChecksParams, XrayStatusResult,
-    };
-
-    if profile.xray_mode != XrayMode::Tun
-        || (!profile
-            .xray_service_checks
-            .iter()
-            .any(|check| check.background)
-            && !checks.iter().any(|check| check.background))
-    {
-        return Ok(());
-    }
-
-    let runtime_checks = checks
-        .iter()
-        .filter(|check| {
-            check.background
-                && net_manager_core::service_checks::service_check_is_bound(
-                    profile,
-                    &check.endpoint_key,
-                )
-        })
-        .cloned()
-        .collect();
-
-    let client = crate::daemon_client::DaemonClient::system();
-    if client
-        .request::<_, Vec<ServiceCheckResult>>(
-            method::XRAY_SERVICE_CHECKS,
-            XrayServiceChecksParams {
-                profile_id: profile.id.clone(),
-                checks: runtime_checks,
-            },
-        )
-        .await
-        .is_ok()
-    {
-        return Ok(());
-    }
-
-    let stopped = client
-        .request::<_, XrayStatusResult>(
-            method::XRAY_STATUS,
-            XrayProfileParams {
-                profile_id: profile.id.clone(),
-            },
-        )
-        .await
-        .is_ok_and(|status| status.state == TunnelState::Stopped);
-
-    if stopped {
-        Ok(())
-    } else {
-        Err("The daemon did not confirm the diagnostic change; configuration was not saved".into())
-    }
-}
-
+#[cfg(not(target_os = "linux"))]
 #[tauri::command]
 pub(crate) async fn set_xray_service_checks(
     profile_id: String,
     checks: Vec<ServiceCheck>,
     state: State<'_, AppState>,
 ) -> Result<Vec<Profile>, String> {
-    require_service_check_user()?;
     let _guard = SUBSCRIPTION_REFRESH_LOCK.lock().await;
     let expected = service_check_profile(state.inner(), &profile_id)?;
     let expected_endpoints = service_check_endpoints(state.inner(), &expected)?;
@@ -1510,9 +1395,6 @@ pub(crate) async fn set_xray_service_checks(
     net_manager_core::profiles::validate_profile(&candidate)
         .map_err(|_| "The profile cannot accept this configuration".to_string())?;
 
-    #[cfg(target_os = "linux")]
-    acknowledge_service_checks(&expected, &checks).await?;
-
     let saved_document = state.profiles.update_profile(&profile_id, |current| {
         if *current != expected {
             return Err(std::io::Error::other("selection changed"));
@@ -1531,43 +1413,20 @@ pub(crate) async fn set_xray_service_checks(
     let document = match saved_document {
         Ok(document) => document,
         Err(_) => {
-            #[cfg(target_os = "linux")]
-            let stopped = acknowledge_service_checks(
-                if expected
-                    .xray_service_checks
-                    .iter()
-                    .any(|check| check.background)
-                {
-                    &expected
-                } else {
-                    &candidate
-                },
-                &[],
-            )
-            .await
-            .is_ok();
-            #[cfg(not(target_os = "linux"))]
-            let stopped = true;
-            return Err(if stopped {
-                "Checks were not saved; background diagnostics are stopped."
-            } else {
-                "Checks were not saved; the daemon did not confirm background cancellation."
-            }
-            .into());
+            return Err("Checks were not saved; background diagnostics are stopped.".into());
         }
     };
 
     Ok(redact_profiles_for_ipc(document.profiles))
 }
 
+#[cfg(not(target_os = "linux"))]
 #[tauri::command]
 pub(crate) async fn run_xray_service_checks(
     profile_id: String,
     check_ids: Option<Vec<String>>,
     state: State<'_, AppState>,
 ) -> Result<Vec<ServiceCheckResult>, String> {
-    require_service_check_user()?;
-
     let (expected, expected_endpoints) = {
         let _guard = SUBSCRIPTION_REFRESH_LOCK.lock().await;
         let profile = service_check_profile(state.inner(), &profile_id)?;
@@ -1612,6 +1471,7 @@ pub(crate) async fn run_xray_service_checks(
 /// The opt-in filtered pool: filters plus the country-proof flag; `None`
 /// turns the pool off and forgets its members. Members themselves come only
 /// from `rebuild_subscription_node_pool` — verified, never hand-picked.
+#[cfg(not(target_os = "linux"))]
 #[tauri::command]
 pub(crate) async fn set_subscription_node_pool(
     profile_id: String,
@@ -1632,6 +1492,7 @@ pub(crate) async fn set_subscription_node_pool(
 /// members whose real exit country passes. The report lists per-candidate
 /// verdicts — including wrong-country rejections — and whether the previous
 /// pool stayed because nothing usable answered.
+#[cfg(not(target_os = "linux"))]
 async fn rebuild_pool_report(
     state: &AppState,
     profile_id: &str,
@@ -1680,6 +1541,7 @@ async fn rebuild_pool_report(
     })
 }
 
+#[cfg(not(target_os = "linux"))]
 #[tauri::command]
 pub(crate) async fn rebuild_subscription_node_pool(
     profile_id: String,
@@ -1693,6 +1555,7 @@ pub(crate) async fn rebuild_subscription_node_pool(
 
 /// One failover candidate's real exit: where it answers from, what its name
 /// claims (flag emoji), and whether the two disagree.
+#[cfg(not(target_os = "linux"))]
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SubscriptionExitCheck {
@@ -1708,6 +1571,7 @@ pub(crate) struct SubscriptionExitCheck {
 
 /// The country a flag emoji names (🇷🇺 → RU), or `None` — a display hint
 /// compared against the probed exit, never trusted as one.
+#[cfg(not(target_os = "linux"))]
 fn flag_country(name: &str) -> Option<String> {
     let mut code = String::new();
     for ch in name.chars() {
@@ -1722,6 +1586,7 @@ fn flag_country(name: &str) -> Option<String> {
 /// Real exit-country verification of the failover chain — primary, manual
 /// backups and pool members — each probed through its own temporary Xray.
 /// A node name is not an exit; mismatches are reported, not hidden.
+#[cfg(not(target_os = "linux"))]
 #[tauri::command]
 pub(crate) async fn verify_subscription_exits(
     profile_id: String,
@@ -1846,6 +1711,7 @@ pub(crate) async fn verify_subscription_exits(
 
 /// What a policy migration would set, in client-safe form: counts,
 /// selectors and sanitized reasons — never the source's outbounds or links.
+#[cfg(not(target_os = "linux"))]
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct XrayPolicyPreview {
@@ -1878,6 +1744,7 @@ pub(crate) struct XrayPolicyPreview {
     pub refused: Vec<String>,
 }
 
+#[cfg(not(target_os = "linux"))]
 fn preview_of(
     migration: &net_manager_core::xray_migrate::XrayPolicyMigration,
 ) -> XrayPolicyPreview {
@@ -1932,6 +1799,7 @@ fn preview_of(
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 fn plan_migration(
     state: &AppState,
     profile: &Profile,
@@ -1987,6 +1855,7 @@ fn plan_migration(
 
 /// What the file at `path` would change on the profile — and which rules it
 /// refuses to fake. Nothing is saved.
+#[cfg(not(target_os = "linux"))]
 #[tauri::command]
 pub(crate) async fn preview_xray_policy_migration(
     profile_id: String,
@@ -2003,6 +1872,7 @@ pub(crate) async fn preview_xray_policy_migration(
 
 /// Adopt the file's policy on the profile. Refused rules block the whole
 /// apply — nothing is half-imported and reported as success.
+#[cfg(not(target_os = "linux"))]
 #[tauri::command]
 pub(crate) async fn apply_xray_policy_migration(
     profile_id: String,
@@ -2069,192 +1939,429 @@ pub(crate) async fn apply_xray_policy_migration(
     Ok(redact_profiles_for_ipc(document.profiles))
 }
 
-#[cfg(test)]
-mod tests {
+#[cfg(target_os = "linux")]
+async fn linux_profiles_operation<R: Send + 'static>(
+    state: &AppState,
+    operation: impl FnOnce(net_manager_engine::linux_profiles::ProfileService) -> Result<R, String>
+        + Send
+        + 'static,
+) -> Result<R, String> {
+    let root = state.data_dir().to_path_buf();
+    crate::daemon_client::DaemonClient::system()
+        .engine_request(move |engine| {
+            operation(net_manager_engine::linux_profiles::ProfileService::new(
+                root, engine,
+            ))
+        })
+        .await
+}
+
+#[cfg(target_os = "linux")]
+async fn linux_profiles_document(
+    state: &AppState,
+    operation: impl FnOnce(
+            net_manager_engine::linux_profiles::ProfileService,
+        ) -> Result<net_manager_core::profiles::ProfileDocument, String>
+        + Send
+        + 'static,
+) -> Result<Vec<Profile>, String> {
+    linux_profiles_operation(state, operation)
+        .await
+        .map(|document| redact_profiles_for_ipc(document.profiles))
+}
+
+#[cfg(target_os = "linux")]
+fn profile_network<T>(future: impl Future<Output = Result<T, String>>) -> Result<T, String> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| "Could not start the subscription runtime".to_string())?
+        .block_on(future)
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+pub(crate) async fn get_profiles(state: State<'_, AppState>) -> Result<Vec<Profile>, String> {
+    linux_profiles_operation(state.inner(), |service| service.profiles())
+        .await
+        .map(redact_profiles_for_ipc)
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+pub(crate) async fn reorder_profiles(
+    backend: TunnelBackend,
+    ordered_ids: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<Profile>, String> {
+    linux_profiles_document(state.inner(), move |service| {
+        service.reorder(backend, &ordered_ids)
+    })
+    .await
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+pub(crate) async fn save_profile(
+    profile: Profile,
+    state: State<'_, AppState>,
+) -> Result<Vec<Profile>, String> {
+    linux_profiles_document(state.inner(), move |service| {
+        service.save_form(profile, None)
+    })
+    .await
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+pub(crate) async fn save_vless_profile(
+    profile: Profile,
+    vless_url: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<Profile>, String> {
+    linux_profiles_document(state.inner(), move |service| {
+        service.save_form(
+            profile,
+            Some(net_manager_engine::linux_profiles::ProfileSource::ShareLink(vless_url)),
+        )
+    })
+    .await
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+pub(crate) async fn save_wireguard_profile(
+    profile: Profile,
+    fields: WireGuardFields,
+    state: State<'_, AppState>,
+) -> Result<Vec<Profile>, String> {
+    linux_profiles_document(state.inner(), move |service| {
+        service.save_form(
+            profile,
+            Some(net_manager_engine::linux_profiles::ProfileSource::WireGuard(fields)),
+        )
+    })
+    .await
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+pub(crate) async fn delete_profile(
+    id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<Profile>, String> {
+    let cleanup_id = id.clone();
+    let result = linux_profiles_document(state.inner(), move |service| service.delete(&id)).await?;
+    state.openvpn_credentials.forget(&cleanup_id, None)?;
+    Ok(result)
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+pub(crate) async fn import_share_link(
+    link: String,
+    name: String,
+    state: State<'_, AppState>,
+) -> Result<BatchImportResult, String> {
+    linux_profiles_operation(state.inner(), move |service| {
+        let id = net_manager_engine::linux_profiles::new_id()?;
+        let document = service.import_link(&id, &name, &link)?;
+        Ok(BatchImportResult {
+            profiles: document.profiles,
+            errors: Vec::new(),
+        })
+    })
+    .await
+    .map(redact_batch_import_for_ipc)
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+pub(crate) async fn import_configs_batch(
+    paths: Vec<String>,
+    default_backend: Option<TunnelBackend>,
+    state: State<'_, AppState>,
+) -> Result<BatchImportResult, String> {
+    linux_profiles_operation(state.inner(), move |service| {
+        service.import_configs(&paths, default_backend)
+    })
+    .await
+    .map(redact_batch_import_for_ipc)
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+pub(crate) async fn import_subscription(
+    url: String,
+    hwid: String,
+    refresh_interval_minutes: Option<u32>,
+    state: State<'_, AppState>,
+) -> Result<BatchImportResult, String> {
+    linux_profiles_operation(state.inner(), move |service| {
+        let id = net_manager_engine::linux_profiles::new_id()?;
+        let request = net_manager_core::subscription::SubscriptionImport {
+            id: &id,
+            url: &url,
+            hwid: &hwid,
+            name: "",
+            refresh_interval_minutes,
+        };
+        profile_network(service.import_subscription(&request, None))
+    })
+    .await
+    .map(redact_batch_import_for_ipc)
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+pub(crate) async fn set_tunnel_role(
+    id: String,
+    role: TunnelRole,
+    state: State<'_, AppState>,
+) -> Result<Vec<Profile>, String> {
+    linux_profiles_document(state.inner(), move |service| service.set_role(&id, role)).await
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+pub(crate) async fn set_tunnel_networks(
+    id: String,
+    networks: String,
+    dns_domains: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<Profile>, String> {
+    linux_profiles_document(state.inner(), move |service| {
+        service.set_networks(&id, &networks, &dns_domains)
+    })
+    .await
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+pub(crate) async fn set_subscription_refresh_interval(
+    profile_id: String,
+    refresh_interval_minutes: Option<u32>,
+    state: State<'_, AppState>,
+) -> Result<Vec<Profile>, String> {
+    linux_profiles_document(state.inner(), move |service| {
+        service.set_refresh_interval(&profile_id, refresh_interval_minutes)
+    })
+    .await
+}
+
+#[cfg(target_os = "linux")]
+async fn linux_refresh_subscription(
+    state: &AppState,
+    id: &str,
+) -> Result<SubscriptionRefreshResult, String> {
+    let id = id.to_string();
+    linux_profiles_operation(state, move |service| {
+        let result = profile_network(service.refresh_subscription(&id, None))?;
+        Ok(SubscriptionRefreshResult {
+            endpoint_count: result.endpoint_count,
+            active_index: result.active_index,
+            skipped_count: result.skipped_count,
+            fallback_used: result.fallback_used,
+            cleanup_failed: result.cleanup_failed,
+            pool_report: result.pool_report,
+        })
+    })
+    .await
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+pub(crate) async fn refresh_subscription(
+    id: String,
+    state: State<'_, AppState>,
+) -> Result<SubscriptionRefreshResult, String> {
+    let _guard = SUBSCRIPTION_REFRESH_LOCK.lock().await;
+    linux_refresh_subscription(state.inner(), &id).await
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+pub(crate) async fn measure_subscription_endpoint_delay(
+    profile_id: String,
+    endpoint_index: usize,
+    state: State<'_, AppState>,
+) -> Result<net_manager_engine::linux_profiles::SubscriptionDelayResult, String> {
+    linux_profiles_operation(state.inner(), move |service| {
+        profile_network(service.measure_endpoint_delay(&profile_id, endpoint_index))
+    })
+    .await
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+pub(crate) async fn get_subscription_endpoints(
+    profile_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<SubscriptionEndpointInfo>, String> {
+    linux_profiles_operation(state.inner(), move |service| {
+        service.subscription_endpoints(&profile_id)
+    })
+    .await
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+pub(crate) async fn switch_subscription_endpoint(
+    profile_id: String,
+    endpoint_key: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<Profile>, String> {
+    linux_profiles_document(state.inner(), move |service| {
+        service.switch_endpoint(&profile_id, &endpoint_key)
+    })
+    .await
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+pub(crate) async fn set_subscription_backups(
+    profile_id: String,
+    backup_keys: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<Profile>, String> {
+    linux_profiles_document(state.inner(), move |service| {
+        service.set_backups(&profile_id, &backup_keys)
+    })
+    .await
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+pub(crate) async fn set_subscription_auto_return(
+    profile_id: String,
+    enabled: bool,
+    state: State<'_, AppState>,
+) -> Result<Vec<Profile>, String> {
+    linux_profiles_document(state.inner(), move |service| {
+        service.set_auto_return(&profile_id, enabled)
+    })
+    .await
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+pub(crate) async fn set_pinned_routes(
+    profile_id: String,
+    routes: Vec<PinnedRoute>,
+    state: State<'_, AppState>,
+) -> Result<Vec<Profile>, String> {
+    linux_profiles_document(state.inner(), move |service| {
+        service.set_pinned_routes(&profile_id, routes)
+    })
+    .await
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+pub(crate) async fn set_xray_service_checks(
+    profile_id: String,
+    checks: Vec<ServiceCheck>,
+    state: State<'_, AppState>,
+) -> Result<Vec<Profile>, String> {
+    linux_profiles_document(state.inner(), move |service| {
+        service.set_service_checks(&profile_id, checks)
+    })
+    .await
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+pub(crate) async fn run_xray_service_checks(
+    profile_id: String,
+    check_ids: Option<Vec<String>>,
+    state: State<'_, AppState>,
+) -> Result<Vec<ServiceCheckResult>, String> {
+    linux_profiles_operation(state.inner(), move |service| {
+        profile_network(service.run_service_checks(&profile_id, check_ids.as_deref()))
+    })
+    .await
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+pub(crate) async fn set_subscription_node_pool(
+    profile_id: String,
+    pool: Option<NodePoolSettings>,
+    state: State<'_, AppState>,
+) -> Result<Vec<Profile>, String> {
+    linux_profiles_document(state.inner(), move |service| {
+        service.set_node_pool(&profile_id, pool)
+    })
+    .await
+}
+
+#[cfg(target_os = "linux")]
+async fn rebuild_pool_report(
+    state: &AppState,
+    profile_id: &str,
+) -> Result<Option<net_manager_core::node_pool::NodePoolReport>, String> {
+    let id = profile_id.to_string();
+    linux_profiles_operation(state, move |service| {
+        profile_network(service.rebuild_node_pool(&id))
+    })
+    .await
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+pub(crate) async fn rebuild_subscription_node_pool(
+    profile_id: String,
+    state: State<'_, AppState>,
+) -> Result<net_manager_core::node_pool::NodePoolReport, String> {
+    rebuild_pool_report(state.inner(), &profile_id)
+        .await?
+        .ok_or_else(|| "Set backup-pool filters before rebuilding the pool".to_string())
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+pub(crate) async fn verify_subscription_exits(
+    profile_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<net_manager_engine::linux_profiles::SubscriptionExitCheck>, String> {
+    linux_profiles_operation(state.inner(), move |service| {
+        profile_network(service.verify_subscription_exits(&profile_id))
+    })
+    .await
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+pub(crate) async fn preview_xray_policy_migration(
+    profile_id: String,
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<net_manager_engine::linux_profiles::XrayPolicyPreview, String> {
+    linux_profiles_operation(state.inner(), move |service| {
+        service.preview_migration(&profile_id, Path::new(&path))
+    })
+    .await
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+pub(crate) async fn apply_xray_policy_migration(
+    profile_id: String,
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<Profile>, String> {
+    linux_profiles_document(state.inner(), move |service| {
+        service.apply_migration(&profile_id, Path::new(&path))
+    })
+    .await
+}
+
+#[cfg(all(test, not(target_os = "linux")))]
+mod native_tests {
     use super::*;
     use crate::test_support::*;
     use base64::Engine;
     use std::fs;
-
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn linux_wireguard_edit_and_delete_guards_use_daemon_status() {
-        use net_manager_core::daemon_protocol::{method, RequestFrame, ResponseFrame};
-        use serde_json::json;
-        use tokio::io::{AsyncWriteExt, BufReader};
-        use tokio::net::UnixListener;
-
-        let dir = unique_dir("wg-mutation-guard");
-        let path = dir.join("daemon.sock");
-        let listener = UnixListener::bind(&path).unwrap();
-        let server = tokio::spawn(async move {
-            for state in ["running", "running", "stopped"] {
-                let (stream, _) = listener.accept().await.unwrap();
-                let (reader, mut writer) = stream.into_split();
-                let mut reader = BufReader::new(reader);
-                let hello: RequestFrame = serde_json::from_slice(
-                    &net_manager_core::daemon_protocol::read_frame(&mut reader, 1024)
-                        .await
-                        .unwrap()
-                        .unwrap(),
-                )
-                .unwrap();
-                writer
-                    .write_all(
-                        &net_manager_core::daemon_protocol::encode_line(&ResponseFrame::ok(
-                            hello.id,
-                            json!({"protocol":1,"daemonVersion":"test","uid":1000,"capabilities":[]}),
-                        ))
-                        .unwrap(),
-                    )
-                    .await
-                    .unwrap();
-                let request: RequestFrame = serde_json::from_slice(
-                    &net_manager_core::daemon_protocol::read_frame(&mut reader, 1024)
-                        .await
-                        .unwrap()
-                        .unwrap(),
-                )
-                .unwrap();
-                assert_eq!(request.method, method::WIREGUARD_STATUS);
-                assert_eq!(request.params["profileId"], "p1");
-                writer
-                    .write_all(
-                        &net_manager_core::daemon_protocol::encode_line(&ResponseFrame::ok(
-                            request.id,
-                            json!({"profileId":"p1","state":state,"interfaceName":null,"latestHandshake":null,"rxBytes":0,"txBytes":0,"dnsApplied":false,"warnings":[]}),
-                        ))
-                        .unwrap(),
-                    )
-                    .await
-                    .unwrap();
-            }
-        });
-        let client = crate::daemon_client::DaemonClient::new(path);
-        let profile = profile("wg-p1");
-        assert!(ensure_linux_wireguard_stopped(&client, &profile, "editing")
-            .await
-            .unwrap_err()
-            .contains("disconnect before editing"));
-        assert!(
-            ensure_linux_wireguard_stopped(&client, &profile, "deleting")
-                .await
-                .unwrap_err()
-                .contains("disconnect before deleting")
-        );
-        ensure_linux_wireguard_stopped(&client, &profile, "editing")
-            .await
-            .unwrap();
-        server.await.unwrap();
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn linux_openvpn_edit_guard_uses_daemon_status() {
-        use net_manager_core::daemon_protocol::{method, RequestFrame, ResponseFrame};
-        use serde_json::json;
-        use tokio::io::{AsyncWriteExt, BufReader};
-        use tokio::net::UnixListener;
-
-        let dir = unique_dir("ovpn-mutation-guard");
-        let path = dir.join("daemon.sock");
-        let listener = UnixListener::bind(&path).unwrap();
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let (reader, mut writer) = stream.into_split();
-            let mut reader = BufReader::new(reader);
-            let hello: RequestFrame = serde_json::from_slice(
-                &net_manager_core::daemon_protocol::read_frame(&mut reader, 1024)
-                    .await
-                    .unwrap()
-                    .unwrap(),
-            )
-            .unwrap();
-            writer
-                .write_all(
-                    &net_manager_core::daemon_protocol::encode_line(&ResponseFrame::ok(
-                        hello.id,
-                        json!({"protocol":1,"daemonVersion":"test","uid":1000,"capabilities":[]}),
-                    ))
-                    .unwrap(),
-                )
-                .await
-                .unwrap();
-            let request: RequestFrame = serde_json::from_slice(
-                &net_manager_core::daemon_protocol::read_frame(&mut reader, 1024)
-                    .await
-                    .unwrap()
-                    .unwrap(),
-            )
-            .unwrap();
-            assert_eq!(request.method, method::OPENVPN_STATUS);
-            writer.write_all(&net_manager_core::daemon_protocol::encode_line(&ResponseFrame::ok(request.id, json!({"profileId":"p1","state":"reconnecting","interfaceName":"tun0","rxBytes":0,"txBytes":0,"appliedRoutes":[],"warnings":[]}))).unwrap()).await.unwrap();
-        });
-        let client = crate::daemon_client::DaemonClient::new(path);
-        let mut profile = profile("tun0");
-        profile.backend = TunnelBackend::OpenVpn;
-        let error = ensure_linux_openvpn_stopped(&client, &profile, "editing")
-            .await
-            .unwrap_err();
-        assert!(error.contains("disconnect before editing"), "{error}");
-        server.await.unwrap();
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn linux_xray_tun_edit_guard_uses_daemon_status_after_restart() {
-        use net_manager_core::daemon_protocol::{method, RequestFrame, ResponseFrame};
-        use serde_json::json;
-        use tokio::io::{AsyncWriteExt, BufReader};
-        use tokio::net::UnixListener;
-        let dir = unique_dir("xray-tun-mutation-guard");
-        let path = dir.join("daemon.sock");
-        let listener = UnixListener::bind(&path).unwrap();
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let (reader, mut writer) = stream.into_split();
-            let mut reader = BufReader::new(reader);
-            let hello: RequestFrame = serde_json::from_slice(
-                &net_manager_core::daemon_protocol::read_frame(&mut reader, 1024)
-                    .await
-                    .unwrap()
-                    .unwrap(),
-            )
-            .unwrap();
-            writer
-                .write_all(
-                    &net_manager_core::daemon_protocol::encode_line(&ResponseFrame::ok(
-                        hello.id,
-                        json!({"protocol":1,"daemonVersion":"test","uid":1000,"capabilities":[]}),
-                    ))
-                    .unwrap(),
-                )
-                .await
-                .unwrap();
-            let request: RequestFrame = serde_json::from_slice(
-                &net_manager_core::daemon_protocol::read_frame(&mut reader, 1024)
-                    .await
-                    .unwrap()
-                    .unwrap(),
-            )
-            .unwrap();
-            assert_eq!(request.method, method::XRAY_STATUS);
-            writer.write_all(&net_manager_core::daemon_protocol::encode_line(&ResponseFrame::ok(request.id, json!({"profileId":"p1","state":"running","interfaceName":"xray-test","dnsApplied":true,"ipv4Covered":true,"ipv6Covered":false}))).unwrap()).await.unwrap();
-        });
-        let client = crate::daemon_client::DaemonClient::new(path);
-        let mut p = profile("xray");
-        p.backend = TunnelBackend::Xray;
-        p.xray_mode = XrayMode::Tun;
-        let err = ensure_linux_xray_stopped(&client, &p, "editing")
-            .await
-            .unwrap_err();
-        assert!(err.contains("disconnect before editing"));
-        assert!(!err.contains(&p.id));
-        server.await.unwrap();
-        fs::remove_dir_all(dir).unwrap();
-    }
 
     #[test]
     fn validate_managed_save_path_rejects_foreign_and_backend_swap() {
@@ -3566,49 +3673,6 @@ mod tests {
     }
 
     #[test]
-    fn public_profile_and_batch_responses_do_not_serialize_subscription_credentials() {
-        let mut stored = profile("subscription");
-        stored.backend = TunnelBackend::Xray;
-        stored.subscription = Some(SubscriptionMeta {
-            url: "https://example.test/private-token".into(),
-            hwid: "private-hwid".into(),
-            endpoint_count: 2,
-            active_index: 1,
-            refresh_interval_minutes: None,
-            last_refresh_at_unix: None,
-            last_refresh_error: None,
-            user_info: None,
-            provider_title: None,
-            announce: None,
-            support_url: None,
-            web_page_url: None,
-            update_interval_hours: None,
-            skipped_protocols: Vec::new(),
-            active_key: None,
-            backup_keys: Vec::new(),
-            auto_return_primary: None,
-            probe_url: None,
-            node_pool: None,
-            pool_keys: Vec::new(),
-        });
-        let public = redact_profiles_for_ipc(vec![stored.clone()]);
-        let json = serde_json::to_string(&public).unwrap();
-        assert!(!json.contains("private-token"));
-        assert!(!json.contains("private-hwid"));
-        assert!(!format!("{public:?}").contains("private-hwid"));
-        assert_eq!(public[0].subscription.as_ref().unwrap().endpoint_count, 2);
-        assert_eq!(stored.subscription.as_ref().unwrap().hwid, "private-hwid");
-        let batch = redact_batch_import_for_ipc(BatchImportResult {
-            profiles: vec![stored],
-            errors: Vec::new(),
-        });
-        let json = serde_json::to_string(&batch).unwrap();
-        assert!(!json.contains("private-token"));
-        assert!(!json.contains("private-hwid"));
-        assert!(!format!("{batch:?}").contains("private-token"));
-    }
-
-    #[test]
     fn save_roundtrip_restores_canonical_subscription_and_rejects_forged_metadata() {
         let dir = unique_dir("subscription-redacted-save");
         let vault = ConfigVault::new(dir.join("configs"));
@@ -3700,6 +3764,64 @@ mod tests {
     }
 
     #[test]
+    fn base64_decode_returns_none_for_invalid_input() {
+        assert!(base64_decode("!!!not-base64!!!").is_none());
+        assert!(base64_decode("").is_none());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::*;
+    #[cfg(target_os = "linux")]
+    use std::fs;
+    #[cfg(target_os = "linux")]
+    use std::net::Ipv4Addr;
+    #[test]
+    fn public_profile_and_batch_responses_do_not_serialize_subscription_credentials() {
+        let mut stored = profile("subscription");
+        stored.backend = TunnelBackend::Xray;
+        stored.subscription = Some(SubscriptionMeta {
+            url: "https://example.test/private-token".into(),
+            hwid: "private-hwid".into(),
+            endpoint_count: 2,
+            active_index: 1,
+            refresh_interval_minutes: None,
+            last_refresh_at_unix: None,
+            last_refresh_error: None,
+            user_info: None,
+            provider_title: None,
+            announce: None,
+            support_url: None,
+            web_page_url: None,
+            update_interval_hours: None,
+            skipped_protocols: Vec::new(),
+            active_key: None,
+            backup_keys: Vec::new(),
+            auto_return_primary: None,
+            probe_url: None,
+            node_pool: None,
+            pool_keys: Vec::new(),
+        });
+        let public = redact_profiles_for_ipc(vec![stored.clone()]);
+        let json = serde_json::to_string(&public).unwrap();
+        assert!(!json.contains("private-token"));
+        assert!(!json.contains("private-hwid"));
+        assert!(!format!("{public:?}").contains("private-hwid"));
+        assert_eq!(public[0].subscription.as_ref().unwrap().endpoint_count, 2);
+        assert_eq!(stored.subscription.as_ref().unwrap().hwid, "private-hwid");
+        let batch = redact_batch_import_for_ipc(BatchImportResult {
+            profiles: vec![stored],
+            errors: Vec::new(),
+        });
+        let json = serde_json::to_string(&batch).unwrap();
+        assert!(!json.contains("private-token"));
+        assert!(!json.contains("private-hwid"));
+        assert!(!format!("{batch:?}").contains("private-token"));
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
     fn fake_xray_process() {
         use std::io::{Read, Write};
         let Ok(mode) = std::env::var("NET_MANAGER_FAKE_XRAY") else {
@@ -3781,7 +3903,7 @@ mod tests {
         ]);
         command.env("NET_MANAGER_FAKE_XRAY", "ok");
         command.env("NET_MANAGER_FAKE_XRAY_PID", &pid_path);
-        let ms = measure_delay_with_process(
+        let ms = net_manager_core::subscription::measure_delay_with_command(
             "hy2://private-password@node.test:443",
             command,
             "http://example.test/generate_204",
@@ -3808,7 +3930,7 @@ mod tests {
         ]);
         command.env("NET_MANAGER_FAKE_XRAY", "hang");
         command.env("NET_MANAGER_FAKE_XRAY_PID", &pid_path);
-        let err = measure_delay_with_process(
+        let err = net_manager_core::subscription::measure_delay_with_command(
             "hy2://private-password@node.test:443",
             command,
             "http://example.test/generate_204",
@@ -3835,7 +3957,7 @@ mod tests {
         ]);
         command.env("NET_MANAGER_FAKE_XRAY", "http-error");
         command.env("NET_MANAGER_FAKE_XRAY_PID", &pid_path);
-        let err = measure_delay_with_process(
+        let err = net_manager_core::subscription::measure_delay_with_command(
             "hy2://private-password@node.test:443",
             command,
             "http://example.test/generate_204",
@@ -3863,7 +3985,7 @@ mod tests {
         command.env("NET_MANAGER_FAKE_XRAY", "hang");
         command.env("NET_MANAGER_FAKE_XRAY_PID", &pid_path);
         let task = tokio::spawn(async move {
-            measure_delay_with_process(
+            net_manager_core::subscription::measure_delay_with_command(
                 "hy2://private-password@node.test:443",
                 command,
                 "http://example.test/generate_204",
@@ -3893,9 +4015,112 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
-    fn base64_decode_returns_none_for_invalid_input() {
-        assert!(base64_decode("!!!not-base64!!!").is_none());
-        assert!(base64_decode("").is_none());
+    fn shared_profile_guards_reject_active_states_without_unrelated_enrollment_reads() {
+        use net_manager_core::daemon_protocol::{
+            method, AlwaysOnKind, AlwaysOnListResult, HelloResult, PROTOCOL_VERSION,
+        };
+        use net_manager_core::helper_client::HelperError;
+        use net_manager_engine::linux_engine::LinuxEngine;
+        use net_manager_engine::linux_profiles::ProfileService;
+        use net_manager_engine::privileged::Privileged;
+        use serde_json::{json, Value};
+
+        struct StatusFixture {
+            method: &'static str,
+            state: &'static str,
+            enrollable: bool,
+        }
+        impl Privileged for StatusFixture {
+            fn hello(&self) -> Result<HelloResult, HelperError> {
+                Ok(HelloResult {
+                    protocol: PROTOCOL_VERSION,
+                    daemon_version: "guard-fixture".into(),
+                    uid: unsafe { libc::geteuid() },
+                    capabilities: Vec::new(),
+                    tools: Default::default(),
+                })
+            }
+
+            fn call_raw(&self, method_name: &str, params: Value) -> Result<Value, HelperError> {
+                if method_name == method::ALWAYS_ON_LIST {
+                    assert!(
+                        self.enrollable && self.state == "stopped",
+                        "Active or non-enrollable connections must not depend on enrollment inventory"
+                    );
+                    return Ok(serde_json::to_value(AlwaysOnListResult {
+                        profiles: Vec::new(),
+                        paused: false,
+                        supported_kinds: vec![AlwaysOnKind::WireGuard, AlwaysOnKind::StaticRoutes],
+                    })
+                    .unwrap());
+                }
+                assert_eq!(method_name, self.method);
+                assert_eq!(params["profileId"], "guard-profile");
+                Ok(json!({
+                    "profileId": "guard-profile",
+                    "state": self.state,
+                    "interfaceName": null,
+                    "latestHandshake": null,
+                    "rxBytes": 0,
+                    "txBytes": 0,
+                    "dnsApplied": false,
+                    "ipv4Covered": false,
+                    "ipv6Covered": false,
+                    "appliedRoutes": [],
+                    "warnings": [],
+                }))
+            }
+
+            fn log_dir(&self) -> std::path::PathBuf {
+                std::env::temp_dir()
+            }
+        }
+
+        for (backend, status_method, states) in [
+            (
+                TunnelBackend::WireGuard,
+                method::WIREGUARD_STATUS,
+                ["running", "failed", "stopped"],
+            ),
+            (
+                TunnelBackend::OpenVpn,
+                method::OPENVPN_STATUS,
+                ["connected", "reconnecting", "stopped"],
+            ),
+            (
+                TunnelBackend::Xray,
+                method::XRAY_STATUS,
+                ["running", "failed", "stopped"],
+            ),
+        ] {
+            for state in states {
+                let fixture = StatusFixture {
+                    method: status_method,
+                    state,
+                    enrollable: backend == TunnelBackend::WireGuard,
+                };
+                let service = ProfileService::new(
+                    std::env::temp_dir().join("unused-profile-guard-root"),
+                    LinuxEngine::with_privileged(std::sync::Arc::new(fixture)),
+                );
+                let candidate = Profile {
+                    id: "guard-profile".into(),
+                    name: "Guard fixture".into(),
+                    backend,
+                    xray_mode: XrayMode::Tun,
+                    ..Profile::default()
+                };
+                let result = service.ensure_editable(&candidate);
+                if state == "stopped" {
+                    result.unwrap();
+                } else {
+                    let error = result.unwrap_err();
+                    assert!(error.contains("disconnect"), "{error}");
+                    assert!(!error.contains(&candidate.id));
+                }
+            }
+        }
     }
 }

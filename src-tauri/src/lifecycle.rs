@@ -1,10 +1,10 @@
 use crate::state::AppState;
-#[cfg(any(not(target_os = "linux"), test))]
+#[cfg(not(target_os = "linux"))]
 use net_manager_core::models::*;
 use std::sync::atomic::Ordering;
 use tauri::{Emitter, Manager};
 
-#[cfg(any(not(target_os = "linux"), test))]
+#[cfg(not(target_os = "linux"))]
 pub(crate) async fn cleanup_all(state: &AppState) -> Result<(), String> {
     let profiles = state.profiles.load().map_err(|e| e.to_string())?.profiles;
     let mut runtime = state.runtime.lock().await;
@@ -86,7 +86,7 @@ async fn exit_cleanup(state: &AppState) -> Result<(), String> {
     }
 }
 
-#[cfg(any(not(target_os = "linux"), test))]
+#[cfg(not(target_os = "linux"))]
 fn should_cleanup_on_ui_exit() -> bool {
     !cfg!(target_os = "linux")
 }
@@ -184,12 +184,6 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn linux_ui_exit_does_not_cleanup_daemon_owners() {
-        assert!(!should_cleanup_on_ui_exit());
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
     fn linux_close_hides_only_when_tray_was_created() {
         assert!(!should_hide_on_close(false));
         assert!(should_hide_on_close(true));
@@ -201,34 +195,32 @@ mod tests {
         assert!(should_cleanup_on_ui_exit());
     }
 
+    #[cfg(not(target_os = "linux"))]
     #[tokio::test]
-    #[cfg_attr(not(target_os = "linux"), allow(irrefutable_let_patterns))]
     async fn cleanup_all_removes_owned_routes_and_persists_empty_registry() {
         let dir = unique_dir("cleanup-all");
         let state = app_state(&dir);
         {
             let mut runtime = state.runtime.lock().await;
-            if let crate::route_runtime::RouteRuntime::Local { policies, .. } = &mut runtime.routes
-            {
-                policies
-                    .restore(vec![
-                        AppliedProfileRoutes {
-                            profile_id: "z".into(),
-                            routes: vec![],
-                        },
-                        AppliedProfileRoutes {
-                            profile_id: "a".into(),
-                            routes: vec![AppliedRoute {
-                                destination: "10.3.0.0/24".parse().unwrap(),
-                                interface_index: 4,
-                                metric: 10,
-                                gateway: None,
-                                table: None,
-                            }],
-                        },
-                    ])
-                    .unwrap();
-            }
+            let crate::route_runtime::RouteRuntime::Local { policies, .. } = &mut runtime.routes;
+            policies
+                .restore(vec![
+                    AppliedProfileRoutes {
+                        profile_id: "z".into(),
+                        routes: vec![],
+                    },
+                    AppliedProfileRoutes {
+                        profile_id: "a".into(),
+                        routes: vec![AppliedRoute {
+                            destination: "10.3.0.0/24".parse().unwrap(),
+                            interface_index: 4,
+                            metric: 10,
+                            gateway: None,
+                            table: None,
+                        }],
+                    },
+                ])
+                .unwrap();
         }
         cleanup_all(&state).await.unwrap();
         let mut runtime = state.runtime.lock().await;
@@ -248,16 +240,69 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn cleanup_all_reports_daemon_failure_after_attempting_other_cleanup() {
-        let dir = unique_dir("cleanup-daemon-unavailable");
+    async fn disconnect_all_reports_daemon_failure() {
+        use net_manager_core::daemon_protocol::{
+            self, method, ErrorCode, RequestFrame, ResponseFrame,
+        };
+        use tokio::io::{AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+
+        let dir = unique_dir("cleanup-daemon-failure");
         let state = app_state(&dir);
-        {
-            let mut runtime = state.runtime.lock().await;
-            runtime.routes = crate::route_runtime::RouteRuntime::Daemon(
-                crate::daemon_client::DaemonClient::new(dir.join("missing.sock")),
-            );
-        }
-        let err = cleanup_all(&state).await.unwrap_err();
-        assert!(err.contains("route ownership:"), "{err}");
+        let socket = dir.join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            let hello: RequestFrame = serde_json::from_slice(
+                &daemon_protocol::read_frame(&mut reader, 4096)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(hello.method, method::HELLO);
+            writer
+                .write_all(
+                    &daemon_protocol::encode_line(&ResponseFrame::ok(
+                        hello.id,
+                        serde_json::to_value(daemon_protocol::HelloResult {
+                            protocol: daemon_protocol::PROTOCOL_VERSION,
+                            daemon_version: "test".into(),
+                            uid: 1000,
+                            capabilities: Vec::new(),
+                            tools: Default::default(),
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            let request: RequestFrame = serde_json::from_slice(
+                &daemon_protocol::read_frame(&mut reader, 4096)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(request.method, method::RECOVERY_CLEANUP);
+            writer
+                .write_all(
+                    &daemon_protocol::encode_line(&ResponseFrame::error(
+                        request.id,
+                        ErrorCode::NotAuthorized,
+                        "denied",
+                    ))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        });
+        let client = crate::daemon_client::DaemonClient::new(socket);
+        let error = disconnect_all(&state, &client).await.unwrap_err();
+        assert!(error.contains("polkit"), "{error}");
+        server.await.unwrap();
     }
 }

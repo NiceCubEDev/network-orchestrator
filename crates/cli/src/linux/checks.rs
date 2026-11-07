@@ -8,20 +8,43 @@ use super::commands::Output;
 use super::ctx::Ctx;
 use super::endpoints;
 use super::library::require_user;
+#[cfg(not(target_os = "linux"))]
 use net_manager_core::backend_settings::BackendSettingsStore;
 use net_manager_core::config_vault::SubscriptionEndpoint;
-use net_manager_core::models::{
-    Profile, ServiceCheck, ServiceCheckResult, TunnelBackend, TunnelState,
-};
-use net_manager_core::{profiles, service_checks, subscription, vpn};
+#[cfg(not(target_os = "linux"))]
+use net_manager_core::models::TunnelState;
+use net_manager_core::models::{Profile, ServiceCheck, ServiceCheckResult, TunnelBackend};
+#[cfg(not(target_os = "linux"))]
+use net_manager_core::{profiles, vpn};
+use net_manager_core::{service_checks, subscription};
+#[cfg(not(target_os = "linux"))]
 use net_manager_engine::linux_engine::LinuxEngine;
 use serde_json::{json, Value};
+#[cfg(not(target_os = "linux"))]
 use std::io;
+#[cfg(not(target_os = "linux"))]
 use std::path::PathBuf;
+#[cfg(not(target_os = "linux"))]
 use std::sync::OnceLock;
 
 pub fn run(ctx: &Ctx, command: ChecksCommand) -> Result<Output, String> {
     match command {
+        #[cfg(target_os = "linux")]
+        ChecksCommand::Set { profile, file } => {
+            require_user(ctx)?;
+            let profile = xray_profile(ctx, &profile)?;
+            use std::io::Read;
+            let mut body = Vec::new();
+            std::fs::File::open(&file)
+                .and_then(|file| file.take(512 * 1024 + 1).read_to_end(&mut body))
+                .map_err(|_| "The check file could not be read".to_string())?;
+            if body.len() > 512 * 1024 {
+                return Err("The check file exceeds 512 KiB".into());
+            }
+            let checks = serde_json::from_slice(&body)
+                .map_err(|_| "Invalid service-check list".to_string())?;
+            save(ctx, &profile, &[], checks)
+        }
         ChecksCommand::List { profile } => {
             let profile = xray_profile(ctx, &profile)?;
             Ok(configuration_output(&profile.xray_service_checks))
@@ -35,6 +58,9 @@ pub fn run(ctx: &Ctx, command: ChecksCommand) -> Result<Output, String> {
         } => {
             require_user(ctx)?;
             let profile = xray_profile(ctx, &profile)?;
+            #[cfg(target_os = "linux")]
+            let expected_endpoints = Vec::new();
+            #[cfg(not(target_os = "linux"))]
             let expected_endpoints = read_endpoints(ctx, &profile)?;
             let endpoint_key = pinned_key(ctx, &profile, &via)?;
             let mut checks = profile.xray_service_checks.clone();
@@ -58,6 +84,9 @@ pub fn run(ctx: &Ctx, command: ChecksCommand) -> Result<Output, String> {
         ChecksCommand::Remove { profile, id } => {
             require_user(ctx)?;
             let profile = xray_profile(ctx, &profile)?;
+            #[cfg(target_os = "linux")]
+            let expected_endpoints = Vec::new();
+            #[cfg(not(target_os = "linux"))]
             let expected_endpoints = read_endpoints(ctx, &profile)?;
             let mut checks = profile.xray_service_checks.clone();
             let index = checks
@@ -74,6 +103,9 @@ pub fn run(ctx: &Ctx, command: ChecksCommand) -> Result<Output, String> {
         } => {
             require_user(ctx)?;
             let profile = xray_profile(ctx, &profile)?;
+            #[cfg(target_os = "linux")]
+            let expected_endpoints = Vec::new();
+            #[cfg(not(target_os = "linux"))]
             let expected_endpoints = read_endpoints(ctx, &profile)?;
             let mut checks = profile.xray_service_checks.clone();
             let check = checks
@@ -88,7 +120,7 @@ pub fn run(ctx: &Ctx, command: ChecksCommand) -> Result<Output, String> {
 }
 
 fn xray_profile(ctx: &Ctx, query: &str) -> Result<Profile, String> {
-    // Ctx::find embeds the supplied query in errors; do not propagate it.
+    // Selection errors must not echo values supplied at a private-input boundary.
     let profile = ctx
         .find(query)
         .map_err(|_| "The requested profile could not be selected".to_string())?;
@@ -98,6 +130,7 @@ fn xray_profile(ctx: &Ctx, query: &str) -> Result<Profile, String> {
     Ok(profile)
 }
 
+#[cfg(not(target_os = "linux"))]
 fn read_endpoints(ctx: &Ctx, profile: &Profile) -> Result<Vec<SubscriptionEndpoint>, String> {
     if profile.subscription.is_none() {
         return Ok(Vec::new());
@@ -137,6 +170,7 @@ fn pinned_key(ctx: &Ctx, profile: &Profile, query: &str) -> Result<String, Strin
     Ok(row.key.clone())
 }
 
+#[cfg(not(target_os = "linux"))]
 fn unchanged(
     ctx: &Ctx,
     expected: &Profile,
@@ -151,6 +185,7 @@ fn unchanged(
     Ok(())
 }
 
+#[cfg(not(target_os = "linux"))]
 /// Runtime-only suppression: retain all canonical saved specs, but never
 /// permit an old live pin listener to keep an unbound check probing.
 fn runtime_checks(profile: &Profile, checks: &[ServiceCheck]) -> Vec<ServiceCheck> {
@@ -163,6 +198,7 @@ fn runtime_checks(profile: &Profile, checks: &[ServiceCheck]) -> Vec<ServiceChec
         .collect()
 }
 
+#[cfg(not(target_os = "linux"))]
 /// Also called by the pin-edit integration described below.
 ///
 /// This sends local IPC only. The daemon cancels the old worker before
@@ -203,6 +239,7 @@ pub(super) fn sync_background(
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 fn save(
     ctx: &Ctx,
     expected: &Profile,
@@ -268,6 +305,7 @@ fn save(
     ))
 }
 
+#[cfg(not(target_os = "linux"))]
 fn executable(ctx: &Ctx) -> Result<PathBuf, String> {
     let setting = BackendSettingsStore::new(ctx.root.join("backend-settings.json"))
         .get(TunnelBackend::Xray)
@@ -276,6 +314,7 @@ fn executable(ctx: &Ctx) -> Result<PathBuf, String> {
         .map_err(|_| "Xray executable unavailable".to_string())
 }
 
+#[cfg(not(target_os = "linux"))]
 fn execute(ctx: &Ctx, query: &str, ids: &[String]) -> Result<Output, String> {
     // Never execute a user-configured binary as root.
     require_user(ctx)?;
@@ -307,6 +346,48 @@ fn execute(ctx: &Ctx, query: &str, ids: &[String]) -> Result<Output, String> {
     // rotation can preserve a transport key.
     unchanged(ctx, &profile, &expected_endpoints)?;
     result_output(results)
+}
+
+#[cfg(target_os = "linux")]
+fn save(
+    ctx: &Ctx,
+    expected: &Profile,
+    _: &[SubscriptionEndpoint],
+    checks: Vec<ServiceCheck>,
+) -> Result<Output, String> {
+    let document = net_manager_engine::linux_profiles::ProfileService::new(
+        ctx.root.clone(),
+        ctx.engine.clone(),
+    )
+    .set_service_checks(&expected.id, checks)?;
+    let saved = document
+        .profiles
+        .iter()
+        .find(|profile| profile.id == expected.id)
+        .ok_or("The saved profile could not be read")?;
+    let (value, text) = configuration_output(&saved.xray_service_checks);
+    Ok((
+        value,
+        format!("Saved. No check destination was contacted.\n{text}"),
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn execute(ctx: &Ctx, query: &str, ids: &[String]) -> Result<Output, String> {
+    require_user(ctx)?;
+    let profile = xray_profile(ctx, query)?;
+    let service = net_manager_engine::linux_profiles::ProfileService::new(
+        ctx.root.clone(),
+        ctx.engine.clone(),
+    );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| "The diagnostic runtime could not be started".to_string())?;
+    result_output(
+        runtime
+            .block_on(service.run_service_checks(&profile.id, (!ids.is_empty()).then_some(ids)))?,
+    )
 }
 
 fn safe_key(value: &str) -> &str {

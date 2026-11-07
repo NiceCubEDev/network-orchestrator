@@ -40,7 +40,9 @@ import {
   loadSnippets,
   newSnippetId,
   sameIds,
-  storeSnippets,
+  applySnippet as applySavedSnippet,
+  captureSnippet,
+  deleteSnippet as deleteSavedSnippet,
 } from "./profiles/sets";
 import Skeleton from "./ui/Skeleton";
 import ExternalTunnelPanel from "./ExternalTunnelPanel";
@@ -61,6 +63,7 @@ import {
   AlwaysOnListResult,
   AlwaysOnSetResult,
   BatchImportResult,
+  ConnectionSetCredentialInput,
   LocalProxy,
   NetworkInterface,
   NmConnection,
@@ -236,7 +239,32 @@ export default function ProfileManager() {
   );
   const [search, setSearch] = useState("");
   const [addMenuOpen, setAddMenuOpen] = useState(false);
-  const [snippets, setSnippets] = useState<ConnectionSnippet[]>(loadSnippets);
+  const [snippets, setSnippets] = useState<ConnectionSnippet[]>([]);
+  const snippetsBusy = useRef(false);
+  const snippetsRefresh = useRef(0);
+  const snippetsMounted = useRef(true);
+  const setCredentialInputs = useRef<Record<string, ConnectionSetCredentialInput>>({});
+  const setCredentialCollector = useRef<{
+    profileId: string;
+    resolve: (input: ConnectionSetCredentialInput) => void;
+    reject: (error: DOMException) => void;
+  } | null>(null);
+  const clearSetCredentials = useCallback(() => {
+    for (const id of Object.keys(setCredentialInputs.current)) delete setCredentialInputs.current[id];
+  }, []);
+  const cancelSetCredentialCollection = useCallback(() => {
+    clearSetCredentials();
+    const pending = setCredentialCollector.current;
+    setCredentialCollector.current = null;
+    pending?.reject(new DOMException("Connection-set credential collection cancelled", "AbortError"));
+  }, [clearSetCredentials]);
+  useEffect(() => {
+    snippetsMounted.current = true;
+    return () => {
+      snippetsMounted.current = false;
+      cancelSetCredentialCollection();
+    };
+  }, [cancelSetCredentialCollection]);
   const [activeSnippetId, setActiveSnippetId] = useState<string | null>(null);
   const [saveModalOpen, setSaveModalOpen] = useState(false);
   const [newSnippetName, setNewSnippetName] = useState("");
@@ -369,9 +397,26 @@ export default function ProfileManager() {
     }
   }, [collapsedGroups]);
 
+  const refreshSnippets = useCallback(async () => {
+    if (!caps) return;
+    const request = ++snippetsRefresh.current;
+    const saved = await loadSnippets(caps.os === "linux");
+    if (request === snippetsRefresh.current) setSnippets(saved);
+  }, [caps]);
+
   useEffect(() => {
-    storeSnippets(snippets);
-  }, [snippets]);
+    const refresh = () => { void refreshSnippets().catch((err: unknown) => setError(String(err))); };
+    refresh();
+    window.addEventListener("focus", refresh);
+    window.addEventListener("route-changed", refresh);
+    const interval = setInterval(refresh, 2000);
+    return () => {
+      ++snippetsRefresh.current;
+      window.removeEventListener("focus", refresh);
+      window.removeEventListener("route-changed", refresh);
+      clearInterval(interval);
+    };
+  }, [refreshSnippets]);
 
   useEffect(() => {
     const poll = async () => {
@@ -1118,22 +1163,88 @@ export default function ProfileManager() {
     }
   };
 
-  const applySnippet = (snippet: ConnectionSnippet) => {
-    const targetIds = new Set(snippet.profileIds);
-    for (const profile of profiles) {
-      const running = statusFor(profile.id).state === "running";
-      if (targetIds.has(profile.id) && !running) {
-        onConnect(profile);
-      } else if (!targetIds.has(profile.id) && running) {
-        onDisconnect(profile);
-      }
+  const withSnippetAction = async (action: () => Promise<void>) => {
+    if (snippetsBusy.current) return;
+    snippetsBusy.current = true;
+    try {
+      await action();
+      if (snippetsMounted.current) await refreshSnippets();
+    } catch (err) {
+      if (snippetsMounted.current && !(err instanceof DOMException && err.name === "AbortError")) toast("error", String(err));
+    } finally {
+      snippetsBusy.current = false;
+      if (snippetsMounted.current) await refreshAll();
     }
-    setActiveSnippetId(snippet.id);
   };
 
-  const deleteSnippet = (id: string) => {
-    setSnippets((prev) => prev.filter((s) => s.id !== id));
-    setActiveSnippetId((prev) => (prev === id ? null : prev));
+  const applySnippet = async (snippet: ConnectionSnippet) => {
+    await withSnippetAction(async () => {
+      try {
+        setCredentialInputs.current = Object.create(null) as Record<string, ConnectionSetCredentialInput>;
+        const changed = profiles.filter((profile) => snippet.profileIds.includes(profile.id) !== (statusFor(profile.id).state === "running"));
+        for (const profile of changed.filter((profile) => snippet.profileIds.includes(profile.id))) {
+          const locked = connectLockedTitle(profile);
+          if (locked) throw new Error(locked);
+        }
+        if (changed.some(requiresElevation) && !(await ensureElevation(t("iface.elevationState")))) return;
+        if (caps?.os === "linux") {
+          for (;;) {
+            if (!snippetsMounted.current) throw new DOMException("Credential collection cancelled", "AbortError");
+            try {
+              await applySavedSnippet(snippet.id, setCredentialInputs.current);
+              break;
+            } catch (error) {
+              if (!snippetsMounted.current) throw new DOMException("Credential collection cancelled", "AbortError");
+              const message = error instanceof Error ? error.message : String(error);
+              const missing = /^OpenVPN credentials required: ([A-Za-z0-9_.-]{1,128})$/.exec(message);
+              if (!missing || setCredentialInputs.current[missing[1]]) throw error;
+              const profile = profiles.find((item) => item.id === missing[1] && item.backend === "openVpn");
+              if (!profile) throw error;
+              // The ES2020/WebKit target does not provide Promise.withResolvers.
+              const input = await new Promise<ConnectionSetCredentialInput>((resolve, reject) => {
+                setCredentialCollector.current = { profileId: profile.id, resolve, reject };
+                setOpenVpnCredentialProfile(profile);
+              });
+              if (!snippetsMounted.current) throw new DOMException("Credential collection cancelled", "AbortError");
+              setCredentialInputs.current[profile.id] = input;
+            }
+          }
+        } else {
+          const target = new Set(snippet.profileIds);
+          const missing = snippet.profileIds.filter((id) => !profiles.some((profile) => profile.id === id));
+          if (missing.length) throw new Error(`${t("backend.missing")}: ${missing.join(", ")}`);
+          const current = await invoke<TunnelStatus[]>("get_tunnel_statuses");
+          for (const profile of profiles) {
+            const status = current.find((item) => item.profileId === profile.id);
+            if (!status || status.state === "failed") throw new Error(status?.message ?? t("backend.missing"));
+            const locked = target.has(profile.id) && status.state !== "running" ? connectLockedTitle(profile) : null;
+            if (locked) throw new Error(locked);
+          }
+          for (const profile of profiles) {
+            const running = current.some((status) => status.profileId === profile.id && status.state === "running");
+            if (running && !target.has(profile.id)) await invoke("disconnect_profile", { id: profile.id });
+          }
+          for (const profile of profiles) {
+            const running = current.some((status) => status.profileId === profile.id && status.state === "running");
+            if (target.has(profile.id) && !running) {
+              const status = await invoke<TunnelStatus>("connect_profile", { id: profile.id });
+              if (status.state !== "running") throw new Error(status.message ?? t("profiles.connectFailedDiag", { name: profile.name }));
+            }
+          }
+        }
+        if (snippetsMounted.current) setActiveSnippetId(snippet.id);
+      } finally {
+        clearSetCredentials();
+        if (snippetsMounted.current) setOpenVpnCredentialProfile(null);
+      }
+    });
+  };
+
+  const deleteSnippet = async (id: string) => {
+    await withSnippetAction(async () => {
+      await deleteSavedSnippet(id, caps?.os === "linux");
+      setActiveSnippetId((prev) => (prev === id ? null : prev));
+    });
   };
 
   const openSaveModal = () => {
@@ -1141,23 +1252,23 @@ export default function ProfileManager() {
     setSaveModalOpen(true);
   };
 
-  const overwriteActiveSnippet = () => {
-    if (!activeSnippetId) return;
-    const profileIds = runningProfiles.map((p) => p.id);
-    setSnippets((prev) =>
-      prev.map((s) => (s.id === activeSnippetId ? { ...s, profileIds } : s)),
-    );
-    setSaveModalOpen(false);
+  const overwriteActiveSnippet = async () => {
+    const active = snippets.find((snippet) => snippet.id === activeSnippetId);
+    if (!active) return;
+    await withSnippetAction(async () => {
+      await captureSnippet(active.id, active.name, caps?.os === "linux", runningProfiles.map((profile) => profile.id));
+      setSaveModalOpen(false);
+    });
   };
 
-  const createSnippet = () => {
+  const createSnippet = async () => {
     const name = newSnippetName.trim();
     if (!name) return;
-    const profileIds = runningProfiles.map((p) => p.id);
-    const id = newSnippetId();
-    setSnippets((prev) => [...prev, { id, name, profileIds }]);
-    setActiveSnippetId(id);
-    setSaveModalOpen(false);
+    await withSnippetAction(async () => {
+      const saved = await captureSnippet(newSnippetId(), name, caps?.os === "linux", runningProfiles.map((profile) => profile.id));
+      setActiveSnippetId(saved.id);
+      setSaveModalOpen(false);
+    });
   };
 
   const openNew = (backend?: TunnelBackend) => {
@@ -1709,9 +1820,12 @@ export default function ProfileManager() {
             }
           }}
         >
-          {profiles.length > 0 && (
+          {(profiles.length > 0 || snippets.length > 0) && (
             <SetsBar
-              snippets={snippets}
+              snippets={snippets.map((snippet) => {
+                const missing = snippet.profileIds.filter((id) => !profiles.some((profile) => profile.id === id));
+                return missing.length ? { ...snippet, name: `${snippet.name} (${t("backend.missing")}: ${missing.join(", ")})` } : snippet;
+              })}
               activeSnippetId={activeSnippetId}
               activeDirty={isActiveSnippetDirty}
               runningCount={runningProfiles.length}
@@ -2177,7 +2291,17 @@ export default function ProfileManager() {
 
       <OpenVpnCredentialsModal
         profile={openVpnCredentialProfile}
-        onClose={() => setOpenVpnCredentialProfile(null)}
+        onClose={() => {
+          cancelSetCredentialCollection();
+          setOpenVpnCredentialProfile(null);
+        }}
+        onSubmitCredentials={setCredentialCollector.current ? async (profile, credentials, remember) => {
+          const pending = setCredentialCollector.current;
+          if (!pending || pending.profileId !== profile.id) throw new DOMException("Credential collection cancelled", "AbortError");
+          setCredentialCollector.current = null;
+          setOpenVpnCredentialProfile(null);
+          pending.resolve({ credentials, remember });
+        } : undefined}
         onConnected={(profile, status) => {
           if (status.message) toast("info", status.message);
           setLastProfileId(profile.id);

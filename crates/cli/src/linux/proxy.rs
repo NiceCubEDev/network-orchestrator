@@ -194,6 +194,7 @@ fn target_of(
     Err("Choose the exit's target: --rules, --via NODE, --pool NODE... or --direct".into())
 }
 
+#[cfg(not(target_os = "linux"))]
 fn save_error(error: std::io::Error) -> String {
     match error.kind() {
         ErrorKind::InvalidInput | ErrorKind::AlreadyExists => error.to_string(),
@@ -235,6 +236,13 @@ fn set(
         target,
         no_proxy,
     };
+    #[cfg(target_os = "linux")]
+    let document = net_manager_engine::linux_profiles::ProfileService::new(
+        ctx.root.clone(),
+        ctx.engine.clone(),
+    )
+    .upsert_proxy_exit(&profile.id, exit)?;
+    #[cfg(not(target_os = "linux"))]
     let document = ctx
         .store()
         .update_profile(&profile.id, |current| {
@@ -271,6 +279,10 @@ fn remove(ctx: &Ctx, query: String, name: &str) -> Result<Output, String> {
         return Err("Invalid or reserved proxy exit name".into());
     }
     let profile = ctx.find(&query)?;
+    #[cfg(target_os = "linux")]
+    net_manager_engine::linux_profiles::ProfileService::new(ctx.root.clone(), ctx.engine.clone())
+        .remove_proxy_exit(&profile.id, name)?;
+    #[cfg(not(target_os = "linux"))]
     ctx.store()
         .update_profile(&profile.id, |current| {
             let before = current.xray_proxy_exits.len();
@@ -482,5 +494,208 @@ mod tests {
         assert_eq!(found.id, "a");
         // A missing name fails.
         assert!(unique_exit(&profiles, "de").is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn named_exit(name: &str) -> NamedProxyExit {
+        NamedProxyExit {
+            name: name.into(),
+            target: ProxyTarget::Direct,
+            no_proxy: vec!["preserve.invalid".into()],
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn proxy_sandbox(exits: Vec<NamedProxyExit>) -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        let vault = net_manager_core::config_vault::ConfigVault::new(root.path().join("configs"));
+        let imported = vault
+            .store_generated_xray("named-race", br#"{"inbounds":[],"outbounds":[]}"#)
+            .unwrap();
+        net_manager_core::profiles::ProfileStore::new(root.path().join("profiles.json"))
+            .upsert(Profile {
+                id: "named-race".into(),
+                name: "Named exit concurrency".into(),
+                backend: TunnelBackend::Xray,
+                xray_mode: XrayMode::Socks,
+                config_path: imported.config_path,
+                xray_proxy_exits: exits,
+                ..Profile::default()
+            })
+            .unwrap();
+        root
+    }
+
+    #[cfg(target_os = "linux")]
+    fn concurrent_mutations(
+        root: &std::path::Path,
+        first: impl FnOnce(&Ctx) -> Result<Output, String> + Send + 'static,
+        second: impl FnOnce(&Ctx) -> Result<Output, String> + Send + 'static,
+    ) {
+        use std::io::Read;
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let lock_path = root.join("profile-operations.lock");
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&lock_path)
+            .unwrap();
+        lock.lock().unwrap();
+        // Each CLI consumer opens this lock only after reading its profile.
+        // Observe the opens separately so inotify cannot coalesce them; both
+        // readers then remain blocked before either can commit a mutation.
+        let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
+        assert!(fd >= 0, "{}", std::io::Error::last_os_error());
+        let mut watch = unsafe { std::fs::File::from_raw_fd(fd) };
+        let path = std::ffi::CString::new(lock_path.as_os_str().as_bytes()).unwrap();
+        assert!(
+            unsafe { libc::inotify_add_watch(fd, path.as_ptr(), libc::IN_OPEN) } >= 0,
+            "{}",
+            std::io::Error::last_os_error()
+        );
+        let mut wait_for_open = || {
+            let mut poll = libc::pollfd {
+                fd: watch.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            assert_eq!(
+                unsafe { libc::poll(&mut poll, 1, 10_000) },
+                1,
+                "CLI consumer did not reach the mutation boundary"
+            );
+            let mut event = [0u8; std::mem::size_of::<libc::inotify_event>()];
+            watch.read_exact(&mut event).unwrap();
+            let mask = u32::from_ne_bytes(event[4..8].try_into().unwrap());
+            assert_ne!(mask & libc::IN_OPEN, 0);
+        };
+        fn spawn_mutation(
+            root: &std::path::Path,
+            operation: impl FnOnce(&Ctx) -> Result<Output, String> + Send + 'static,
+        ) -> std::thread::JoinHandle<Result<Output, String>> {
+            let root = root.to_path_buf();
+            std::thread::spawn(move || {
+                let engine = net_manager_engine::linux_engine::LinuxEngine::for_socket(
+                    root.join("unused-daemon.sock"),
+                    "proxy-concurrency-test",
+                );
+                let ctx = Ctx::new(root, engine).unwrap();
+                operation(&ctx)
+            })
+        }
+        let first = spawn_mutation(root, first);
+        wait_for_open();
+        let second = spawn_mutation(root, second);
+        wait_for_open();
+        drop(lock);
+        assert!(first.join().unwrap().is_ok(), "first named mutation failed");
+        assert!(
+            second.join().unwrap().is_ok(),
+            "second named mutation failed"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn saved_exits(root: &std::path::Path) -> Vec<NamedProxyExit> {
+        net_manager_core::profiles::ProfileStore::new(root.join("profiles.json"))
+            .load()
+            .unwrap()
+            .profiles
+            .into_iter()
+            .find(|profile| profile.id == "named-race")
+            .unwrap()
+            .xray_proxy_exits
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn concurrent_proxy_sets_preserve_distinct_names() {
+        let root = proxy_sandbox(vec![named_exit("kept")]);
+        concurrent_mutations(
+            root.path(),
+            |ctx| {
+                set(
+                    ctx,
+                    "named-race".into(),
+                    "alpha",
+                    false,
+                    None,
+                    None,
+                    true,
+                    Vec::new(),
+                )
+            },
+            |ctx| {
+                set(
+                    ctx,
+                    "named-race".into(),
+                    "bravo",
+                    true,
+                    None,
+                    None,
+                    false,
+                    Vec::new(),
+                )
+            },
+        );
+        let mut actual = saved_exits(root.path());
+        actual.sort_by(|a, b| a.name.cmp(&b.name));
+        assert_eq!(
+            actual,
+            vec![
+                NamedProxyExit {
+                    name: "alpha".into(),
+                    target: ProxyTarget::Direct,
+                    no_proxy: Vec::new()
+                },
+                NamedProxyExit {
+                    name: "bravo".into(),
+                    target: ProxyTarget::Rules,
+                    no_proxy: Vec::new()
+                },
+                named_exit("kept"),
+            ]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn concurrent_proxy_remove_and_set_preserve_both_changes() {
+        let root = proxy_sandbox(vec![named_exit("kept"), named_exit("remove-me")]);
+        concurrent_mutations(
+            root.path(),
+            |ctx| remove(ctx, "named-race".into(), "remove-me"),
+            |ctx| {
+                set(
+                    ctx,
+                    "named-race".into(),
+                    "added",
+                    false,
+                    None,
+                    None,
+                    true,
+                    Vec::new(),
+                )
+            },
+        );
+        let mut actual = saved_exits(root.path());
+        actual.sort_by(|a, b| a.name.cmp(&b.name));
+        assert_eq!(
+            actual,
+            vec![
+                NamedProxyExit {
+                    name: "added".into(),
+                    target: ProxyTarget::Direct,
+                    no_proxy: Vec::new()
+                },
+                named_exit("kept"),
+            ]
+        );
     }
 }

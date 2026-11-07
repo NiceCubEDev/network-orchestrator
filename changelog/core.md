@@ -10,6 +10,28 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-11-07
+
+### Added
+
+- Shared Linux profile, network, service, diagnostic, system and connection-set
+  operations for CLI and GUI clients.
+- Retained connection preparation for safe set/endpoint cutovers, authenticated
+  local-runtime capability negotiation and common WireGuard input validation.
+- Canonical Linux Xray route derivation for dual-stack runtime and static
+  analysis, including split-default and explicit IPv6 scope.
+
+### Fixed
+
+- Normalize IPv6 hosts from VLESS and Hysteria2 links before generating Xray
+  server addresses, so transport dialing and literal endpoint bypasses use bare
+  IPv6 addresses rather than bracketed URL authorities.
+- Keep NetBird setup keys in inherited anonymous descriptors on Linux and track
+  pending logins by process birth, executable, user and provider socket. A later
+  frontend can cancel its own pending login without signaling unrelated processes.
+- Reject symlinked NetBird runtime/log storage and report unsuccessful provider
+  shutdowns instead of acknowledging a failed operation.
+
 ## [0.14.0] - 2026-11-07
 
 ### Added
