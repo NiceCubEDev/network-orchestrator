@@ -122,9 +122,36 @@ pub(crate) fn app_state(dir: &Path) -> AppState {
         }),
         log: std::sync::Mutex::new(std::collections::VecDeque::new()),
         #[cfg(target_os = "linux")]
-        openvpn_credentials: crate::openvpn_credentials::OpenVpnCredentialStore::new(Box::new(
-            crate::openvpn_credentials::tests::FakeKeyring::default(),
-        )),
+        openvpn_credentials: std::sync::Arc::new(
+            net_manager_engine::linux_credentials::OpenVpnCredentialStore::new(Box::new(
+                FakeKeyring::default(),
+            )),
+        ),
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+pub(crate) struct FakeKeyring {
+    pub(crate) entries:
+        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>>,
+}
+
+#[cfg(target_os = "linux")]
+impl net_manager_engine::linux_credentials::SecretStore for FakeKeyring {
+    fn load(&self, id: &str) -> std::io::Result<Option<Vec<u8>>> {
+        Ok(self.entries.lock().unwrap().get(id).cloned())
+    }
+    fn save(&self, id: &str, secret: &[u8]) -> std::io::Result<()> {
+        self.entries
+            .lock()
+            .unwrap()
+            .insert(id.into(), secret.to_vec());
+        Ok(())
+    }
+    fn delete(&self, id: &str) -> std::io::Result<()> {
+        self.entries.lock().unwrap().remove(id);
+        Ok(())
     }
 }
 
@@ -166,6 +193,8 @@ pub(crate) fn diag_input(p: &Profile) -> DiagnosticsInput {
             state: TunnelState::Running,
             message: None,
             interface_name: None,
+            failover: None,
+            watchdog: None,
         },
         managed: true,
         inspection: Some(inspection_for(p, true)),

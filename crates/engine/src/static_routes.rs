@@ -159,6 +159,7 @@ pub(crate) fn status(privileged: &dyn Privileged, profile: &Profile) -> TunnelSt
         state,
         message,
         interface_name: Some(profile.interface_name.clone()).filter(|name| !name.is_empty()),
+        failover: None,
     }
 }
 

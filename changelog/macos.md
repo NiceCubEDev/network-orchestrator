@@ -10,3 +10,27 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+## [0.10.2] - 2026-11-03
+
+Core 0.13.0.
+
+### Changed
+
+- Keep shared Xray request, status and ownership models compatible with named
+  proxy preferences. The macOS helper explicitly rejects Linux-only named
+  process exits instead of silently accepting unsupported settings.
+
+## [0.10.1] - 2026-11-02
+
+Core 0.12.0.
+
+### Fixed
+
+- Keep shared Xray request and ownership constructors complete after the
+  protocol/model extensions.
+
+### Changed
+
+- Refresh the shared localization catalog. Service-availability configuration
+  and background diagnostics remain Linux-only.
+

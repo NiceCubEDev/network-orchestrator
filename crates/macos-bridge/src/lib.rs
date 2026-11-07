@@ -817,6 +817,9 @@ fn dispatch(root: &Path, method: &str, args: &Value) -> Result<Value, String> {
                     .enumerate()
                     .map(|(index, endpoint)| SubscriptionEndpointInfo {
                         protocol: net_manager_core::xray::endpoint_protocol(&endpoint.url),
+                        key: net_manager_core::subscription::endpoint_key(&endpoint.url),
+                        is_backup: false,
+                        is_missing: false,
                         name: endpoint.name,
                         active: index == active,
                     })

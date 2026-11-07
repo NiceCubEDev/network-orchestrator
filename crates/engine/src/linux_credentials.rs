@@ -9,24 +9,24 @@ use std::path::Path;
 use std::sync::Mutex;
 
 /// Minimal keyring backend. `ErrorKind::NotConnected` means "no keyring".
-pub(crate) trait SecretStore: Send + Sync {
+pub trait SecretStore: Send + Sync {
     fn load(&self, profile_id: &str) -> io::Result<Option<Vec<u8>>>;
     fn save(&self, profile_id: &str, secret: &[u8]) -> io::Result<()>;
     fn delete(&self, profile_id: &str) -> io::Result<()>;
 }
 
-pub(crate) const SESSION_ONLY_NOTICE: &str =
+pub const SESSION_ONLY_NOTICE: &str =
     "System keyring is unavailable; OpenVPN credentials are remembered only until the app exits";
-pub(crate) const MIGRATED_SESSION_ONLY_NOTICE: &str =
+pub const MIGRATED_SESSION_ONLY_NOTICE: &str =
     "Old plaintext OpenVPN credentials were removed; the system keyring is unavailable, so they are kept only until the app exits";
 
-pub(crate) struct OpenVpnCredentialStore {
+pub struct OpenVpnCredentialStore {
     keyring: Box<dyn SecretStore>,
     session: Mutex<HashMap<String, OpenVpnCredentials>>,
 }
 
 impl OpenVpnCredentialStore {
-    pub(crate) fn new(keyring: Box<dyn SecretStore>) -> Self {
+    pub fn new(keyring: Box<dyn SecretStore>) -> Self {
         Self {
             keyring,
             session: Mutex::new(HashMap::new()),
@@ -35,7 +35,7 @@ impl OpenVpnCredentialStore {
 
     /// Remembered credentials plus an optional user notice. `legacy` is the
     /// old plaintext file, migrated and deleted on first access.
-    pub(crate) fn load(
+    pub fn load(
         &self,
         profile_id: &str,
         legacy: &Path,
@@ -71,7 +71,7 @@ impl OpenVpnCredentialStore {
     }
 
     /// Stores credentials in the keyring, or for this session only.
-    pub(crate) fn remember(
+    pub fn remember(
         &self,
         profile_id: &str,
         credentials: &OpenVpnCredentials,
@@ -89,7 +89,7 @@ impl OpenVpnCredentialStore {
     }
 
     /// Removes credentials from the session, the keyring and the legacy file.
-    pub(crate) fn forget(&self, profile_id: &str, legacy: Option<&Path>) -> Result<(), String> {
+    pub fn forget(&self, profile_id: &str, legacy: Option<&Path>) -> Result<(), String> {
         self.session.lock().unwrap().remove(profile_id);
         let failed = |_| "cannot remove remembered OpenVPN credentials".to_string();
         if let Some(legacy) = legacy {
@@ -154,7 +154,7 @@ fn read_legacy_file(path: &Path) -> io::Result<Option<OpenVpnCredentials>> {
 
 /// Freedesktop Secret Service over the session D-Bus, with an encrypted
 /// (Diffie-Hellman) transfer session. Calls block; unlock prompts time out.
-pub(crate) struct SecretServiceStore;
+pub struct SecretServiceStore;
 
 impl SecretServiceStore {
     const PROMPT_TIMEOUT_SECS: u64 = 60;
@@ -247,7 +247,7 @@ impl SecretServiceStore {
     }
 }
 
-impl net_manager_engine::linux::CredentialSource for OpenVpnCredentialStore {
+impl crate::linux::CredentialSource for OpenVpnCredentialStore {
     fn load(
         &self,
         profile_id: &str,
@@ -260,7 +260,10 @@ impl net_manager_engine::linux::CredentialSource for OpenVpnCredentialStore {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::test_support::unique_dir;
+    fn unique_dir(name: &str) -> std::path::PathBuf {
+        let directory = tempfile::Builder::new().prefix(name).tempdir().unwrap();
+        directory.keep()
+    }
     use net_manager_core::daemon_protocol::OpenVpnUserPass;
     use std::os::unix::fs::OpenOptionsExt;
 

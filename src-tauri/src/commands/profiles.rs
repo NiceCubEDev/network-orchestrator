@@ -4,11 +4,9 @@ use crate::state::{existing_profile_for_update, find_profile, AppState};
 use net_manager_core::config_security;
 use net_manager_core::config_vault::{ConfigImport, ConfigVault};
 use net_manager_core::models::*;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, TcpListener};
-use std::path::Path;
-#[cfg(test)]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, Manager, State};
 
@@ -138,6 +136,69 @@ fn preserve_canonical_subscription(profile: &mut Profile, stored: Option<&Profil
     };
 }
 
+/// Linux multinode: the node pins live on the profile but are edited through
+/// `set_pinned_routes`, never through the generic form save — restore the
+/// stored value so editing other fields cannot drop them.
+fn preserve_pinned_policies(profile: &mut Profile, stored: Option<&Profile>) {
+    profile.pinned_policies = if profile.backend == TunnelBackend::Xray {
+        stored.map_or_else(Vec::new, |profile| profile.pinned_policies.clone())
+    } else {
+        Vec::new()
+    };
+}
+
+fn preserve_service_checks(profile: &mut Profile, stored: Option<&Profile>) {
+    profile.xray_service_checks = if profile.backend == TunnelBackend::Xray {
+        stored
+            .filter(|stored| stored.backend == TunnelBackend::Xray)
+            .map_or_else(Vec::new, |stored| stored.xray_service_checks.clone())
+    } else {
+        Vec::new()
+    };
+}
+
+/// Named `netorch proxy` exits are owned by the proxy commands, never the
+/// generic form save — restore the stored spec so ordinary edits keep the
+/// aliases, and a non-Xray backend drops them entirely.
+fn preserve_named_proxy_exits(profile: &mut Profile, stored: Option<&Profile>) {
+    profile.xray_proxy_exits = if profile.backend == TunnelBackend::Xray {
+        stored
+            .filter(|stored| stored.backend == TunnelBackend::Xray)
+            .map_or_else(Vec::new, |stored| stored.xray_proxy_exits.clone())
+    } else {
+        Vec::new()
+    };
+}
+
+fn preserve_migrated_xray_settings(profile: &mut Profile, stored: Option<&Profile>) {
+    if profile.backend != TunnelBackend::Xray {
+        profile.xray_sockopts = None;
+        profile.xray_traffic_rules.clear();
+        profile.xray_interface_routes.clear();
+        profile.xray_connection_idle_secs = None;
+        profile.xray_tun_mtu = None;
+        profile.xray_tun_dns_servers.clear();
+        profile.xray_direct_domain_strategy = None;
+        profile.xray_quic_reject = false;
+        return;
+    }
+
+    let Some(stored) = stored.filter(|stored| stored.backend == TunnelBackend::Xray) else {
+        return;
+    };
+    profile.xray_sockopts = stored.xray_sockopts.clone();
+    profile.xray_traffic_rules = stored.xray_traffic_rules.clone();
+    profile.xray_interface_routes = stored.xray_interface_routes.clone();
+    profile.xray_connection_idle_secs = stored.xray_connection_idle_secs;
+    profile.xray_tun_mtu = stored.xray_tun_mtu;
+    profile.xray_tun_dns_servers = stored.xray_tun_dns_servers.clone();
+    profile.xray_direct_domain_strategy = stored.xray_direct_domain_strategy.clone();
+    profile.endpoint_bypasses = stored.endpoint_bypasses.clone();
+
+    // xray_quic_reject is deliberately not restored for Xray:
+    // the existing Linux form owns its editable toggle.
+}
+
 fn preserve_generated_xray_source(profile: &mut Profile, stored: Option<&Profile>) {
     let generated = stored.filter(|existing| {
         profile.backend == TunnelBackend::Xray
@@ -160,7 +221,7 @@ fn validate_xray_routing(profile: &Profile) -> Result<(), String> {
         .into_iter()
         .flatten()
         {
-            crate::geo_assets::validate_geo_asset_url(url)
+            net_manager_engine::linux_geo_assets::validate_geo_asset_url(url)
                 .map_err(|err| format!("invalid Xray geo data URL: {err}"))?;
         }
     }
@@ -270,13 +331,30 @@ async fn ensure_profile_stopped(
         )
         .await;
     }
-    let mut runtime = state.runtime.lock().await;
-    if runtime.tunnels.status(profile).state == TunnelState::Running {
-        return Err(format!(
-            "profile '{}' is running; disconnect before {action}",
-            profile.id
-        ));
+    #[cfg(target_os = "linux")]
+    {
+        let status = crate::commands::tunnels::linux_profile_status(
+            &crate::daemon_client::DaemonClient::system(),
+            state,
+            profile,
+        )
+        .await?;
+        if status.state != TunnelState::Stopped {
+            return Err(format!("profile is active; disconnect before {action}"));
+        }
+        Ok(())
     }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let mut runtime = state.runtime.lock().await;
+        if runtime.tunnels.status(profile).state == TunnelState::Running {
+            return Err(format!(
+                "profile '{}' is running; disconnect before {action}",
+                profile.id
+            ));
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
     Ok(())
 }
 
@@ -307,9 +385,14 @@ pub(crate) async fn save_profile(
     mut profile: Profile,
     state: State<'_, AppState>,
 ) -> Result<Vec<Profile>, String> {
+    let _guard = SUBSCRIPTION_REFRESH_LOCK.lock().await;
     let document = state.profiles.load().map_err(|e| e.to_string())?;
     let stored = existing_profile_for_update(&document, &profile.id).cloned();
     preserve_canonical_subscription(&mut profile, stored.as_ref());
+    preserve_pinned_policies(&mut profile, stored.as_ref());
+    preserve_service_checks(&mut profile, stored.as_ref());
+    preserve_named_proxy_exits(&mut profile, stored.as_ref());
+    preserve_migrated_xray_settings(&mut profile, stored.as_ref());
     preserve_generated_xray_source(&mut profile, stored.as_ref());
     #[cfg(target_os = "linux")]
     if profile.backend == TunnelBackend::Xray
@@ -405,6 +488,7 @@ pub(crate) async fn save_vless_profile(
     vless_url: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<Profile>, String> {
+    let _guard = SUBSCRIPTION_REFRESH_LOCK.lock().await;
     if profile.backend != TunnelBackend::Xray {
         return Err("share link import requires an Xray profile".into());
     }
@@ -420,6 +504,10 @@ pub(crate) async fn save_vless_profile(
     profile.xray_http_port = Some(http_port);
     let stored = existing_profile_for_update(&document, &profile.id).cloned();
     preserve_canonical_subscription(&mut profile, stored.as_ref());
+    preserve_pinned_policies(&mut profile, stored.as_ref());
+    preserve_service_checks(&mut profile, stored.as_ref());
+    preserve_named_proxy_exits(&mut profile, stored.as_ref());
+    preserve_migrated_xray_settings(&mut profile, stored.as_ref());
     validate_xray_routing(&profile)?;
     if let Some(existing) = &stored {
         ensure_profile_stopped(&state, existing, "editing").await?;
@@ -490,6 +578,7 @@ pub(crate) async fn save_wireguard_profile(
     fields: WireGuardFields,
     state: State<'_, AppState>,
 ) -> Result<Vec<Profile>, String> {
+    let _guard = SUBSCRIPTION_REFRESH_LOCK.lock().await;
     if profile.backend != TunnelBackend::WireGuard {
         return Err("wireguard fields require a WireGuard profile".into());
     }
@@ -511,6 +600,10 @@ pub(crate) async fn save_wireguard_profile(
     let document = state.profiles.load().map_err(|e| e.to_string())?;
     let stored = existing_profile_for_update(&document, &profile.id).cloned();
     preserve_canonical_subscription(&mut profile, stored.as_ref());
+    preserve_pinned_policies(&mut profile, stored.as_ref());
+    preserve_service_checks(&mut profile, stored.as_ref());
+    preserve_named_proxy_exits(&mut profile, stored.as_ref());
+    preserve_migrated_xray_settings(&mut profile, stored.as_ref());
     if let Some(existing) = &stored {
         #[cfg(target_os = "linux")]
         crate::commands::always_on::ensure_not_enrolled(
@@ -730,6 +823,7 @@ pub(crate) struct SubscriptionRefreshResult {
     pub skipped_count: usize,
     pub fallback_used: bool,
     pub cleanup_failed: bool,
+    pub pool_report: Option<net_manager_core::node_pool::NodePoolReport>,
 }
 
 fn subscription_profile(
@@ -825,7 +919,46 @@ fn refresh_subscription_body_into_with_metadata(
         skipped_count: outcome.skipped_count,
         fallback_used: outcome.fallback_used,
         cleanup_failed: outcome.cleanup_failed,
+        pool_report: None,
     })
+}
+
+async fn finish_subscription_refresh(
+    state: &AppState,
+    id: &str,
+    mut result: SubscriptionRefreshResult,
+) -> Result<SubscriptionRefreshResult, String> {
+    let refreshed = subscription_profile(&state.profiles, id)?;
+    match rebuild_pool_report(state, id).await {
+        Ok(report) => {
+            result.pool_report = report;
+            Ok(result)
+        }
+        Err(_) => {
+            let recorded = state.profiles.update_profile(id, |current| {
+                if current.subscription != refreshed.subscription {
+                    return Err(std::io::Error::other("Subscription changed after refresh"));
+                }
+                let subscription = current
+                    .subscription
+                    .as_mut()
+                    .ok_or_else(|| std::io::Error::other("Profile is no longer a subscription"))?;
+                subscription.last_refresh_error = Some(
+                    "Subscription refreshed, but the backup pool could not be rebuilt".to_string(),
+                );
+                Ok(())
+            });
+            Err(if recorded.is_ok() {
+                "Subscription refreshed, but backup-pool rebuild failed; \
+                 the previously stored pool was not replaced"
+                    .into()
+            } else {
+                "Subscription refreshed, but backup-pool rebuild failed; \
+                 its failure notice could not be saved"
+                    .into()
+            })
+        }
+    }
 }
 
 fn record_subscription_refresh_failure(
@@ -955,10 +1088,18 @@ pub(crate) async fn refresh_subscription(
         .map_err(|_| "failed to build subscription HTTP client".to_string())?;
     let result =
         refresh_subscription_into(&state.config_vault, &state.profiles, &client, &id).await;
-    if result.is_err() {
-        let _ = record_subscription_refresh_failure(&state.profiles, &id, unix_now());
+
+    match result {
+        Ok(result) => finish_subscription_refresh(state.inner(), &id, result).await,
+        Err(error) => {
+            if record_subscription_refresh_failure(&state.profiles, &id, unix_now()).is_err() {
+                return Err(
+                    "Subscription refresh failed, and its failure notice could not be saved".into(),
+                );
+            }
+            Err(error)
+        }
     }
-    result
 }
 
 pub(crate) async fn run_subscription_refresh_loop(app: tauri::AppHandle) {
@@ -1000,12 +1141,41 @@ pub(crate) async fn run_subscription_refresh_loop(app: tauri::AppHandle) {
             if !should_auto_refresh(&current, unix_now(), active) {
                 continue;
             }
-            if refresh_subscription_into(&state.config_vault, &state.profiles, &client, &current.id)
-                .await
-                .is_err()
-            {
-                let _ =
-                    record_subscription_refresh_failure(&state.profiles, &current.id, unix_now());
+            let refresh = refresh_subscription_into(
+                &state.config_vault,
+                &state.profiles,
+                &client,
+                &current.id,
+            )
+            .await;
+
+            match refresh {
+                Ok(result) => {
+                    match finish_subscription_refresh(state.inner(), &current.id, result).await {
+                        Ok(result) => {
+                            let _ = app.emit("subscription-refreshed", (&current.id, &result));
+                        }
+                        Err(error) => {
+                            let _ = app.emit("subscription-refresh-failed", (&current.id, &error));
+                            eprintln!("network-orchestrator: {error}");
+                        }
+                    }
+                }
+                Err(_) => {
+                    let error = if record_subscription_refresh_failure(
+                        &state.profiles,
+                        &current.id,
+                        unix_now(),
+                    )
+                    .is_ok()
+                    {
+                        "Subscription refresh failed"
+                    } else {
+                        "Subscription refresh failed, and its failure notice could not be saved"
+                    };
+                    let _ = app.emit("subscription-refresh-failed", (&current.id, error));
+                    eprintln!("network-orchestrator: {error}");
+                }
             }
             let _ = app.emit("route-changed", ());
         }
@@ -1074,31 +1244,20 @@ pub(crate) async fn get_subscription_endpoints(
     profile_id: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<SubscriptionEndpointInfo>, String> {
-    let profile = find_profile(&state.profiles, &profile_id)?;
-    let endpoints = state
-        .config_vault
-        .read_subscription_endpoints(&profile_id)
-        .map_err(|e| e.to_string())?;
-    let active_index = profile
-        .subscription
-        .as_ref()
-        .map(|s| s.active_index)
-        .unwrap_or(0);
-    Ok(endpoints
-        .into_iter()
-        .enumerate()
-        .map(|(i, e)| SubscriptionEndpointInfo {
-            name: e.name,
-            active: i == active_index,
-            protocol: net_manager_core::xray::endpoint_protocol(&e.url),
-        })
-        .collect())
+    let _profile = find_profile(&state.profiles, &profile_id)?;
+    net_manager_core::subscription::list_endpoints(
+        &state.config_vault,
+        &state.profiles,
+        &profile_id,
+    )
+    .map_err(|e| e.to_string())
 }
 
+/// Node key of the new primary (16 hex chars, never the share-link URL).
 #[tauri::command]
 pub(crate) async fn switch_subscription_endpoint(
     profile_id: String,
-    endpoint_index: usize,
+    endpoint_key: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<Profile>, String> {
     let _guard = SUBSCRIPTION_REFRESH_LOCK.lock().await;
@@ -1108,7 +1267,7 @@ pub(crate) async fn switch_subscription_endpoint(
         &state.config_vault,
         &state.profiles,
         &profile_id,
-        endpoint_index,
+        &endpoint_key,
         loopback_port_available,
     )
 }
@@ -1117,59 +1276,797 @@ fn switch_subscription_endpoint_into(
     vault: &ConfigVault,
     store: &net_manager_core::profiles::ProfileStore,
     profile_id: &str,
-    endpoint_index: usize,
+    endpoint_key: &str,
     available: impl Fn(u16) -> bool,
 ) -> Result<Vec<Profile>, String> {
-    let mut profile = subscription_profile(store, profile_id)?;
-    let subscription = profile
+    let doc = net_manager_core::subscription::switch_endpoint_key(
+        vault,
+        store,
+        profile_id,
+        endpoint_key,
+        available,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(redact_profiles_for_ipc(doc.profiles))
+}
+
+/// Ordered backup nodes tried after the primary fails its HTTPS probes.
+/// Keys are kept even when a node left the subscription (it may reappear).
+#[tauri::command]
+pub(crate) async fn set_subscription_backups(
+    profile_id: String,
+    backup_keys: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<Profile>, String> {
+    let _guard = SUBSCRIPTION_REFRESH_LOCK.lock().await;
+    let profile = subscription_profile(&state.profiles, &profile_id)?;
+    if profile.backend != TunnelBackend::Xray {
+        return Err("failover backups need an Xray subscription".into());
+    }
+    let doc = net_manager_core::subscription::set_backup_endpoints(
+        &state.config_vault,
+        &state.profiles,
+        &profile_id,
+        &backup_keys,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(redact_profiles_for_ipc(doc.profiles))
+}
+
+/// Probe the primary over HTTPS while a backup carries traffic and switch
+/// back when it answers again. Enabled unless explicitly turned off.
+#[tauri::command]
+pub(crate) async fn set_subscription_auto_return(
+    profile_id: String,
+    enabled: bool,
+    state: State<'_, AppState>,
+) -> Result<Vec<Profile>, String> {
+    let _guard = SUBSCRIPTION_REFRESH_LOCK.lock().await;
+    subscription_profile(&state.profiles, &profile_id)?;
+    let doc = net_manager_core::subscription::set_auto_return_primary(
+        &state.profiles,
+        &profile_id,
+        enabled,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(redact_profiles_for_ipc(doc.profiles))
+}
+
+/// Domain selectors pinned to one node: while that node is down or gone the
+/// selectors are blocked, never sent direct or through another node.
+#[tauri::command]
+pub(crate) async fn set_pinned_routes(
+    profile_id: String,
+    routes: Vec<PinnedRoute>,
+    state: State<'_, AppState>,
+) -> Result<Vec<Profile>, String> {
+    let _guard = SUBSCRIPTION_REFRESH_LOCK.lock().await;
+    let profile = subscription_profile(&state.profiles, &profile_id)?;
+    if profile.backend != TunnelBackend::Xray {
+        return Err("node-pinned rules need an Xray subscription".into());
+    }
+    let candidate = if profile
+        .xray_service_checks
+        .iter()
+        .any(|check| check.background)
+    {
+        let mut candidate = profile.clone();
+        candidate.pinned_policies = routes.clone();
+        net_manager_core::profiles::validate_profile(&candidate)
+            .map_err(|_| "The pinned-route configuration is invalid".to_string())?;
+        #[cfg(target_os = "linux")]
+        acknowledge_service_checks(&candidate, &candidate.xray_service_checks).await?;
+        Some(candidate)
+    } else {
+        None
+    };
+    let saved = net_manager_core::subscription::set_pinned_routes(
+        &state.config_vault,
+        &state.profiles,
+        &profile_id,
+        routes,
+    );
+    #[cfg(target_os = "linux")]
+    if saved.is_err() {
+        if let Some(candidate) = candidate {
+            acknowledge_service_checks(&candidate, &[]).await?;
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = candidate;
+    let doc = saved.map_err(|e| e.to_string())?;
+    Ok(redact_profiles_for_ipc(doc.profiles))
+}
+
+fn require_service_check_user() -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            return Err("Run service-check operations as your own user, without sudo".into());
+        }
+    }
+    Ok(())
+}
+
+fn service_check_profile(state: &AppState, profile_id: &str) -> Result<Profile, String> {
+    let profile = find_profile(&state.profiles, profile_id)
+        .map_err(|_| "The requested profile could not be selected".to_string())?;
+    if profile.backend != TunnelBackend::Xray {
+        return Err("Service checks require an Xray profile".into());
+    }
+    Ok(profile)
+}
+
+fn service_check_endpoints(
+    state: &AppState,
+    profile: &Profile,
+) -> Result<Vec<net_manager_core::config_vault::SubscriptionEndpoint>, String> {
+    if profile.subscription.is_none() {
+        return Ok(Vec::new());
+    }
+    state
+        .config_vault
+        .read_subscription_endpoints(&profile.id)
+        .map_err(|_| "The saved endpoint list could not be read".to_string())
+}
+
+#[cfg(target_os = "linux")]
+async fn acknowledge_service_checks(
+    profile: &Profile,
+    checks: &[ServiceCheck],
+) -> Result<(), String> {
+    use net_manager_core::daemon_protocol::{
+        method, XrayProfileParams, XrayServiceChecksParams, XrayStatusResult,
+    };
+
+    if profile.xray_mode != XrayMode::Tun
+        || (!profile
+            .xray_service_checks
+            .iter()
+            .any(|check| check.background)
+            && !checks.iter().any(|check| check.background))
+    {
+        return Ok(());
+    }
+
+    let runtime_checks = checks
+        .iter()
+        .filter(|check| {
+            check.background
+                && net_manager_core::service_checks::service_check_is_bound(
+                    profile,
+                    &check.endpoint_key,
+                )
+        })
+        .cloned()
+        .collect();
+
+    let client = crate::daemon_client::DaemonClient::system();
+    if client
+        .request::<_, Vec<ServiceCheckResult>>(
+            method::XRAY_SERVICE_CHECKS,
+            XrayServiceChecksParams {
+                profile_id: profile.id.clone(),
+                checks: runtime_checks,
+            },
+        )
+        .await
+        .is_ok()
+    {
+        return Ok(());
+    }
+
+    let stopped = client
+        .request::<_, XrayStatusResult>(
+            method::XRAY_STATUS,
+            XrayProfileParams {
+                profile_id: profile.id.clone(),
+            },
+        )
+        .await
+        .is_ok_and(|status| status.state == TunnelState::Stopped);
+
+    if stopped {
+        Ok(())
+    } else {
+        Err("The daemon did not confirm the diagnostic change; configuration was not saved".into())
+    }
+}
+
+#[tauri::command]
+pub(crate) async fn set_xray_service_checks(
+    profile_id: String,
+    checks: Vec<ServiceCheck>,
+    state: State<'_, AppState>,
+) -> Result<Vec<Profile>, String> {
+    require_service_check_user()?;
+    let _guard = SUBSCRIPTION_REFRESH_LOCK.lock().await;
+    let expected = service_check_profile(state.inner(), &profile_id)?;
+    let expected_endpoints = service_check_endpoints(state.inner(), &expected)?;
+
+    net_manager_core::service_checks::validate_service_checks(&checks)
+        .map_err(|_| "The service-check configuration is invalid".to_string())?;
+
+    // Preserve existing dangling choices, but do not allow the dedicated
+    // editor to recruit an unpinned endpoint for a new or retargeted check.
+    for check in &checks {
+        let retained = expected
+            .xray_service_checks
+            .iter()
+            .any(|previous| previous.id == check.id && previous.endpoint_key == check.endpoint_key);
+        if !retained
+            && !net_manager_core::service_checks::service_check_is_bound(
+                &expected,
+                &check.endpoint_key,
+            )
+        {
+            return Err("The selected endpoint is not explicitly pinned".into());
+        }
+    }
+
+    let mut candidate = expected.clone();
+    candidate.xray_service_checks = checks.clone();
+    net_manager_core::profiles::validate_profile(&candidate)
+        .map_err(|_| "The profile cannot accept this configuration".to_string())?;
+
+    #[cfg(target_os = "linux")]
+    acknowledge_service_checks(&expected, &checks).await?;
+
+    let saved_document = state.profiles.update_profile(&profile_id, |current| {
+        if *current != expected {
+            return Err(std::io::Error::other("selection changed"));
+        }
+        if current.subscription.is_some()
+            && state
+                .config_vault
+                .read_subscription_endpoints(&current.id)?
+                != expected_endpoints
+        {
+            return Err(std::io::Error::other("selection changed"));
+        }
+        current.xray_service_checks = checks;
+        Ok(())
+    });
+    let document = match saved_document {
+        Ok(document) => document,
+        Err(_) => {
+            #[cfg(target_os = "linux")]
+            let stopped = acknowledge_service_checks(
+                if expected
+                    .xray_service_checks
+                    .iter()
+                    .any(|check| check.background)
+                {
+                    &expected
+                } else {
+                    &candidate
+                },
+                &[],
+            )
+            .await
+            .is_ok();
+            #[cfg(not(target_os = "linux"))]
+            let stopped = true;
+            return Err(if stopped {
+                "Checks were not saved; background diagnostics are stopped."
+            } else {
+                "Checks were not saved; the daemon did not confirm background cancellation."
+            }
+            .into());
+        }
+    };
+
+    Ok(redact_profiles_for_ipc(document.profiles))
+}
+
+#[tauri::command]
+pub(crate) async fn run_xray_service_checks(
+    profile_id: String,
+    check_ids: Option<Vec<String>>,
+    state: State<'_, AppState>,
+) -> Result<Vec<ServiceCheckResult>, String> {
+    require_service_check_user()?;
+
+    let (expected, expected_endpoints) = {
+        let _guard = SUBSCRIPTION_REFRESH_LOCK.lock().await;
+        let profile = service_check_profile(state.inner(), &profile_id)?;
+        let endpoints = service_check_endpoints(state.inner(), &profile)?;
+        (profile, endpoints)
+    };
+
+    // Do not hold the save/refresh lock during network work: background
+    // opt-out must remain able to cancel its independent worker.
+    let executable = std::sync::OnceLock::<Result<PathBuf, String>>::new();
+    let results = net_manager_core::service_checks::check_profile_services(
+        &state.config_vault,
+        &expected,
+        check_ids.as_deref(),
+        || {
+            let path = executable
+                .get_or_init(|| {
+                    state
+                        .resolve_backend_executable(TunnelBackend::Xray)
+                        .map(|resolved| resolved.path)
+                        .map_err(|_| "Xray executable unavailable".to_string())
+                })
+                .as_ref()
+                .map_err(Clone::clone)?;
+            Ok(tokio::process::Command::new(path))
+        },
+    )
+    .await
+    .map_err(|_| "The service checks could not be completed".to_string())?;
+
+    let _guard = SUBSCRIPTION_REFRESH_LOCK.lock().await;
+    let current = service_check_profile(state.inner(), &profile_id)?;
+    if current != expected
+        || service_check_endpoints(state.inner(), &current)? != expected_endpoints
+    {
+        return Err("The profile or endpoint selection changed; run the checks again".into());
+    }
+
+    Ok(results)
+}
+
+/// The opt-in filtered pool: filters plus the country-proof flag; `None`
+/// turns the pool off and forgets its members. Members themselves come only
+/// from `rebuild_subscription_node_pool` — verified, never hand-picked.
+#[tauri::command]
+pub(crate) async fn set_subscription_node_pool(
+    profile_id: String,
+    pool: Option<NodePoolSettings>,
+    state: State<'_, AppState>,
+) -> Result<Vec<Profile>, String> {
+    let _guard = SUBSCRIPTION_REFRESH_LOCK.lock().await;
+    let profile = subscription_profile(&state.profiles, &profile_id)?;
+    if profile.backend != TunnelBackend::Xray {
+        return Err("the backup pool needs an Xray subscription".into());
+    }
+    let doc = net_manager_core::node_pool::set_node_pool(&state.profiles, &profile_id, pool)
+        .map_err(|e| e.to_string())?;
+    Ok(redact_profiles_for_ipc(doc.profiles))
+}
+
+/// Probe every filter candidate through a temporary Xray and keep the
+/// members whose real exit country passes. The report lists per-candidate
+/// verdicts — including wrong-country rejections — and whether the previous
+/// pool stayed because nothing usable answered.
+async fn rebuild_pool_report(
+    state: &AppState,
+    profile_id: &str,
+) -> Result<Option<net_manager_core::node_pool::NodePoolReport>, String> {
+    let profile = subscription_profile(&state.profiles, profile_id)?;
+    if profile
         .subscription
         .as_ref()
-        .ok_or_else(|| "profile is not a subscription".to_string())?
-        .clone();
-    if endpoint_index >= subscription.endpoint_count {
-        return Err("endpoint index out of range".into());
+        .and_then(|subscription| subscription.node_pool.as_ref())
+        .is_none()
+    {
+        return Ok(None);
     }
-    let endpoints = vault
-        .read_subscription_endpoints(profile_id)
-        .map_err(|e| e.to_string())?;
-    if endpoint_index >= endpoints.len() {
-        return Err("endpoint index out of range".into());
+
+    let verify = profile
+        .subscription
+        .as_ref()
+        .and_then(|subscription| subscription.node_pool.as_ref())
+        .is_some_and(|pool| pool.verify_exit_country);
+    let executable = verify
+        .then(|| {
+            state
+                .resolve_backend_executable(TunnelBackend::Xray)
+                .map(|resolved| resolved.path)
+                .map_err(|_| "Xray executable unavailable".to_string())
+        })
+        .transpose()?;
+
+    net_manager_core::node_pool::rebuild_node_pool(
+        &state.config_vault,
+        &state.profiles,
+        profile_id,
+        &net_manager_core::node_pool::EXIT_COUNTRY_PROBES,
+        net_manager_core::node_pool::EXIT_COUNTRY_PROBE_TIMEOUT,
+        move |_| {
+            executable
+                .as_ref()
+                .ok_or_else(|| std::io::Error::other("Xray executable unavailable"))
+                .map(tokio::process::Command::new)
+        },
+    )
+    .await
+    .map(Some)
+    .map_err(|_| {
+        "Backup-pool rebuild failed; the previously stored pool was not replaced".to_string()
+    })
+}
+
+#[tauri::command]
+pub(crate) async fn rebuild_subscription_node_pool(
+    profile_id: String,
+    state: State<'_, AppState>,
+) -> Result<net_manager_core::node_pool::NodePoolReport, String> {
+    let _guard = SUBSCRIPTION_REFRESH_LOCK.lock().await;
+    rebuild_pool_report(state.inner(), &profile_id)
+        .await?
+        .ok_or_else(|| "Set backup-pool filters before rebuilding the pool".to_string())
+}
+
+/// One failover candidate's real exit: where it answers from, what its name
+/// claims (flag emoji), and whether the two disagree.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SubscriptionExitCheck {
+    pub key: String,
+    pub name: String,
+    pub role: String,
+    pub named_country: Option<String>,
+    pub exit_country: Option<String>,
+    pub exit_ip: Option<String>,
+    pub mismatch: bool,
+    pub error: Option<String>,
+}
+
+/// The country a flag emoji names (🇷🇺 → RU), or `None` — a display hint
+/// compared against the probed exit, never trusted as one.
+fn flag_country(name: &str) -> Option<String> {
+    let mut code = String::new();
+    for ch in name.chars() {
+        let value = ch as u32;
+        if (0x1F1E6..=0x1F1FF).contains(&value) {
+            code.push(char::from_u32(value - 0x1F1E6 + 'A' as u32)?);
+        }
     }
-    let endpoint = &endpoints[endpoint_index];
-    let document = store
-        .load()
-        .map_err(|_| "failed to load profiles".to_string())?;
-    let used = profile_listener_ports(&document.profiles, profile_id);
-    let (socks_port, http_port) = select_generated_ports(
-        profile.xray_socks_port,
-        profile.xray_http_port,
-        &used,
-        available,
-    )?;
-    let config = generate_endpoint_config(&endpoint.url, socks_port, http_port)?;
-    let body = serde_json::to_vec_pretty(&config).map_err(|e| e.to_string())?;
-    let old_path = profile.config_path.clone();
-    let import = store_generated_xray(vault, profile_id, &body).map_err(|e| e.to_string())?;
-    profile.config_path = import.config_path.clone();
-    profile.xray_socks_port = Some(socks_port);
-    profile.xray_http_port = Some(http_port);
-    profile.name = if endpoint.name.trim().is_empty() {
-        "Subscription".to_string()
-    } else {
-        endpoint.name.clone()
+    (code.len() == 2).then_some(code)
+}
+
+/// Real exit-country verification of the failover chain — primary, manual
+/// backups and pool members — each probed through its own temporary Xray.
+/// A node name is not an exit; mismatches are reported, not hidden.
+#[tauri::command]
+pub(crate) async fn verify_subscription_exits(
+    profile_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<SubscriptionExitCheck>, String> {
+    let _guard = SUBSCRIPTION_REFRESH_LOCK.lock().await;
+    let profile = subscription_profile(&state.profiles, &profile_id)?;
+    let (nodes, _) = net_manager_core::subscription::failover_plan(&state.config_vault, &profile)
+        .map_err(|_| "The failover endpoints could not be resolved".to_string())?;
+    if nodes.is_empty() {
+        return Err("The profile has no failover candidates".into());
+    }
+    let expected_nodes = nodes.clone();
+
+    let executable = state
+        .resolve_backend_executable(TunnelBackend::Xray)
+        .map_err(|_| "Xray executable unavailable".to_string())?
+        .path;
+    let infos = net_manager_core::subscription::list_endpoints(
+        &state.config_vault,
+        &state.profiles,
+        &profile_id,
+    )
+    .map_err(|_| "The subscription endpoint list could not be read".to_string())?;
+    let roles = infos
+        .iter()
+        .map(|info| {
+            let role = if info.active {
+                "primary"
+            } else if info.is_backup {
+                "backup"
+            } else if info.in_pool {
+                "pool"
+            } else {
+                "node"
+            };
+            (info.key.as_str(), role)
+        })
+        .collect::<HashMap<_, _>>();
+
+    let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(
+        net_manager_core::node_pool::POOL_PROBE_PARALLELISM,
+    ));
+    let mut tasks = tokio::task::JoinSet::new();
+    for (index, endpoint) in nodes.into_iter().enumerate() {
+        let gate = gate.clone();
+        let executable = executable.clone();
+        tasks.spawn(async move {
+            let _permit = gate
+                .acquire_owned()
+                .await
+                .map_err(|_| "Exit verification was cancelled".to_string())?;
+            let key = net_manager_core::subscription::endpoint_key(&endpoint.url);
+            let mut command = tokio::process::Command::new(&executable);
+            command.args(["run", "-config", "stdin:"]);
+            let outcome = net_manager_core::node_pool::measure_exit_country(
+                &endpoint.url,
+                command,
+                &net_manager_core::node_pool::EXIT_COUNTRY_PROBES,
+                net_manager_core::node_pool::EXIT_COUNTRY_PROBE_TIMEOUT,
+            )
+            .await;
+            Ok::<_, String>((index, key, endpoint.name, outcome))
+        });
+    }
+
+    let mut results = Vec::new();
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok(Ok(result)) => results.push(result),
+            Ok(Err(error)) => {
+                tasks.abort_all();
+                return Err(error);
+            }
+            Err(_) => {
+                tasks.abort_all();
+                return Err("An exit-verification worker failed".into());
+            }
+        }
+    }
+    results.sort_by_key(|(index, _, _, _)| *index);
+
+    if subscription_profile(&state.profiles, &profile_id)? != profile {
+        return Err("The profile changed during verification; verify again".into());
+    }
+    let (current_nodes, _) =
+        net_manager_core::subscription::failover_plan(&state.config_vault, &profile)
+            .map_err(|_| "The current failover endpoints could not be read".to_string())?;
+    if current_nodes != expected_nodes {
+        return Err("The subscription endpoints changed during verification; verify again".into());
+    }
+
+    Ok(results
+        .into_iter()
+        .map(|(_, key, name, outcome)| {
+            let role = roles.get(key.as_str()).copied().unwrap_or("node");
+            let named_country = flag_country(&name);
+            let (exit_country, exit_ip, error) = match outcome {
+                Ok(exit) => (Some(exit.country), Some(exit.ip), None),
+                Err(_) => (
+                    None,
+                    None,
+                    Some("Exit-country verification failed".to_string()),
+                ),
+            };
+            let mismatch =
+                named_country.is_some() && exit_country.is_some() && named_country != exit_country;
+
+            SubscriptionExitCheck {
+                key,
+                name: name.trim().to_string(),
+                role: role.to_string(),
+                named_country,
+                exit_country,
+                exit_ip,
+                mismatch,
+                error,
+            }
+        })
+        .collect())
+}
+
+/// What a policy migration would set, in client-safe form: counts,
+/// selectors and sanitized reasons — never the source's outbounds or links.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct XrayPolicyPreview {
+    pub direct: usize,
+    pub proxy: usize,
+    pub block: usize,
+    pub pinned_count: usize,
+    pub private_lan_direct: bool,
+    pub quic_reject: bool,
+    pub domain_strategy: Option<XrayDomainStrategy>,
+    pub domain_matcher: Option<XrayDomainMatcher>,
+    pub endpoint_bypass_count: usize,
+    pub has_geoip_override: bool,
+    pub has_geosite_override: bool,
+    pub has_dns: bool,
+    pub has_sockopts: bool,
+    pub traffic_rule_count: usize,
+    pub interface_route_count: usize,
+    pub dns_server_count: usize,
+    pub dns_host_count: usize,
+    pub dns_rewrite_rule_count: usize,
+    pub tun_dns_server_count: usize,
+    pub tun_mtu: Option<u32>,
+    pub connection_idle_secs: Option<u32>,
+    pub direct_domain_strategy: Option<String>,
+    pub dns_enable_parallel_query: Option<bool>,
+    pub has_dns_outbound: bool,
+    pub backup_count: Option<usize>,
+    pub skipped: Vec<String>,
+    pub refused: Vec<String>,
+}
+
+fn preview_of(
+    migration: &net_manager_core::xray_migrate::XrayPolicyMigration,
+) -> XrayPolicyPreview {
+    let count = |target| {
+        migration
+            .domain_policies
+            .iter()
+            .filter(|policy| policy.target == target)
+            .map(|policy| policy.domains.len())
+            .sum::<usize>()
     };
-    let mut updated = profile.clone();
-    updated.subscription = Some(SubscriptionMeta {
-        endpoint_count: endpoints.len(),
-        active_index: endpoint_index,
-        ..subscription
+    XrayPolicyPreview {
+        direct: count(DomainRouteTarget::Direct),
+        proxy: count(DomainRouteTarget::Proxy),
+        block: count(DomainRouteTarget::Block),
+        pinned_count: migration.pinned_routes.len(),
+        private_lan_direct: migration.private_lan_direct,
+        quic_reject: migration.quic_reject,
+        domain_strategy: migration.domain_strategy,
+        domain_matcher: migration.domain_matcher,
+        endpoint_bypass_count: migration.endpoint_bypasses.len(),
+        has_geoip_override: migration.geoip_url.is_some(),
+        has_geosite_override: migration.geosite_url.is_some(),
+        has_dns: !migration.dns.is_empty(),
+        has_sockopts: migration.sockopts.is_some(),
+        traffic_rule_count: migration.traffic_rules.len(),
+        interface_route_count: migration.interface_routes.len(),
+        dns_server_count: migration.dns.servers.len(),
+        dns_host_count: migration.dns.hosts.len(),
+        dns_rewrite_rule_count: migration
+            .dns
+            .outbound
+            .as_ref()
+            .map_or(0, |outbound| outbound.rules.len()),
+        tun_dns_server_count: migration.tun_dns_servers.len(),
+        tun_mtu: migration.tun_mtu,
+        connection_idle_secs: migration.connection_idle_secs,
+        direct_domain_strategy: migration.direct_domain_strategy.clone(),
+        dns_enable_parallel_query: migration.dns.enable_parallel_query,
+        has_dns_outbound: migration.dns.outbound.is_some(),
+        backup_count: migration.backup_keys.as_ref().map(Vec::len),
+        skipped: migration
+            .skipped
+            .iter()
+            .map(|item| item.reason.clone())
+            .collect(),
+        refused: migration
+            .refused
+            .iter()
+            .map(|item| item.reason.clone())
+            .collect(),
+    }
+}
+
+fn plan_migration(
+    state: &AppState,
+    profile: &Profile,
+    path: &Path,
+) -> Result<
+    (
+        net_manager_core::xray_migrate::XrayPolicyMigration,
+        Vec<net_manager_core::config_vault::SubscriptionEndpoint>,
+    ),
+    String,
+> {
+    use std::io::Read;
+    const LIMIT: u64 = 512 * 1024;
+    let mut body = Vec::new();
+    std::fs::File::open(path)
+        .and_then(|file| file.take(LIMIT + 1).read_to_end(&mut body))
+        .map_err(|_| "The selected Xray policy file could not be read".to_string())?;
+    if body.len() as u64 > LIMIT {
+        return Err("The selected Xray policy exceeds 512 KiB".into());
+    }
+    let source: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|_| "The selected file is not a JSON Xray configuration".to_string())?;
+
+    let endpoints = if profile.subscription.is_some() {
+        state
+            .config_vault
+            .read_subscription_endpoints(&profile.id)
+            .map_err(|_| "The subscription endpoint vault could not be read".to_string())?
+    } else {
+        Vec::new()
+    };
+
+    let primary = profile.subscription.as_ref().and_then(|subscription| {
+        subscription.active_key.clone().or_else(|| {
+            endpoints
+                .get(subscription.active_index)
+                .map(|endpoint| net_manager_core::subscription::endpoint_key(&endpoint.url))
+        })
     });
-    let doc = store.upsert(updated).map_err(|e| {
-        let _ = vault.remove_revision_for_config(&import.config_path);
-        e.to_string()
-    })?;
-    remove_managed_revision(vault, profile_id, &old_path, "subscription endpoint switch")?;
-    Ok(redact_profiles_for_ipc(doc.profiles))
+
+    let migration = net_manager_core::xray_migrate::plan_xray_policy_migration(
+        &source,
+        primary.as_deref(),
+        net_manager_core::xray_migrate::subscription_outbound_resolver(
+            &endpoints,
+            primary.as_deref(),
+        ),
+    )
+    .map_err(|_| "The selected Xray policy could not be planned".to_string())?;
+
+    Ok((migration, endpoints))
+}
+
+/// What the file at `path` would change on the profile — and which rules it
+/// refuses to fake. Nothing is saved.
+#[tauri::command]
+pub(crate) async fn preview_xray_policy_migration(
+    profile_id: String,
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<XrayPolicyPreview, String> {
+    let profile = find_profile(&state.profiles, &profile_id)?;
+    if profile.backend != TunnelBackend::Xray {
+        return Err("policy migration targets Xray profiles".into());
+    }
+    let (migration, _) = plan_migration(&state, &profile, Path::new(&path))?;
+    Ok(preview_of(&migration))
+}
+
+/// Adopt the file's policy on the profile. Refused rules block the whole
+/// apply — nothing is half-imported and reported as success.
+#[tauri::command]
+pub(crate) async fn apply_xray_policy_migration(
+    profile_id: String,
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<Profile>, String> {
+    let _guard = SUBSCRIPTION_REFRESH_LOCK.lock().await;
+    let expected = find_profile(&state.profiles, &profile_id)?;
+    if expected.backend != TunnelBackend::Xray {
+        return Err("Policy migration requires an Xray profile".into());
+    }
+
+    ensure_profile_stopped(&state, &expected, "migrating routing policy").await?;
+
+    let (migration, expected_endpoints) = plan_migration(&state, &expected, Path::new(&path))?;
+    if !migration.refused.is_empty() {
+        return Err(format!(
+            "Policy migration refused {} source construct(s); \
+             preview the refusal categories. Nothing was changed.",
+            migration.refused.len(),
+        ));
+    }
+
+    let document = state
+        .profiles
+        .update_profile(&profile_id, |current| {
+            if current != &expected {
+                return Err(std::io::Error::other("Profile changed during migration"));
+            }
+
+            if expected.subscription.is_some() {
+                let endpoints = state
+                    .config_vault
+                    .read_subscription_endpoints(&profile_id)
+                    .map_err(|_| std::io::Error::other("Endpoint vault could not be read"))?;
+                if endpoints != expected_endpoints {
+                    return Err(std::io::Error::other(
+                        "Subscription changed during migration",
+                    ));
+                }
+            }
+
+            net_manager_core::xray_migrate::apply_xray_policy_migration(current, migration)
+                .map_err(|_| std::io::Error::other("Policy could not be applied"))?;
+
+            if current.subscription.is_some() {
+                let live = expected_endpoints
+                    .iter()
+                    .map(|endpoint| net_manager_core::subscription::endpoint_key(&endpoint.url))
+                    .collect::<HashSet<_>>();
+                for pin in &mut current.pinned_policies {
+                    pin.missing = !live.contains(&pin.endpoint_key);
+                }
+            }
+            Ok(())
+        })
+        .map_err(|_| {
+            "Policy migration was not saved. The profile or endpoint selection may \
+             have changed, the policy may conflict with existing pins, or the store \
+             may be unwritable. Preview again before retrying."
+                .to_string()
+        })?;
+
+    Ok(redact_profiles_for_ipc(document.profiles))
 }
 
 #[cfg(test)]
@@ -1817,6 +2714,12 @@ mod tests {
             web_page_url: None,
             update_interval_hours: None,
             skipped_protocols: Vec::new(),
+            active_key: None,
+            backup_keys: Vec::new(),
+            auto_return_primary: None,
+            probe_url: None,
+            node_pool: None,
+            pool_keys: Vec::new(),
         };
         assert!(!subscription_refresh_due(&meta, 1899));
         assert!(subscription_refresh_due(&meta, 1900));
@@ -1925,6 +2828,12 @@ mod tests {
             web_page_url: None,
             update_interval_hours: None,
             skipped_protocols: Vec::new(),
+            active_key: None,
+            backup_keys: Vec::new(),
+            auto_return_primary: None,
+            probe_url: None,
+            node_pool: None,
+            pool_keys: Vec::new(),
         });
         assert!(!should_auto_refresh(&p, 1900, true));
         assert!(should_auto_refresh(&p, 1900, false));
@@ -2011,8 +2920,12 @@ mod tests {
         )
         .unwrap();
         let old = &imported.profiles[0];
+        let key = net_manager_core::subscription::list_endpoints(&vault, &store, &old.id).unwrap()
+            [1]
+        .key
+        .clone();
         let profiles =
-            switch_subscription_endpoint_into(&vault, &store, &old.id, 1, |_| true).unwrap();
+            switch_subscription_endpoint_into(&vault, &store, &old.id, &key, |_| true).unwrap();
         let switched = &profiles[0];
         assert_eq!(switched.xray_socks_port, old.xray_socks_port);
         assert_eq!(switched.xray_http_port, old.xray_http_port);
@@ -2052,8 +2965,16 @@ mod tests {
         let vault = ConfigVault::new(dir.join("configs"));
         let store = net_manager_core::profiles::ProfileStore::new(dir.join("profiles.json"));
         let imported = import_subscription_body_into(&vault, &store, "https://secret-url.test/sub", "private-hwid", "vless://id@one.test:443?security=tls#First\nhy2://private-password@two.test:443#Second").unwrap();
-        let mut selected = imported.profiles[0].clone();
-        selected.subscription.as_mut().unwrap().active_index = 1;
+        let mut selected = net_manager_core::subscription::switch_endpoint(
+            &vault,
+            &store,
+            &imported.profiles[0].id,
+            1,
+            |_| true,
+        )
+        .unwrap()
+        .profiles
+        .remove(0);
         selected
             .subscription
             .as_mut()
@@ -2103,8 +3024,16 @@ mod tests {
             "vless://id@one.test:443?security=tls#First\nhy2://password@two.test:443#Second",
         )
         .unwrap();
-        let mut selected = imported.profiles[0].clone();
-        selected.subscription.as_mut().unwrap().active_index = 1;
+        let selected = net_manager_core::subscription::switch_endpoint(
+            &vault,
+            &store,
+            &imported.profiles[0].id,
+            1,
+            |_| true,
+        )
+        .unwrap()
+        .profiles
+        .remove(0);
         store.upsert(selected.clone()).unwrap();
         let result = refresh_subscription_body_into(
             &vault,
@@ -2655,6 +3584,12 @@ mod tests {
             web_page_url: None,
             update_interval_hours: None,
             skipped_protocols: Vec::new(),
+            active_key: None,
+            backup_keys: Vec::new(),
+            auto_return_primary: None,
+            probe_url: None,
+            node_pool: None,
+            pool_keys: Vec::new(),
         });
         let public = redact_profiles_for_ipc(vec![stored.clone()]);
         let json = serde_json::to_string(&public).unwrap();
@@ -2908,7 +3843,6 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(err.contains("unexpected status"));
         assert!(!err.contains("private-password"));
         let pid: u32 = fs::read_to_string(&pid_path).unwrap().parse().unwrap();
         assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());

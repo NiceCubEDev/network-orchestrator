@@ -1,6 +1,6 @@
 use crate::models::{
     DomainPolicy, DomainRouteTarget, XrayDnsConfig, XrayDnsRoute, XrayDnsServer, XrayDomainMatcher,
-    XrayDomainStrategy,
+    XrayDomainStrategy, XraySockopts, XrayTrafficRule,
 };
 use ipnet::IpNet;
 use serde_json::{json, Map, Value};
@@ -310,6 +310,42 @@ fn decode_xray_json_entry(uri: &str) -> io::Result<Map<String, Value>> {
     }
 }
 
+/// Secret-free identity string for `xray-json:` entries (see
+/// [`crate::subscription::endpoint_key`]): the transport of the first
+/// outbound — `protocol|address:port|network|security`. `None` for entries
+/// that cannot be decoded.
+pub fn xray_json_identity(uri: &str) -> Option<String> {
+    let entry = decode_xray_json_entry(uri).ok()?;
+    let outbound = entry.get("outbounds")?.as_array()?.first()?;
+    let text = |key: &str| outbound.get(key)?.as_str().map(str::to_string);
+    let protocol = text("protocol")?;
+    let (address, port) = match protocol.as_str() {
+        "hysteria" | "hysteria2" => (
+            outbound["settings"].get("address")?.as_str()?.to_string(),
+            outbound["settings"].get("port")?.to_string(),
+        ),
+        _ => {
+            let server = outbound["settings"].get("vnext")?.as_array()?.first()?;
+            (
+                server.get("address")?.as_str()?.to_string(),
+                server.get("port")?.to_string(),
+            )
+        }
+    };
+    let network = outbound["streamSettings"]
+        .get("network")
+        .and_then(Value::as_str)
+        .unwrap_or("tcp");
+    let security = outbound["streamSettings"]
+        .get("security")
+        .and_then(Value::as_str)
+        .unwrap_or("none");
+    Some(format!(
+        "{protocol}|{}:{port}|{network}|{security}",
+        address.to_lowercase()
+    ))
+}
+
 fn generate_xray_json_config(uri: &str, socks_port: u16) -> io::Result<Value> {
     if socks_port == 0 {
         return Err(invalid_input("socks port must be nonzero"));
@@ -585,6 +621,155 @@ pub fn generate_share_link_config_with_http(
     Ok(config)
 }
 
+// ---- multinode (failover + pinned routes) ----------------------------------
+
+/// Outbound tag of a failover candidate (`node-<key>`); also the tag a
+/// `xray api bo` override selects.
+pub fn node_tag(key: &str) -> String {
+    format!("node-{key}")
+}
+
+/// Outbound tag of a pinned-only node (`pin-<key>`) — deliberately outside
+/// the balancer selector so the failover machinery can never select a node
+/// the user only pinned routes to.
+pub fn pin_tag(key: &str) -> String {
+    format!("pin-{key}")
+}
+
+/// The tag the balancer selects while no candidate is healthy: a blackhole
+/// the daemon appends. Default traffic is dropped, never sent direct.
+pub const UNAVAILABLE_TAG: &str = "unavailable";
+/// Tag of the single `routing.balancers` entry the daemon overrides at
+/// runtime with `xray api bo`.
+pub const FAILOVER_BALANCER: &str = "failover";
+
+/// The proxy outbound of an endpoint's generated config, retagged to `tag`.
+/// Panel `xray-json:` entries are reduced to their server first, the same
+/// way a single-endpoint TUN connect treats them.
+pub fn multinode_outbound(url: &str, tag: &str) -> io::Result<Value> {
+    let config = generate_share_link_config(url, 1)?;
+    let config = tun_compatible_config(&config)
+        .map_err(|_| invalid_input("invalid or unsupported subscription endpoint"))?;
+    let mut outbound = config["outbounds"]
+        .as_array()
+        .and_then(|outbounds| outbounds.first().cloned())
+        .ok_or_else(|| invalid_input("endpoint produced no proxy outbound"))?;
+    outbound["tag"] = json!(tag);
+    Ok(outbound)
+}
+
+/// One resolved pinned route for [`apply_multinode_config`]: selectors plus
+/// either a real outbound (the endpoint is in the subscription) or a
+/// blackhole (it left — the pinned selectors drop, never reroute).
+pub struct PinnedOutbound {
+    pub key: String,
+    /// `None` → the outbound for this key is a blackhole.
+    pub outbound: Option<Value>,
+    pub selectors: Vec<String>,
+}
+
+/// Rebuild a generated single-endpoint config for multinode operation:
+///
+/// - `base`'s primary outbound is retagged `node-<primary>` and the ordered
+///   `backups` join it (same order → strict priority);
+/// - each resolved pinned route adds a `pin-<key>` outbound and prepends a
+///   domain rule pinned to it — these rules sit before every other rule so
+///   a pinned name can never escape to direct or another node;
+/// - a missing pinned key adds only a blackhole `pin-<key>` outbound —
+///   fail-closed;
+/// - routing gets `balancers: [{tag: failover, selector: [unavailable]}]`:
+///   the daemon adds the `unavailable` blackhole outbound and the catch-all
+///   rule, and pins the balancer to a real node only after a probe says it
+///   is healthy. Before that, default traffic drops — never leaks.
+///
+/// `freedom`/`blackhole` auxiliaries from the base config are preserved.
+pub fn apply_multinode_config(
+    base: &Value,
+    primary_key: &str,
+    backups: &[(String, Value)],
+    pinned: &[PinnedOutbound],
+) -> io::Result<Value> {
+    let mut config = base.clone();
+    let outbounds = config["outbounds"]
+        .as_array_mut()
+        .ok_or_else(|| invalid_data("xray config outbounds must be an array"))?;
+    if outbounds.is_empty() {
+        return Err(invalid_data("xray config has no outbounds"));
+    }
+    let primary_tag = outbounds[0]["tag"]
+        .as_str()
+        .ok_or_else(|| invalid_data("xray primary outbound has no tag"))?
+        .to_owned();
+    outbounds[0]["tag"] = json!(node_tag(primary_key));
+    for (key, outbound) in backups {
+        let mut node = outbound.clone();
+        node["tag"] = json!(node_tag(key));
+        outbounds.push(node);
+    }
+    let mut pinned_outbounds = HashMap::new();
+    for route in pinned {
+        if let Some(previous) = pinned_outbounds.insert(route.key.as_str(), route.outbound.as_ref())
+        {
+            if previous != route.outbound.as_ref() {
+                return Err(invalid_data("conflicting outbounds for a pinned endpoint"));
+            }
+            continue;
+        }
+        outbounds.push(match &route.outbound {
+            Some(outbound) => {
+                let mut pinned_node = outbound.clone();
+                pinned_node["tag"] = json!(pin_tag(&route.key));
+                pinned_node
+            }
+            None => json!({"tag": pin_tag(&route.key), "protocol": "blackhole"}),
+        });
+    }
+    let routing = config
+        .as_object_mut()
+        .and_then(|root| root.get_mut("routing"))
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| invalid_data("xray config routing must be an object"))?;
+    let mut merged: Vec<Value> = Vec::new();
+    for route in pinned {
+        if route.selectors.is_empty() {
+            continue;
+        }
+        merged.push(json!({
+            "type": "field",
+            "domain": route.selectors,
+            "outboundTag": pin_tag(&route.key),
+        }));
+    }
+    let rules = routing
+        .entry("rules")
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .ok_or_else(|| invalid_data("xray config routing rules must be an array"))?;
+    // Existing proxy policies must follow failover, not retain a dangling
+    // reference to the primary's old tag after it becomes `node-<key>`.
+    for rule in rules.iter_mut() {
+        if rule["outboundTag"].as_str() == Some(primary_tag.as_str()) {
+            let object = rule
+                .as_object_mut()
+                .ok_or_else(|| invalid_data("xray routing rule must be an object"))?;
+            object.remove("outboundTag");
+            object.insert("balancerTag".into(), json!(FAILOVER_BALANCER));
+        }
+    }
+    // Port-scoped transport guards and DNS capture precede domain pins.
+    // Pins still precede ordinary domain/default policies.
+    let guard_count = rules
+        .iter()
+        .take_while(|rule| rule.get("port").is_some())
+        .count();
+    rules.splice(guard_count..guard_count, merged);
+    routing.insert(
+        "balancers".into(),
+        json!([{"tag": FAILOVER_BALANCER, "selector": [UNAVAILABLE_TAG]}]),
+    );
+    Ok(config)
+}
+
 /// Short protocol label for an endpoint, e.g. `VLESS · Reality` or
 /// `Hysteria2`; for full Xray JSON entries it is read from the first outbound.
 pub fn endpoint_protocol(uri: &str) -> Option<String> {
@@ -816,6 +1001,29 @@ pub struct ProfileRoutingOptions {
     pub domain_matcher: Option<XrayDomainMatcher>,
     /// Profile `dns` section policy.
     pub dns: XrayDnsConfig,
+    /// `streamSettings.sockopt` keepalive/timeouts applied to the node and
+    /// direct outbounds (`None` keeps xray defaults).
+    pub sockopts: Option<XraySockopts>,
+    pub traffic_rules: Vec<XrayTrafficRule>,
+    pub interface_routes: Vec<crate::models::XrayInterfaceRoute>,
+    pub connection_idle_secs: Option<u32>,
+    pub direct_domain_strategy: Option<String>,
+}
+
+impl From<&crate::models::Profile> for ProfileRoutingOptions {
+    fn from(profile: &crate::models::Profile) -> Self {
+        Self {
+            private_lan_direct: profile.private_lan_direct,
+            domain_strategy: profile.xray_domain_strategy,
+            domain_matcher: profile.xray_domain_matcher,
+            dns: profile.xray_dns.clone(),
+            sockopts: profile.xray_sockopts.clone(),
+            traffic_rules: profile.xray_traffic_rules.clone(),
+            interface_routes: profile.xray_interface_routes.clone(),
+            connection_idle_secs: profile.xray_connection_idle_secs,
+            direct_domain_strategy: profile.xray_direct_domain_strategy.clone(),
+        }
+    }
 }
 
 pub fn apply_domain_policies(base: &Value, policies: &[DomainPolicy]) -> io::Result<Value> {
@@ -836,9 +1044,7 @@ pub fn validate_routing_policy_selectors(policies: &[DomainPolicy]) -> io::Resul
 
 /// Returns `Ok(None)` for comments (`# …`) and blank selectors so the UI can
 /// keep annotation lines inside routing lists.
-pub(crate) fn classify_routing_selector(
-    selector: &str,
-) -> io::Result<Option<(&'static str, String)>> {
+pub fn classify_routing_selector(selector: &str) -> io::Result<Option<(&'static str, String)>> {
     let selector = selector.trim();
     if selector.is_empty() || selector.starts_with('#') {
         return Ok(None);
@@ -854,7 +1060,10 @@ pub(crate) fn classify_routing_selector(
             && name.len() <= 64
             && name
                 .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_');
+                // `!` is legal in compiled category names (e.g. the
+                // Loyalsoldier `geolocation-!cn` lists ship a literal
+                // category literally named `geolocation-!cn`).
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'!'));
         let valid_attr = attr.is_none_or(|attr| {
             !attr.is_empty()
                 && attr.len() <= 32
@@ -893,6 +1102,49 @@ pub(crate) fn classify_routing_selector(
 const DNS_SCHEMES: &[&str] = &["udp", "tcp", "tls", "https", "https+local", "quic+local"];
 
 pub fn validate_dns_config(dns: &XrayDnsConfig) -> io::Result<()> {
+    if dns
+        .outbound_key
+        .as_ref()
+        .is_some_and(|key| !crate::subscription::valid_endpoint_key(key))
+    {
+        return Err(invalid_input("invalid DNS egress endpoint key"));
+    }
+    if let Some(outbound) = &dns.outbound {
+        if outbound.rewrite_port == Some(0)
+            || outbound
+                .rewrite_network
+                .as_deref()
+                .is_some_and(|network| !matches!(network, "tcp" | "udp"))
+            || outbound.rewrite_address.as_deref().is_some_and(|address| {
+                address.parse::<IpAddr>().is_err()
+                    && (address.is_empty()
+                        || address.len() > 253
+                        || !address.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_')
+                        }))
+            })
+            || outbound.rules.len() > 64
+        {
+            return Err(invalid_input("invalid DNS outbound rewrite settings"));
+        }
+        for rule in &outbound.rules {
+            if !matches!(
+                rule.action.as_str(),
+                "direct" | "drop" | "return" | "hijack"
+            ) || rule.domain.len() > 128
+                || rule.q_type.as_deref().is_some_and(|types| {
+                    types.len() > 128 || types.split(',').any(|value| value.parse::<u16>().is_err())
+                })
+            {
+                return Err(invalid_input("invalid DNS outbound rewrite rule"));
+            }
+            for domain in &rule.domain {
+                if !matches!(classify_routing_selector(domain)?, Some(("domain", _))) {
+                    return Err(invalid_input("DNS rewrite rules require domain selectors"));
+                }
+            }
+        }
+    }
     for server in &dns.servers {
         let address = server.address.trim();
         if address.is_empty()
@@ -1090,18 +1342,181 @@ fn dns_servers_json(dns: &XrayDnsConfig, policies: &[DomainPolicy]) -> Vec<Value
     servers
 }
 
+pub fn validate_stream_sockopts(sockopts: &XraySockopts) -> io::Result<()> {
+    if sockopts
+        .tcp_user_timeout
+        .is_some_and(|milliseconds| milliseconds > 3_600_000)
+    {
+        return Err(invalid_input("TCP user timeout must not exceed one hour"));
+    }
+    Ok(())
+}
+
+fn validate_outbound_domain_strategy(strategy: Option<&str>) -> io::Result<()> {
+    if strategy.is_some_and(|strategy| {
+        !matches!(
+            strategy,
+            "UseIP" | "UseIPv4" | "UseIPv6" | "ForceIP" | "ForceIPv4" | "ForceIPv6"
+        )
+    }) {
+        return Err(invalid_input("unsupported outbound domain strategy"));
+    }
+    Ok(())
+}
+
+pub fn validate_advanced_routing_options(
+    traffic_rules: &[XrayTrafficRule],
+    interface_routes: &[crate::models::XrayInterfaceRoute],
+    sockopts: Option<&XraySockopts>,
+    connection_idle_secs: Option<u32>,
+    direct_domain_strategy: Option<&str>,
+) -> io::Result<()> {
+    if connection_idle_secs.is_some_and(|seconds| seconds > 86_400) {
+        return Err(invalid_input(
+            "connection idle timeout must not exceed one day",
+        ));
+    }
+
+    validate_outbound_domain_strategy(direct_domain_strategy)?;
+
+    if let Some(sockopts) = sockopts {
+        validate_stream_sockopts(sockopts)?;
+    }
+
+    if interface_routes.len() > 16 {
+        return Err(invalid_input(
+            "at most 16 interface-bound policies are supported",
+        ));
+    }
+
+    for route in interface_routes {
+        let name = &route.interface_name;
+        if name.is_empty()
+            || name.len() > 15
+            || name.starts_with('-')
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+            || route.selectors.is_empty()
+        {
+            return Err(invalid_input("invalid interface-bound policy"));
+        }
+
+        validate_outbound_domain_strategy(route.domain_strategy.as_deref())?;
+
+        let mut domains = 0;
+        let mut ips = 0;
+        for selector in &route.selectors {
+            match classify_routing_selector(selector)? {
+                Some(("domain", _)) => domains += 1,
+                Some(("ip", _)) => ips += 1,
+                None => {}
+                _ => return Err(invalid_input("unsupported routing selector")),
+            }
+        }
+        if domains + ips == 0 || domains > 128 || ips > 128 {
+            return Err(invalid_input(
+                "interface-bound policy needs 1-128 selectors per emitted rule",
+            ));
+        }
+    }
+
+    if traffic_rules.len() > 32 {
+        return Err(invalid_input("at most 32 IP/port guards are supported"));
+    }
+
+    for rule in traffic_rules {
+        if rule.port == 0
+            || rule.ips.is_empty()
+            || rule.ips.len() > 128
+            || !matches!(rule.network.as_str(), "tcp" | "udp" | "tcp,udp")
+        {
+            return Err(invalid_input("invalid IP/port guard"));
+        }
+        for selector in &rule.ips {
+            if !matches!(classify_routing_selector(selector)?, Some(("ip", _))) {
+                return Err(invalid_input("IP/port guards require IP selectors"));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+pub fn validate_tun_profile_settings(mtu: Option<u32>, dns_servers: &[IpAddr]) -> io::Result<()> {
+    if mtu.is_some_and(|mtu| !(1280..=9000).contains(&mtu)) {
+        return Err(invalid_input("TUN MTU must be 1280-9000"));
+    }
+    if dns_servers.len() > 8
+        || dns_servers
+            .iter()
+            .any(|server| server.is_unspecified() || server.is_multicast())
+    {
+        return Err(invalid_input(
+            "TUN DNS needs at most eight unicast IP addresses",
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_pinned_routes(routes: &[crate::models::PinnedRoute]) -> io::Result<()> {
+    if routes.len() > 32 {
+        return Err(invalid_input("at most 32 pinned routes are supported"));
+    }
+    for route in routes {
+        if !crate::subscription::valid_endpoint_key(&route.endpoint_key)
+            || route.selectors.is_empty()
+            || route.selectors.len() > 128
+        {
+            return Err(invalid_input("invalid pinned route"));
+        }
+
+        let mut has_selector = false;
+        for selector in &route.selectors {
+            match classify_routing_selector(selector)? {
+                Some(("domain", _)) => has_selector = true,
+                None => {}
+                _ => {
+                    return Err(invalid_input("pinned routes require domain selectors"));
+                }
+            }
+        }
+        if !has_selector {
+            return Err(invalid_input("pinned route has no selectors"));
+        }
+    }
+    Ok(())
+}
+
 pub fn apply_profile_routing(
     base: &Value,
     policies: &[DomainPolicy],
     options: &ProfileRoutingOptions,
 ) -> io::Result<Value> {
     let dns_active = !options.dns.is_empty();
-    let rules_active = !policies.is_empty() || options.private_lan_direct || dns_active;
-    if !rules_active && options.domain_strategy.is_none() && options.domain_matcher.is_none() {
+    let rules_active = !policies.is_empty()
+        || options.private_lan_direct
+        || dns_active
+        || !options.traffic_rules.is_empty()
+        || !options.interface_routes.is_empty();
+    if !rules_active
+        && options.domain_strategy.is_none()
+        && options.domain_matcher.is_none()
+        && options.sockopts.is_none()
+        && options.connection_idle_secs.is_none()
+        && options.direct_domain_strategy.is_none()
+    {
         return Ok(base.clone());
     }
     validate_routing_policy_selectors(policies)?;
     validate_dns_config(&options.dns)?;
+    validate_advanced_routing_options(
+        &options.traffic_rules,
+        &options.interface_routes,
+        options.sockopts.as_ref(),
+        options.connection_idle_secs,
+        options.direct_domain_strategy.as_deref(),
+    )?;
     let mut doc = base.clone();
     let root = doc
         .as_object_mut()
@@ -1119,6 +1534,11 @@ pub fn apply_profile_routing(
             .servers
             .iter()
             .any(|server| server.route == XrayDnsRoute::Proxy);
+    let needs_proxy = needs_proxy
+        || options
+            .traffic_rules
+            .iter()
+            .any(|rule| rule.target == DomainRouteTarget::Proxy);
     let needs_direct = options.private_lan_direct
         || policies
             .iter()
@@ -1128,6 +1548,11 @@ pub fn apply_profile_routing(
             .servers
             .iter()
             .any(|server| server.route == XrayDnsRoute::Direct);
+    let needs_direct = needs_direct
+        || options
+            .traffic_rules
+            .iter()
+            .any(|rule| rule.target == DomainRouteTarget::Direct);
     // Any customised rule set also drops multicast, so the blackhole
     // outbound is always required once rules are emitted.
     let needs_block = rules_active;
@@ -1226,6 +1651,81 @@ pub fn apply_profile_routing(
     } else {
         None
     };
+    if let Some(settings) = &options.dns.outbound {
+        if let Some(index) = outbounds
+            .iter()
+            .position(|outbound| outbound["protocol"] == "dns")
+        {
+            outbounds[index]["settings"] = json!(settings);
+        }
+    }
+    if let Some(key) = &options.dns.outbound_key {
+        if let Some(index) = outbounds
+            .iter()
+            .position(|outbound| outbound["protocol"] == "dns")
+        {
+            outbounds[index]["streamSettings"] = json!({"sockopt": {"dialerProxy": pin_tag(key)}});
+        }
+    }
+    if let Some(strategy) = &options.direct_domain_strategy {
+        for outbound in outbounds
+            .iter_mut()
+            .filter(|outbound| outbound["protocol"] == "freedom")
+        {
+            let object = outbound
+                .as_object_mut()
+                .ok_or_else(|| invalid_data("invalid direct outbound"))?;
+            let stream = object
+                .entry("streamSettings")
+                .or_insert_with(|| json!({}))
+                .as_object_mut()
+                .ok_or_else(|| invalid_data("invalid direct stream settings"))?;
+            let sockopt = stream
+                .entry("sockopt")
+                .or_insert_with(|| json!({}))
+                .as_object_mut()
+                .ok_or_else(|| invalid_data("invalid direct socket options"))?;
+            sockopt.insert("domainStrategy".into(), json!(strategy));
+        }
+    }
+
+    let mut interface_tags = HashMap::new();
+    for route in &options.interface_routes {
+        let identity = (
+            route.interface_name.as_str(),
+            route.domain_strategy.as_deref(),
+        );
+        if interface_tags.contains_key(&identity) {
+            continue;
+        }
+        let mut outbound = json!({"protocol": "freedom", "streamSettings": {"sockopt": {"interface": route.interface_name}}});
+        if let Some(strategy) = &route.domain_strategy {
+            outbound["streamSettings"]["sockopt"]["domainStrategy"] = json!(strategy);
+        }
+        let tag = resolve_outbound_tag(
+            &mut outbound,
+            "network-orchestrator-interface",
+            &counts,
+            &mut used,
+        );
+        outbounds.push(outbound);
+        interface_tags.insert(identity, tag);
+    }
+    if let Some(sockopts) = &options.sockopts {
+        for outbound in outbounds.iter_mut() {
+            let protocol = outbound["protocol"].as_str().unwrap_or_default();
+            if matches!(protocol, "blackhole" | "dns" | "loopback" | "") {
+                continue;
+            }
+            apply_stream_sockopts(outbound, sockopts)?;
+        }
+    }
+    if let Some(seconds) = options.connection_idle_secs {
+        root.insert(
+            "policy".into(),
+            json!({"levels": {"0": {"connIdle": seconds}}}),
+        );
+    }
 
     let routing = root.entry("routing").or_insert_with(|| json!({}));
     let routing = routing
@@ -1243,11 +1743,45 @@ pub fn apply_profile_routing(
         .ok_or_else(|| invalid_data("xray config routing.rules must be an array"))?;
 
     let mut merged = Vec::new();
+    for guard in &options.traffic_rules {
+        let tag = match guard.target {
+            DomainRouteTarget::Proxy => proxy_tag.as_deref().unwrap_or_default(),
+            DomainRouteTarget::Direct => direct_tag.as_deref().unwrap_or_default(),
+            DomainRouteTarget::Block => block_tag.as_deref().unwrap_or_default(),
+        };
+        merged.push(
+            json!({"type": "field", "ip": guard.ips, "port": guard.port.to_string(),
+            "network": guard.network, "outboundTag": tag}),
+        );
+    }
     // DNS capture comes first: port-53 traffic is answered by the dns
     // outbound so static hosts / split resolvers / fake-DNS apply even to
     // plain system resolvers (TUN mode).
     if let Some(tag) = dns_tag.as_deref() {
         merged.push(json!({"type": "field", "port": "53", "outboundTag": tag}));
+    }
+    for route in &options.interface_routes {
+        let tag = &interface_tags[&(
+            route.interface_name.as_str(),
+            route.domain_strategy.as_deref(),
+        )];
+        let mut domains = Vec::new();
+        let mut ips = Vec::new();
+        for selector in &route.selectors {
+            if let Some((kind, value)) = classify_routing_selector(selector)? {
+                if kind == "ip" {
+                    ips.push(value);
+                } else {
+                    domains.push(value);
+                }
+            }
+        }
+        if !domains.is_empty() {
+            merged.push(json!({"type": "field", "domain": domains, "outboundTag": tag}));
+        }
+        if !ips.is_empty() {
+            merged.push(json!({"type": "field", "ip": ips, "outboundTag": tag}));
+        }
     }
     for policy in policies {
         let tag = match policy.target {
@@ -1341,6 +1875,9 @@ pub fn apply_profile_routing(
         if let Some(strategy) = options.dns.query_strategy {
             dns_obj.insert("queryStrategy".into(), json!(strategy.as_xray_str()));
         }
+        if let Some(parallel) = options.dns.enable_parallel_query {
+            dns_obj.insert("enableParallelQuery".into(), json!(parallel));
+        }
         root.insert("dns".into(), Value::Object(dns_obj));
 
         if options.dns.fake_dns {
@@ -1369,6 +1906,53 @@ pub fn apply_profile_routing(
         }
     }
     Ok(doc)
+}
+
+/// Merge profile `XraySockopts` into one outbound's `streamSettings.sockopt`:
+/// keepalive seconds and user timeout (xray's millisecond unit) plus
+/// `tcpNoDelay`. Existing sockopt keys we do not model are preserved.
+pub fn apply_stream_sockopts(outbound: &mut Value, sockopts: &XraySockopts) -> io::Result<()> {
+    validate_stream_sockopts(sockopts)?;
+
+    let object = outbound
+        .as_object_mut()
+        .ok_or_else(|| invalid_data("outbound must be an object"))?;
+
+    if let Some(stream) = object.get("streamSettings") {
+        let stream = stream
+            .as_object()
+            .ok_or_else(|| invalid_data("streamSettings must be an object"))?;
+        if stream
+            .get("sockopt")
+            .is_some_and(|value| !value.is_object())
+        {
+            return Err(invalid_data("sockopt must be an object"));
+        }
+    }
+
+    let stream = object
+        .entry("streamSettings")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| invalid_data("streamSettings must be an object"))?;
+    let sockopt = stream
+        .entry("sockopt")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| invalid_data("sockopt must be an object"))?;
+
+    if let Some(idle) = sockopts.tcp_keep_alive_idle {
+        sockopt.insert("tcpKeepAliveIdle".into(), json!(idle));
+    }
+    if let Some(interval) = sockopts.tcp_keep_alive_interval {
+        sockopt.insert("tcpKeepAliveInterval".into(), json!(interval));
+    }
+    if let Some(timeout) = sockopts.tcp_user_timeout {
+        sockopt.insert("tcpUserTimeout".into(), json!(timeout));
+    }
+    sockopt.insert("tcpNoDelay".into(), json!(sockopts.tcp_no_delay));
+
+    Ok(())
 }
 
 /// Replace the SOCKS inbound in an Xray config with a TUN inbound (Wintun on
@@ -1960,12 +2544,7 @@ mod tests {
         let processed = apply_profile_routing(
             &base,
             &profile.domain_policies,
-            &ProfileRoutingOptions {
-                private_lan_direct: profile.private_lan_direct,
-                domain_strategy: profile.xray_domain_strategy,
-                domain_matcher: profile.xray_domain_matcher,
-                dns: profile.xray_dns.clone(),
-            },
+            &ProfileRoutingOptions::from(profile),
         )
         .expect("apply_profile_routing");
         std::fs::write(
@@ -3570,5 +4149,52 @@ mod tests {
         let mut panel = panel_vless();
         panel["outbounds"] = json!([{"tag": "proxy", "protocol": "trojan", "settings": {}}]);
         assert!(tun_compatible_config(&panel).is_err());
+    }
+
+    #[test]
+    fn fixed_domain_routes_do_not_override_port_guards_or_dns_capture() {
+        let base = json!({"outbounds":[{"tag":"proxy","protocol":"vless"}],
+        "routing":{"rules":[
+            {"type":"field","port":853,"network":"tcp","outboundTag":"direct"},
+            {"type":"field","port":53,"outboundTag":"dns"},
+            {"type":"field","domain":["domain:example.test"],"outboundTag":"proxy"}
+        ]}});
+        let pins = [PinnedOutbound {
+            key: "1111111111111111".into(),
+            selectors: vec!["domain:example.test".into()],
+            outbound: Some(json!({"protocol":"vless"})),
+        }];
+        let config = apply_multinode_config(&base, "2222222222222222", &[], &pins).unwrap();
+        let rules = config["routing"]["rules"].as_array().unwrap();
+        assert_eq!(rules[0]["port"], 853);
+        assert_eq!(rules[1]["port"], 53);
+        assert_eq!(rules[2]["outboundTag"], pin_tag(&pins[0].key));
+        assert_eq!(rules[3]["balancerTag"], FAILOVER_BALANCER);
+    }
+
+    #[test]
+    fn multiple_domain_pins_share_one_endpoint_outbound() {
+        let base = json!({"outbounds":[{"tag":"proxy","protocol":"vless"}],"routing":{"rules":[]}});
+        let pins = ["domain:first.test", "domain:second.test"].map(|selector| PinnedOutbound {
+            key: "1111111111111111".into(),
+            selectors: vec![selector.into()],
+            outbound: Some(json!({"protocol":"vless"})),
+        });
+        let config = apply_multinode_config(&base, "2222222222222222", &[], &pins).unwrap();
+        let tags: Vec<_> = config["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|outbound| outbound["tag"].as_str())
+            .collect();
+        assert_eq!(tags, ["node-2222222222222222", "pin-1111111111111111"]);
+        assert_eq!(
+            config["routing"]["rules"][0]["domain"],
+            json!(["domain:first.test"])
+        );
+        assert_eq!(
+            config["routing"]["rules"][1]["domain"],
+            json!(["domain:second.test"])
+        );
     }
 }

@@ -181,7 +181,7 @@ async def main():
         print("WebView disconnect_profile: kernel route and daemon owner removed")
 
         await inspector.evaluate(
-            'document.querySelector("button[title=Connections]").click(); "navigated"'
+            'document.querySelector("button[title=Profiles]").click(); "navigated"'
         )
         await wait_for(
             lambda: inspector.evaluate(
@@ -190,8 +190,7 @@ async def main():
             "rendered profile card",
         )
         click_switch = """(() => {
-          const card = [...document.querySelectorAll('.connection-card')]
-            .find(item => item.querySelector('.connection-card-name')?.textContent === 'GUI static route E2E');
+          const card = document.querySelector('[data-profile-id="e2e-gui-static"]');
           if (!card) return false;
           card.querySelector('button[role=switch]')?.click();
           return true;
@@ -202,8 +201,7 @@ async def main():
         await wait_for(
             lambda: inspector.evaluate(
                 """(() => {
-                  const card = [...document.querySelectorAll('.connection-card')]
-                    .find(item => item.querySelector('.connection-card-name')?.textContent === 'GUI static route E2E');
+                  const card = document.querySelector('[data-profile-id="e2e-gui-static"]');
                   return card?.querySelector('button[role=switch]')?.getAttribute('aria-checked') === 'true';
                 })()"""
             ),

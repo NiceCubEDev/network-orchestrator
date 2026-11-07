@@ -209,13 +209,16 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "Requires NETORCH_TEST_GEOSITE_STOCK and NETORCH_TEST_GEOSITE_OVERLAY"]
     fn real_dats_parse_and_merge() {
-        let stock = std::fs::read("/usr/lib/network-orchestrator/xray/v26.3.27/geosite.dat");
-        let overlay =
-            std::fs::read("/home/artur/.local/share/Happ/routing/0/RoscomVPN/geosite.dat");
-        let (Ok(stock), Ok(overlay)) = (stock, overlay) else {
-            return;
-        };
+        let stock = std::fs::read(
+            std::env::var_os("NETORCH_TEST_GEOSITE_STOCK").expect("set the stock geosite path"),
+        )
+        .expect("read stock geosite data");
+        let overlay = std::fs::read(
+            std::env::var_os("NETORCH_TEST_GEOSITE_OVERLAY").expect("set the overlay geosite path"),
+        )
+        .expect("read overlay geosite data");
         let merged = merge_geo_list(&stock, &overlay).unwrap();
         let merged_codes: std::collections::HashSet<String> = codes(&merged).into_iter().collect();
         for code in geo_codes(&stock)

@@ -1,6 +1,5 @@
-//! Connection engine for the Linux network daemon: "connect / disconnect /
-//! status of this profile" as plain calls, with no UI state. The Tauri app
-//! keeps its own async client for now; the `netorch` CLI is built on this.
+//! Shared Linux connection engine. Both the CLI and the GUI use these
+//! operations; frontends provide presentation, prompts and async scheduling.
 //!
 //! The engine never touches routes, interfaces or DNS. It checks the profile,
 //! builds the typed `daemon_protocol` request from the vault (see
@@ -16,9 +15,10 @@ use crate::privileged::Privileged;
 use net_manager_core::config_vault::ConfigVault;
 use net_manager_core::daemon_protocol::{
     method, ErrorCode, OpenVpnConnectResult, OpenVpnCredentials, OpenVpnDisconnectResult,
-    OpenVpnProfileParams, OpenVpnStatusResult, WireGuardConnectResult, WireGuardDisconnectResult,
-    WireGuardProfileParams, WireGuardStatusResult, XrayConnectResult, XrayDisconnectResult,
-    XrayProfileParams, XrayStatusResult, DEFAULT_SOCKET_PATH, SOCKET_ENV,
+    OpenVpnProbeResult, OpenVpnProfileParams, OpenVpnStatusResult, WireGuardConnectResult,
+    WireGuardDisconnectResult, WireGuardProfileParams, WireGuardStatusResult, XrayConnectParams,
+    XrayConnectResult, XrayDisconnectResult, XrayProfileParams, XrayStatusResult,
+    DEFAULT_SOCKET_PATH, SOCKET_ENV,
 };
 use net_manager_core::helper_client::{HelperClient, HelperError};
 use net_manager_core::models::{Profile, TunnelBackend, TunnelState, TunnelStatus, XrayMode};
@@ -65,19 +65,161 @@ pub fn daemon_error(error: HelperError) -> String {
 #[derive(Clone)]
 pub struct LinuxEngine {
     privileged: Arc<dyn Privileged>,
+    data_root: Option<PathBuf>,
+    // Injected/in-process privileged adapters remain caller-owned.
+    socket: Option<PathBuf>,
 }
 
 impl LinuxEngine {
     /// Engine that talks to the system daemon over its socket; `client_name`
     /// (for example `netorch/0.10.0`) is what the daemon logs for this client.
     pub fn new(client_name: impl Into<String>) -> Self {
-        let client = HelperClient::new(daemon_socket()).with_client_name(client_name);
-        Self::with_privileged(Arc::new(client))
+        Self::for_socket(daemon_socket(), client_name)
     }
 
-    /// Engine with another privileged side (a fake in tests).
+    /// Explicit transport endpoint for a sandbox or isolated development daemon.
+    pub fn for_socket(socket: PathBuf, client_name: impl Into<String>) -> Self {
+        let client = HelperClient::new(&socket)
+            .with_client_name(client_name)
+            .with_timeout(std::time::Duration::from_secs(330));
+        Self {
+            privileged: Arc::new(client),
+            data_root: None,
+            socket: Some(socket),
+        }
+    }
+
+    /// Inject a caller-owned privileged adapter, without a detached Unix-session coordinator.
     pub fn with_privileged(privileged: Arc<dyn Privileged>) -> Self {
-        Self { privileged }
+        Self {
+            privileged,
+            data_root: None,
+            socket: None,
+        }
+    }
+
+    pub fn with_data_root(mut self, root: PathBuf) -> Self {
+        self.data_root = Some(root);
+        self
+    }
+
+    #[cfg(target_os = "linux")]
+    fn local_request(
+        &self,
+        request: crate::linux_session::Request,
+    ) -> Result<TunnelStatus, String> {
+        let root = self
+            .data_root
+            .as_deref()
+            .ok_or("The application data directory is required")?;
+        let socket = self
+            .socket
+            .as_deref()
+            .ok_or("A daemon socket is required for the shared user runtime")?;
+        crate::linux_session::request(root, socket, request)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn disconnect_local_proxies(&self) -> Result<(), String> {
+        self.local_request(crate::linux_session::Request::Cleanup)
+            .map(|_| ())
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn recover_local_proxy(&self) -> Result<(), String> {
+        self.local_request(crate::linux_session::Request::RecoverProxy)
+            .map(|_| ())
+    }
+
+    /// Retain a daemon connection independently of the frontend process.
+    /// The frontend still performs all polkit-authorized mutations itself.
+    #[cfg(target_os = "linux")]
+    pub fn retain_connection(&self, profile: &Profile) -> Result<(), String> {
+        if !Self::requires_daemon(profile)
+            || self.data_root.is_none()
+            || self.socket.is_none()
+            || unsafe { libc::geteuid() } == 0
+        {
+            return Ok(());
+        }
+        if let Err(error) = self.local_request(crate::linux_session::Request::ObserveDaemon) {
+            return Err(match self.disconnect(profile) {
+                Ok(_) => format!("Cannot retain the connection: {error}"),
+                Err(cleanup) => {
+                    format!("Cannot retain the connection: {error}; rollback failed: {cleanup}")
+                }
+            });
+        }
+        Ok(())
+    }
+
+    pub fn requires_daemon(profile: &Profile) -> bool {
+        profile.backend != TunnelBackend::Xray
+            || profile.xray_mode != XrayMode::Socks
+            || !profile.routes.is_empty()
+            || !profile.endpoint_bypasses.is_empty()
+    }
+
+    fn apply_profile_routes(&self, profile: &Profile) -> Result<(), String> {
+        use net_manager_core::daemon_protocol::{
+            AttachSpecParams, RoutesApplyParams, RoutesApplyResult,
+        };
+        let interfaces = net_manager_core::explorer::list_interfaces()
+            .map_err(|_| "Cannot enumerate network interfaces")?;
+        let plan = net_manager_core::policy::plan_profile(profile, &interfaces)
+            .map_err(|error| error.to_string())?;
+        let mut routes = plan.routes;
+        routes.extend(plan.bypasses);
+        let attach = ((profile.wait_for_interface && !profile.interface_name.is_empty())
+            || !profile.endpoint_bypasses.is_empty())
+        .then(|| AttachSpecParams {
+            interface_name: profile.interface_name.clone(),
+            routes: profile.routes.clone(),
+            endpoint_bypasses: profile.endpoint_bypasses.clone(),
+            uplink: false,
+        });
+        let _: RoutesApplyResult = self.ask(
+            method::ROUTES_APPLY,
+            RoutesApplyParams {
+                owner: profile.id.clone(),
+                routes,
+                attach,
+            },
+        )?;
+        Ok(())
+    }
+
+    fn remove_profile_routes(&self, id: &str) -> Result<(), String> {
+        let _: net_manager_core::daemon_protocol::RoutesRemoveResult = self.ask(
+            method::ROUTES_REMOVE,
+            net_manager_core::daemon_protocol::OwnerParams { owner: id.into() },
+        )?;
+        Ok(())
+    }
+
+    pub fn static_status(&self, id: &str, interface_name: &str) -> Result<TunnelStatus, String> {
+        use net_manager_core::daemon_protocol::{OwnedListResult, OwnedState};
+        let owners: OwnedListResult = self.ask(method::OWNED_LIST, serde_json::Value::Null)?;
+        let entry = owners.owners.iter().find(|entry| entry.owner == id);
+        Ok(TunnelStatus {
+            profile_id: id.into(),
+            state: match entry {
+                None => TunnelState::Stopped,
+                Some(entry) if entry.state == OwnedState::Applied => TunnelState::Running,
+                _ => TunnelState::Failed,
+            },
+            message: entry
+                .filter(|entry| entry.state != OwnedState::Applied)
+                .map(|_| "The daemon reports incomplete route ownership".into()),
+            interface_name: (!interface_name.is_empty()).then(|| interface_name.into()),
+            failover: None,
+            watchdog: None,
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn local_proxy_status(&self, id: &str) -> Result<TunnelStatus, String> {
+        self.local_request(crate::linux_session::Request::Status { id: id.into() })
     }
 
     pub fn privileged(&self) -> &dyn Privileged {
@@ -94,13 +236,39 @@ impl LinuxEngine {
             .map_err(daemon_error)
     }
 
-    /// Whether the daemon handles this profile; everything else (static
-    /// routes, a local Xray proxy) runs in the client process.
+    /// Reconfigure diagnostics only; never reload the child or alter routing.
+    pub fn set_xray_service_checks(
+        &self,
+        profile_id: &str,
+        checks: Vec<net_manager_core::models::ServiceCheck>,
+    ) -> Result<Vec<net_manager_core::models::ServiceCheckResult>, String> {
+        self.ask(
+            method::XRAY_SERVICE_CHECKS,
+            net_manager_core::daemon_protocol::XrayServiceChecksParams {
+                profile_id: profile_id.to_owned(),
+                checks,
+            },
+        )
+    }
+
+    /// Read actual listeners only; this never connects, reloads or mutates routing.
+    pub fn named_proxy_exits(
+        &self,
+        profile_id: &str,
+    ) -> Result<Vec<net_manager_core::daemon_protocol::ProxyExitStatus>, String> {
+        self.ask(
+            method::XRAY_PROXY_EXITS,
+            XrayProfileParams {
+                profile_id: profile_id.to_owned(),
+            },
+        )
+    }
+
+    /// Whether the shared Linux runtime supports this profile.
     pub fn handles(profile: &Profile) -> bool {
-        matches!(
-            profile.backend,
-            TunnelBackend::WireGuard | TunnelBackend::OpenVpn
-        ) || (profile.backend == TunnelBackend::Xray && profile.xray_mode == XrayMode::Tun)
+        profile.backend != TunnelBackend::Xray
+            || profile.xray_mode == XrayMode::Tun
+            || cfg!(target_os = "linux")
     }
 
     pub fn connect(
@@ -114,7 +282,33 @@ impl LinuxEngine {
         if !Self::handles(profile) {
             return Err("This connection does not run through the network daemon".into());
         }
-        match profile.backend {
+        let status = match profile.backend {
+            TunnelBackend::None => {
+                if profile.routes.is_empty() && profile.endpoint_bypasses.is_empty() {
+                    return Err("Static-route profile has no routes or endpoint bypasses".into());
+                }
+                self.apply_profile_routes(profile)?;
+                self.static_status(&profile.id, &profile.interface_name)
+            }
+            #[cfg(target_os = "linux")]
+            TunnelBackend::Xray if profile.xray_mode == XrayMode::Socks => {
+                let status = self.local_request(crate::linux_session::Request::Connect {
+                    id: profile.id.clone(),
+                })?;
+                if Self::requires_daemon(profile) {
+                    if let Err(error) = self.apply_profile_routes(profile) {
+                        let cleanup =
+                            self.local_request(crate::linux_session::Request::Disconnect {
+                                id: profile.id.clone(),
+                            });
+                        return Err(match cleanup {
+                            Ok(_) => error,
+                            Err(cleanup) => format!("{error}; local cleanup failed: {cleanup}"),
+                        });
+                    }
+                }
+                Ok(status)
+            }
             TunnelBackend::WireGuard => {
                 let params = wireguard_connect_params(vault, profile)?;
                 let result: WireGuardConnectResult = self.ask(method::WIREGUARD_CONNECT, params)?;
@@ -132,19 +326,142 @@ impl LinuxEngine {
                 let result: OpenVpnConnectResult = self.ask(method::OPENVPN_CONNECT, request)?;
                 Ok(finish_openvpn_connect(result.status, notice))
             }
-            _ => {
-                // No inline geo assets here: the daemon falls back to the
-                // managed ones. The app attaches user-supplied lists itself.
-                let params = prepare_linux_xray_tun_params(vault, profile)?;
-                let result: XrayConnectResult = self.ask(method::XRAY_CONNECT, params)?;
-                Ok(linux_xray_tunnel_status(result.status, profile))
+            _ => self.start_xray(vault, profile, method::XRAY_CONNECT),
+        }?;
+        #[cfg(target_os = "linux")]
+        self.retain_connection(profile)?;
+        Ok(status)
+    }
+    fn xray_params(
+        &self,
+        vault: &ConfigVault,
+        profile: &Profile,
+    ) -> Result<(XrayConnectParams, Vec<String>), String> {
+        let params = prepare_linux_xray_tun_params(vault, profile)?;
+        #[cfg(not(target_os = "linux"))]
+        let notices: Vec<String> = Vec::new();
+        #[cfg(target_os = "linux")]
+        let (params, notices) = {
+            let mut params = params;
+            let root = vault
+                .root()
+                .parent()
+                .ok_or("The application data directory is unavailable")?
+                .join("geoassets");
+            let (directory, warnings) = crate::linux_geo_assets::prepare_blocking(&root, profile)?;
+            if let Some(directory) = directory {
+                params.geo_assets = Some(crate::linux_geo_assets::protocol_geo_assets(&directory)?);
             }
+            (params, warnings)
+        };
+        crate::linux::check_xray_frame_size(&params)
+            .map_err(|_| "geo assets are too large for daemon protocol".to_string())?;
+        Ok((params, notices))
+    }
+
+    fn start_xray(
+        &self,
+        vault: &ConfigVault,
+        profile: &Profile,
+        method_name: &str,
+    ) -> Result<TunnelStatus, String> {
+        let (params, notices) = self.xray_params(vault, profile)?;
+        let result: XrayConnectResult = self.ask(method_name, params)?;
+        let mut status = linux_xray_tunnel_status(result.status, profile);
+        for notice in notices {
+            status.message = Some(match status.message.take() {
+                Some(message) => format!("{message}; {notice}"),
+                None => notice,
+            });
         }
+        Ok(status)
+    }
+
+    pub fn reload_xray(
+        &self,
+        vault: &ConfigVault,
+        profile: &Profile,
+    ) -> Result<TunnelStatus, String> {
+        profile.check_role()?;
+        if profile.backend != TunnelBackend::Xray || profile.xray_mode != XrayMode::Tun {
+            return Err("Reload requires an Xray TUN profile".into());
+        }
+        self.start_xray(vault, profile, method::XRAY_RELOAD)
+    }
+
+    pub fn probe_openvpn_routes(
+        &self,
+        vault: &ConfigVault,
+        profile: &Profile,
+        remembered: &dyn CredentialSource,
+    ) -> Result<Vec<net_manager_core::models::AnalyzedRoute>, String> {
+        let (request, _) = prepare_linux_openvpn_request(
+            vault,
+            remembered,
+            profile,
+            None,
+            Vec::new(),
+            method::OPENVPN_PROBE,
+        )?;
+        let result: OpenVpnProbeResult = self.ask(method::OPENVPN_PROBE, request)?;
+        Ok(result.routes)
+    }
+
+    pub fn wireguard_status_result(
+        &self,
+        profile_id: &str,
+    ) -> Result<WireGuardStatusResult, String> {
+        self.ask(
+            method::WIREGUARD_STATUS,
+            WireGuardProfileParams {
+                profile_id: profile_id.into(),
+            },
+        )
+    }
+
+    pub fn openvpn_status_result(&self, profile_id: &str) -> Result<OpenVpnStatusResult, String> {
+        self.ask(
+            method::OPENVPN_STATUS,
+            OpenVpnProfileParams {
+                profile_id: profile_id.into(),
+            },
+        )
+    }
+
+    pub fn xray_status_result(&self, profile_id: &str) -> Result<XrayStatusResult, String> {
+        self.ask(
+            method::XRAY_STATUS,
+            XrayProfileParams {
+                profile_id: profile_id.into(),
+            },
+        )
     }
 
     pub fn disconnect(&self, profile: &Profile) -> Result<TunnelStatus, String> {
         let id = profile.id.clone();
         let stopped = match profile.backend {
+            TunnelBackend::None => {
+                self.remove_profile_routes(&profile.id)?;
+                true
+            }
+            #[cfg(target_os = "linux")]
+            TunnelBackend::Xray if profile.xray_mode == XrayMode::Socks => {
+                self.local_request(crate::linux_session::Request::Disconnect {
+                    id: profile.id.clone(),
+                })?;
+                // The saved profile may have been edited since connect. The
+                // daemon's ownership, not its current route list, is authoritative.
+                if Self::requires_daemon(profile)
+                    || self.socket.as_ref().is_some_and(|socket| socket.exists())
+                {
+                    let owned: net_manager_core::daemon_protocol::OwnedListResult =
+                        self.ask(method::OWNED_LIST, serde_json::Value::Null)?;
+                    if owned.owners.iter().any(|entry| entry.owner == profile.id) {
+                        self.remove_profile_routes(&profile.id)?;
+                    }
+                }
+                true
+            }
             TunnelBackend::WireGuard => {
                 let result: WireGuardDisconnectResult = self.ask(
                     method::WIREGUARD_DISCONNECT,
@@ -176,29 +493,29 @@ impl LinuxEngine {
             state: TunnelState::Stopped,
             message: None,
             interface_name: None,
+            failover: None,
+            watchdog: None,
         })
     }
 
     pub fn status(&self, profile: &Profile) -> Result<TunnelStatus, String> {
         let id = profile.id.clone();
         match profile.backend {
+            TunnelBackend::None => self.static_status(&profile.id, &profile.interface_name),
+            #[cfg(target_os = "linux")]
+            TunnelBackend::Xray if profile.xray_mode == XrayMode::Socks => {
+                self.local_proxy_status(&profile.id)
+            }
             TunnelBackend::WireGuard => {
-                let status: WireGuardStatusResult = self.ask(
-                    method::WIREGUARD_STATUS,
-                    WireGuardProfileParams { profile_id: id },
-                )?;
+                let status = self.wireguard_status_result(&id)?;
                 Ok(linux_wireguard_tunnel_status(status))
             }
             TunnelBackend::OpenVpn => {
-                let status: OpenVpnStatusResult = self.ask(
-                    method::OPENVPN_STATUS,
-                    OpenVpnProfileParams { profile_id: id },
-                )?;
+                let status = self.openvpn_status_result(&id)?;
                 Ok(linux_openvpn_tunnel_status(status))
             }
             _ if Self::handles(profile) => {
-                let status: XrayStatusResult =
-                    self.ask(method::XRAY_STATUS, XrayProfileParams { profile_id: id })?;
+                let status = self.xray_status_result(&id)?;
                 Ok(linux_xray_tunnel_status(status, profile))
             }
             _ => Err("This connection does not run through the network daemon".into()),
@@ -351,11 +668,10 @@ mod tests {
     }
 
     #[test]
-    fn a_proxy_only_profile_is_not_the_daemons_to_run() {
+    fn empty_static_routes_are_refused_before_mutation() {
         let dir = tempfile::tempdir().unwrap();
         let (vault, mut profile) = wireguard_profile(dir.path());
         profile.backend = TunnelBackend::None;
-        assert!(!LinuxEngine::handles(&profile));
         let (engine, daemon) = engine(FakeDaemon::default());
         assert!(engine
             .connect(&vault, &profile, None, &NoCredentials)

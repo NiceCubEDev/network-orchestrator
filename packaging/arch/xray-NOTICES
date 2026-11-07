@@ -1,15 +1,41 @@
-Network Orchestrator includes the unmodified Xray-core v26.3.27 Linux binary.
-Release and source: https://github.com/XTLS/Xray-core/releases/tag/v26.3.27
+Network Orchestrator includes the unmodified Xray-core v26.10.31 Linux binary.
+Release and source: https://github.com/XTLS/Xray-core/releases/tag/v26.10.31
 License: Mozilla Public License 2.0 (see the accompanying LICENSE file).
 
-The geoip.dat and geosite.dat files are from that pinned Xray-core release.
-The Xray-core v26.3.27 asset workflow obtains these files from
-Loyalsoldier/v2ray-rules-dat, licensed under GPL-3.0:
-https://github.com/Loyalsoldier/v2ray-rules-dat
-https://github.com/Loyalsoldier/v2ray-rules-dat/blob/master/LICENSE
-That project documents its additional upstream data sources in its README.
+The hash-pinned geoip.dat and geosite.dat are from that Xray-core release.
+Its scheduled-assets-update workflow obtains GeoIP Lite and GeoSite Standard
+from XTLS/Xray-rules-dat:
+https://github.com/XTLS/Xray-rules-dat
+https://github.com/XTLS/Xray-core/blob/v26.10.31/.github/workflows/scheduled-assets-update.yml
+The data project is licensed as a whole under GPL-3.0:
+https://github.com/XTLS/Xray-rules-dat/blob/main/LICENSE
+On Debian and Ubuntu the GPL-3.0 text is at /usr/share/common-licenses/GPL-3;
+on Arch it is at /usr/share/licenses/common/GPL3/license.
+Corresponding source, data sources, and build instructions:
+https://github.com/XTLS/Xray-rules-dat/blob/geoip/README.md
+https://github.com/XTLS/Xray-rules-dat/blob/geosite/README.md
+GeoIP is based on IPinfo Lite (https://ipinfo.io/lite), supplemented with
+regional-routing and service data. GeoSite includes domain-list-community data.
+The project's README documents its additional upstream datasets and notices.
 
-The rule set's GeoIP build uses MaxMind GeoLite2 Country data by default.
-This product includes GeoLite Data created by MaxMind, available from
-https://www.maxmind.com. See the GeoLite End User License Agreement:
-https://www.maxmind.com/en/geolite/eula
+GeoSite MIT notices:
+Copyright (c) 2026 Project X
+Copyright (c) 2018-2019 V2Ray
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

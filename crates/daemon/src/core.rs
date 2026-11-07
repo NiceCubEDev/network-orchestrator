@@ -1285,6 +1285,11 @@ mod openvpn_tests {
             wireguard_handshake: HashMap::new(),
             tunnel_failed: HashSet::new(),
             xray_restarts: HashMap::new(),
+            failovers: HashMap::new(),
+            watchdogs: HashMap::new(),
+            service_checks: HashMap::new(),
+            watchdog_network: None,
+            quic_reject: None,
             cond_eval: HashMap::new(),
             intents: None,
             policy: Some(Box::new(policy.clone())),
@@ -1624,6 +1629,14 @@ pub struct DaemonCore {
     /// In-place respawn budget per xray owner: a child crash gets a few
     /// restarts before reconcile gives up and fails the tunnel.
     xray_restarts: HashMap<(u32, String), u32>,
+    /// Live failover supervisors per xray owner: probe threads run outside
+    /// this mutex; core only consumes their shared status.
+    failovers: HashMap<(u32, String), crate::failover::FailoverSupervisors>,
+    watchdogs: HashMap<(u32, String), crate::watchdog::WatchdogSupervisor>,
+    /// User URLs exist only in the diagnostic worker, never in owned resources.
+    service_checks: HashMap<(u32, String), crate::service_checks::ServiceCheckSupervisor>,
+    watchdog_network: Option<crate::watchdog::WatchdogNetwork>,
+    quic_reject: Option<Box<dyn crate::quic_reject::QuicRejectExecutor>>,
     /// Last evaluation of each conditional rule `(uid, rule id)`: which
     /// interface matched, or why the apply failed. Not journaled — the
     /// journal already records what was installed.
@@ -1784,6 +1797,11 @@ impl DaemonCore {
             wireguard_handshake: HashMap::new(),
             tunnel_failed: HashSet::new(),
             xray_restarts: HashMap::new(),
+            failovers: HashMap::new(),
+            watchdogs: HashMap::new(),
+            service_checks: HashMap::new(),
+            watchdog_network: None,
+            quic_reject: None,
             cond_eval: HashMap::new(),
             intents: None,
             #[cfg(target_os = "linux")]
@@ -1827,6 +1845,11 @@ impl DaemonCore {
             wireguard_handshake: HashMap::new(),
             tunnel_failed: HashSet::new(),
             xray_restarts: HashMap::new(),
+            failovers: HashMap::new(),
+            watchdogs: HashMap::new(),
+            service_checks: HashMap::new(),
+            watchdog_network: None,
+            quic_reject: None,
             cond_eval: HashMap::new(),
             intents: None,
             #[cfg(target_os = "linux")]
@@ -1868,6 +1891,11 @@ impl DaemonCore {
             wireguard_handshake: HashMap::new(),
             tunnel_failed: HashSet::new(),
             xray_restarts: HashMap::new(),
+            failovers: HashMap::new(),
+            watchdogs: HashMap::new(),
+            service_checks: HashMap::new(),
+            watchdog_network: None,
+            quic_reject: None,
             cond_eval: HashMap::new(),
             intents: None,
             policy: Some(policy),
@@ -1903,6 +1931,11 @@ impl DaemonCore {
             wireguard_handshake: HashMap::new(),
             tunnel_failed: HashSet::new(),
             xray_restarts: HashMap::new(),
+            failovers: HashMap::new(),
+            watchdogs: HashMap::new(),
+            service_checks: HashMap::new(),
+            watchdog_network: None,
+            quic_reject: None,
             cond_eval: HashMap::new(),
             intents: None,
             #[cfg(target_os = "linux")]
@@ -1942,6 +1975,11 @@ impl DaemonCore {
             wireguard_handshake: HashMap::new(),
             tunnel_failed: HashSet::new(),
             xray_restarts: HashMap::new(),
+            failovers: HashMap::new(),
+            watchdogs: HashMap::new(),
+            service_checks: HashMap::new(),
+            watchdog_network: None,
+            quic_reject: None,
             cond_eval: HashMap::new(),
             intents: None,
             #[cfg(target_os = "linux")]
@@ -1986,6 +2024,11 @@ impl DaemonCore {
             wireguard_handshake: HashMap::new(),
             tunnel_failed: HashSet::new(),
             xray_restarts: HashMap::new(),
+            failovers: HashMap::new(),
+            watchdogs: HashMap::new(),
+            service_checks: HashMap::new(),
+            watchdog_network: None,
+            quic_reject: Some(Box::new(crate::quic_reject::TrustedQuicReject)),
             cond_eval: HashMap::new(),
             intents: None,
             policy: Some(policy),
@@ -2012,7 +2055,7 @@ impl DaemonCore {
         }
         let mark = self.allocate_openvpn_mark()?;
         let mut plan = prepare_xray(uid, params, mark)?;
-        crate::xray::pin_server_address(&mut plan, |host| resolve_host_addrs(Some(host)));
+        crate::xray::pin_server_addresses(&mut plan, |host| resolve_host_addrs(Some(host)));
         let runner = self.xray.as_mut().ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotConnected, "Xray executor is unavailable")
         })?;
@@ -2081,6 +2124,12 @@ impl DaemonCore {
                 owner_marker: format!("network-orchestrator:{uid}:{owner}"),
                 transport_mark: mark,
                 full: full.clone(),
+                failover: plan.failover.clone(),
+                reject_quic: plan.reject_quic,
+                probe_url: plan.probe_url.clone(),
+                pinned_keys: plan.pinned_keys.clone(),
+                proxy_exits: plan.proxy_exits.clone(),
+                mtu: Some(plan.mtu),
             })],
         });
         if let Err(err) = self.store.save(&self.journal) {
@@ -2092,6 +2141,7 @@ impl DaemonCore {
         if let Err(err) = result {
             let _ = self.teardown_xray_entry(index);
             self.persist();
+
             return Err(err);
         }
         self.journal.entries[index].state = OwnedState::Applied;
@@ -2101,8 +2151,188 @@ impl DaemonCore {
             return Err(xray_stage("journal_commit", err));
         }
         self.xray_restarts.remove(&(uid, owner.clone()));
-        self.tunnel_failed.remove(&(uid, owner));
+        self.tunnel_failed.remove(&(uid, owner.clone()));
+        self.start_failover(uid, &owner, &plan);
+        self.ensure_watchdog(index);
+        if self
+            .set_xray_service_checks(
+                uid,
+                &plan.profile_id,
+                std::mem::take(&mut plan.service_checks),
+            )
+            .is_err()
+        {
+            eprintln!("network-orchestrator-daemon: service diagnostics unavailable");
+        }
         Ok(self.xray_status(uid, &plan.profile_id))
+    }
+
+    /// Spawn (or skip) the failover probe worker for a freshly applied
+    /// plan. A spawn failure degrades to the balancer's safe default —
+    /// `unavailable` — rather than failing the connect.
+    fn start_failover(&mut self, uid: u32, owner: &str, plan: &crate::xray::XrayPlan) {
+        let key = (uid, owner.to_owned());
+        self.failovers.remove(&key);
+        let supervisors = crate::failover::FailoverSupervisors::spawn(
+            plan.failover.as_ref(),
+            &plan.proxy_exits,
+            plan.probe_url.as_deref(),
+            &plan.pinned_keys,
+            plan.mark,
+        );
+        self.failovers.insert(key, supervisors);
+    }
+
+    /// Replace only the caller's diagnostic worker; no recovery or route access.
+    pub fn set_xray_service_checks(
+        &mut self,
+        uid: u32,
+        profile_id: &str,
+        checks: Vec<net_manager_core::models::ServiceCheck>,
+    ) -> io::Result<Vec<net_manager_core::models::ServiceCheckResult>> {
+        let owner = format!("xray:{profile_id}");
+        validate_owner(&owner).map_err(invalid_input)?;
+        net_manager_core::service_checks::validate_service_checks(&checks)?;
+        let key = (uid, owner);
+        let process = self.position(uid, &key.1).and_then(|index| {
+            self.journal.entries[index]
+                .resources
+                .iter()
+                .find_map(|resource| match resource {
+                    OwnedResource::XrayProcess(process) => Some(process),
+                    _ => None,
+                })
+        });
+        let ports = process.map(|process| {
+            process
+                .pinned_keys
+                .iter()
+                .enumerate()
+                .map(|(index, key)| {
+                    (
+                        key.clone(),
+                        crate::xray::xray_pin_probe_port(process.transport_mark, index),
+                    )
+                })
+                .collect::<HashMap<_, _>>()
+        });
+        // Cancel first: an opt-out must not depend on starting a replacement.
+        self.service_checks.remove(&key);
+        let Some(ports) = ports else {
+            return Ok(Vec::new());
+        };
+        if !checks.iter().any(|check| check.background) {
+            return Ok(Vec::new());
+        }
+        let network = self.watchdog_network.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "service diagnostics unavailable",
+            )
+        })?;
+        if let Some(worker) =
+            crate::service_checks::ServiceCheckSupervisor::spawn(checks, &ports, &network.runtime)
+        {
+            self.service_checks.insert(key, worker);
+        }
+        Ok(Vec::new())
+    }
+
+    pub fn set_watchdog_network(&mut self, network: crate::watchdog::WatchdogNetwork) {
+        self.watchdog_network = Some(network);
+    }
+
+    fn ensure_watchdog(&mut self, index: usize) {
+        let Some(network) = self.watchdog_network.clone() else {
+            return;
+        };
+        let entry = &self.journal.entries[index];
+        let key = (entry.uid, entry.owner.clone());
+        if self
+            .watchdogs
+            .get(&key)
+            .is_some_and(|watchdog| !watchdog.finished())
+        {
+            return;
+        }
+        let Some(process) = entry.resources.iter().find_map(|resource| match resource {
+            OwnedResource::XrayProcess(process) => Some(process),
+            _ => None,
+        }) else {
+            return;
+        };
+        let Some(address) = entry.resources.iter().find_map(|resource| match resource {
+            OwnedResource::Address(address) => Some(address.address.addr()),
+            _ => None,
+        }) else {
+            return;
+        };
+        let dns_servers = entry
+            .resources
+            .iter()
+            .find_map(|resource| match resource {
+                OwnedResource::Dns(dns) => Some(dns.servers.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let spec = crate::watchdog::WatchdogSpec {
+            uid: entry.uid,
+            tun_name: process.name.clone(),
+            tun_addr: address,
+            mark: process.transport_mark,
+            dns_servers,
+            probe_url: process.probe_url.clone().or_else(|| {
+                process
+                    .failover
+                    .as_ref()
+                    .map(|failover| failover.probe_url.clone())
+            }),
+        };
+        if let Ok(watchdog) = crate::watchdog::WatchdogSupervisor::spawn(spec, network) {
+            self.watchdogs.insert(key, watchdog);
+        }
+    }
+
+    fn ensure_xray_quic(&mut self, index: usize) -> io::Result<()> {
+        let entry = &self.journal.entries[index];
+        if let Some(process) = entry.resources.iter().find_map(|resource| match resource {
+            OwnedResource::XrayProcess(process) if process.reject_quic => Some(process),
+            _ => None,
+        }) {
+            self.quic_reject
+                .as_mut()
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "QUIC reject executor is unavailable",
+                    )
+                })?
+                .ensure(entry.uid, &process.name)?;
+        }
+        Ok(())
+    }
+    /// Re-arm a probe worker after a daemon restart: the journaled
+    /// `failover` params rebuild the supervisor; a live one is left alone.
+    fn ensure_failover(&mut self, index: usize) {
+        let entry = &self.journal.entries[index];
+        let Some(process) = entry.resources.iter().find_map(|resource| match resource {
+            OwnedResource::XrayProcess(process) => Some(process.clone()),
+            _ => None,
+        }) else {
+            return;
+        };
+        let key = (entry.uid, entry.owner.clone());
+        if self.failovers.contains_key(&key) {
+            return;
+        }
+        let supervisors = crate::failover::FailoverSupervisors::spawn(
+            process.failover.as_ref(),
+            &process.proxy_exits,
+            process.probe_url.as_deref(),
+            &process.pinned_keys,
+            process.transport_mark,
+        );
+        self.failovers.insert(key, supervisors);
     }
 
     /// Hot-reload the staged Xray config of an already connected profile:
@@ -2137,8 +2367,11 @@ impl DaemonCore {
                 io::Error::new(io::ErrorKind::InvalidData, "missing Xray process marker")
             })?;
         let mut plan = prepare_xray(uid, params, process.transport_mark)?;
-        crate::xray::pin_server_address(&mut plan, |host| resolve_host_addrs(Some(host)));
+        crate::xray::pin_server_addresses(&mut plan, |host| resolve_host_addrs(Some(host)));
         self.ensure_xray_reload_compatible(index, &plan, &process)?;
+        self.failovers.remove(&(uid, owner.clone()));
+        self.watchdogs.remove(&(uid, owner.clone()));
+        self.service_checks.remove(&(uid, owner.clone()));
         let runner = self.xray.as_mut().ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotConnected, "Xray executor is unavailable")
         })?;
@@ -2156,8 +2389,35 @@ impl DaemonCore {
             })?;
         self.rebind_xray_link(index, process.index, new_index)
             .map_err(|err| xray_stage("rebind", err))?;
+        // Journal the probe policy the reload actually runs so a daemon
+        // restart resurrects the right supervisor.
+        for resource in &mut self.journal.entries[index].resources {
+            if let OwnedResource::XrayProcess(process) = resource {
+                process.failover = plan.failover.clone();
+                process.probe_url = plan.probe_url.clone();
+                process.pinned_keys = plan.pinned_keys.clone();
+                process.mtu = Some(plan.mtu);
+            }
+        }
+        self.store
+            .save(&self.journal)
+            .map_err(|err| xray_stage("journal_failover", err))?;
         // A successful reload hands the child a fresh restart budget.
         self.xray_restarts.remove(&(uid, owner.clone()));
+        // The reloaded child forgot the balancer override; a fresh
+        // supervisor (with the new probe set) re-installs it.
+        self.start_failover(uid, &owner, &plan);
+        self.ensure_watchdog(index);
+        if self
+            .set_xray_service_checks(
+                uid,
+                &plan.profile_id,
+                std::mem::take(&mut plan.service_checks),
+            )
+            .is_err()
+        {
+            eprintln!("network-orchestrator-daemon: service diagnostics unavailable");
+        }
         self.tunnel_failed.remove(&(uid, owner));
         Ok(self.xray_status(uid, &plan.profile_id))
     }
@@ -2180,6 +2440,9 @@ impl DaemonCore {
         if plan.name != process.name
             || plan.full_ipv4 != process.full.as_ref().is_some_and(|full| full.ipv4)
             || plan.full_ipv6 != process.full.as_ref().is_some_and(|full| full.ipv6)
+            || plan.reject_quic != process.reject_quic
+            || process.mtu.is_some_and(|mtu| mtu != plan.mtu)
+            || plan.proxy_exits != process.proxy_exits
         {
             return Err(incompatible());
         }
@@ -2253,7 +2516,14 @@ impl DaemonCore {
             })
             .collect();
         bypassed.sort();
-        let mut targets = resolve_host_addrs(plan.server_host.as_deref());
+        let mut targets: Vec<IpAddr> = Vec::new();
+        for host in plan.server_hosts.iter().chain(plan.unpinned_hosts.iter()) {
+            for ip in resolve_host_addrs(Some(host.as_str())) {
+                if !targets.contains(&ip) {
+                    targets.push(ip);
+                }
+            }
+        }
         for ip in plan.dns_server_bypass() {
             if !targets.contains(&ip) {
                 targets.push(ip);
@@ -2352,6 +2622,8 @@ impl DaemonCore {
             .unwrap()
             .set_state(link_index, true)
             .map_err(|err| xray_stage("link_up", err))?;
+        self.ensure_xray_quic(index)
+            .map_err(|err| xray_stage("quic_reject", err))?;
         self.add_xray_bypass_routes(index, plan)?;
         for route in &plan.routes {
             let mut applied = AppliedRoute::on_link(route.destination, link_index, route.metric);
@@ -2438,7 +2710,14 @@ impl DaemonCore {
         index: usize,
         plan: &crate::xray::XrayPlan,
     ) -> io::Result<()> {
-        let mut targets = resolve_host_addrs(plan.server_host.as_deref());
+        let mut targets: Vec<IpAddr> = Vec::new();
+        for host in plan.server_hosts.iter().chain(plan.unpinned_hosts.iter()) {
+            for ip in resolve_host_addrs(Some(host.as_str())) {
+                if !targets.contains(&ip) {
+                    targets.push(ip);
+                }
+            }
+        }
         for ip in plan.dns_server_bypass() {
             if !targets.contains(&ip) {
                 targets.push(ip);
@@ -2494,9 +2773,52 @@ impl DaemonCore {
             ));
         };
         let result = self.teardown_entry(index);
+        self.failovers.remove(&(uid, owner.clone()));
         self.xray_restarts.remove(&(uid, owner));
         self.store.save(&self.journal)?;
         result
+    }
+
+    /// Resolve only the authenticated caller's live listeners, without stats
+    /// subprocesses, recovery, reload or network changes.
+    pub fn xray_proxy_exits(
+        &mut self,
+        uid: u32,
+        profile_id: &str,
+    ) -> io::Result<Vec<net_manager_core::daemon_protocol::ProxyExitStatus>> {
+        let unavailable = || {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "The Xray profile is not running; connect it before launching a proxy command",
+            )
+        };
+        let owner = format!("xray:{profile_id}");
+        let index = self.position(uid, &owner).ok_or_else(unavailable)?;
+        let entry = &self.journal.entries[index];
+        if entry.state != OwnedState::Applied {
+            return Err(unavailable());
+        }
+        let process = entry
+            .resources
+            .iter()
+            .find_map(|resource| match resource {
+                OwnedResource::XrayProcess(process) => Some(process),
+                _ => None,
+            })
+            .ok_or_else(unavailable)?;
+        if !self
+            .xray
+            .as_mut()
+            .is_some_and(|runner| runner.health(&process.name).unwrap_or(false))
+        {
+            return Err(unavailable());
+        }
+        self.failovers
+            .get(&(uid, owner))
+            .map(|supervisors| {
+                supervisors.exit_statuses(&process.proxy_exits, process.transport_mark)
+            })
+            .ok_or_else(unavailable)
     }
 
     pub fn xray_status(&mut self, uid: u32, profile_id: &str) -> XrayStatusResult {
@@ -2545,6 +2867,22 @@ impl DaemonCore {
         } else {
             (None, None)
         };
+        let key = (uid, owner);
+        let proxy_exits = if state == TunnelState::Running {
+            process
+                .and_then(|process| {
+                    self.failovers.get(&key).map(|supervisors| {
+                        supervisors.exit_statuses(&process.proxy_exits, process.transport_mark)
+                    })
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let mut watchdog = self.watchdogs.get(&key).map(|watchdog| watchdog.status());
+        if let Some(checks) = self.service_checks.get(&key) {
+            watchdog.get_or_insert_with(Default::default).service_checks = checks.status();
+        }
         XrayStatusResult {
             profile_id: profile_id.to_owned(),
             state,
@@ -2561,6 +2899,12 @@ impl DaemonCore {
                 .is_some_and(|process| process.full.as_ref().is_some_and(|full| full.ipv4)),
             ipv6_covered: process
                 .is_some_and(|process| process.full.as_ref().is_some_and(|full| full.ipv6)),
+            watchdog,
+            proxy_exits,
+            failover: self
+                .failovers
+                .get(&key)
+                .and_then(|supervisors| supervisors.status()),
         }
     }
 
@@ -3956,7 +4300,17 @@ impl DaemonCore {
                         // an exhausted budget or a respawn failure tears the
                         // tunnel down.
                         if key.1.starts_with("xray:") {
-                            match self.heal_xray(index) {
+                            if self.watchdog_network.is_some() {
+                                self.ensure_watchdog(index);
+                                if !self
+                                    .watchdogs
+                                    .get(&key)
+                                    .is_some_and(|watchdog| watchdog.online())
+                                {
+                                    continue;
+                                }
+                            }
+                            match self.heal_xray(index, false) {
                                 Ok(true) => self.restore_owned_network(index, observed),
                                 Ok(false) | Err(_) => {
                                     Err(io::Error::other("tunnel transport is gone"))
@@ -3966,7 +4320,29 @@ impl DaemonCore {
                             Err(io::Error::other("tunnel transport is gone"))
                         }
                     }
-                    Some(true) => self.restore_owned_network(index, observed),
+                    Some(true) => {
+                        self.ensure_failover(index);
+                        self.ensure_watchdog(index);
+                        let requested = self
+                            .watchdogs
+                            .get(&key)
+                            .and_then(|watchdog| watchdog.take_request())
+                            .is_some();
+                        if requested {
+                            match self.heal_xray(index, true) {
+                                Ok(true) => {}
+                                Ok(false) | Err(_) => {
+                                    let _ = self.teardown_entry(index);
+                                    self.persist();
+                                    self.tunnel_failed.insert(key.clone());
+                                    changed.push(key);
+                                    continue;
+                                }
+                            }
+                        }
+                        self.ensure_xray_quic(index)
+                            .and_then(|_| self.restore_owned_network(index, observed))
+                    }
                 }
             };
             match restored {
@@ -4035,7 +4411,7 @@ impl DaemonCore {
     /// once the restart budget is spent — the caller then tears the owner
     /// down. Errors are treated the same as exhaustion.
     #[cfg(target_os = "linux")]
-    fn heal_xray(&mut self, index: usize) -> io::Result<bool> {
+    fn heal_xray(&mut self, index: usize, intentional: bool) -> io::Result<bool> {
         const MAX_XRAY_RESPAWNS: u32 = 3;
         let entry = &self.journal.entries[index];
         let key = (entry.uid, entry.owner.clone());
@@ -4050,13 +4426,18 @@ impl DaemonCore {
                 io::Error::new(io::ErrorKind::InvalidData, "missing Xray process marker")
             })?;
         let attempts = self.xray_restarts.get(&key).copied().unwrap_or(0);
-        if attempts >= MAX_XRAY_RESPAWNS {
+        if !intentional && attempts >= MAX_XRAY_RESPAWNS {
             return Ok(false);
         }
         // The attempt counts even when the respawn itself fails: a flapping
         // child must not loop forever.
         let uid = key.0;
-        self.xray_restarts.insert(key, attempts + 1);
+        // A respawn resets Xray's override. Stop the old controller before
+        // replacing the child, then start with fresh health observations.
+        self.failovers.remove(&key);
+        if !intentional {
+            self.xray_restarts.insert(key.clone(), attempts + 1);
+        }
         self.xray
             .as_mut()
             .ok_or_else(|| {
@@ -4072,6 +4453,11 @@ impl DaemonCore {
                 io::Error::new(io::ErrorKind::NotConnected, "Xray TUN link is unavailable")
             })?;
         self.rebind_xray_link(index, process.index, new_index)?;
+        self.ensure_failover(index);
+        if let Some(watchdog) = self.watchdogs.get(&key) {
+            watchdog.recovered((self.clock)());
+        }
+        self.ensure_watchdog(index);
         eprintln!(
             "network-orchestrator-daemon: respawned xray child for {}",
             self.journal.entries[index].owner
@@ -4111,6 +4497,14 @@ impl DaemonCore {
             }
         }
         self.wg.as_mut().unwrap().set_state(new_index, true)?;
+        for resource in &resources {
+            if let OwnedResource::XrayProcess(process) = resource {
+                if let Some(mtu) = process.mtu {
+                    self.wg.as_mut().unwrap().set_mtu(new_index, mtu)?;
+                }
+            }
+        }
+        self.ensure_xray_quic(index)?;
         for resource in &resources {
             if let OwnedResource::Route(route) = resource {
                 // Bypass routes keep their physical oif/gateway; the generic
@@ -4160,9 +4554,172 @@ impl DaemonCore {
         })
     }
 
-    /// Install owned routes, then owned rules, that are missing. A foreign
-    /// route with the same key counts as present; a rule priority taken by a
-    /// foreign rule is an error, so it is never claimed.
+    #[cfg(target_os = "linux")]
+    fn migrate_owned_bypass(
+        &mut self,
+        index: usize,
+        old: &AppliedRoute,
+        desired: &AppliedRoute,
+    ) -> io::Result<bool> {
+        let desired_was_journaled = self.journal.entries[index]
+            .resources
+            .iter()
+            .any(|resource| matches!(resource, OwnedResource::Route(route) if route == desired));
+
+        // Another journal owner is never a source of authority for this owner.
+        let key_matches = |route: &AppliedRoute| {
+            route.destination == desired.destination
+                && route.metric == desired.metric
+                && route.table.unwrap_or(RT_TABLE_MAIN) == desired.table.unwrap_or(RT_TABLE_MAIN)
+        };
+        if self
+            .journal
+            .entries
+            .iter()
+            .enumerate()
+            .any(|(other_index, entry)| {
+                other_index != index
+                    && entry.resources.iter().any(|resource| {
+                        matches!(
+                            resource,
+                            OwnedResource::Route(route) if key_matches(route)
+                        )
+                    })
+            })
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "bypass route belongs to another owner",
+            ));
+        }
+
+        // Use a full inventory, not just the daemon-protocol route snapshot:
+        // otherwise a foreign collision is invisible.
+        let tables = self.routes.net_tables()?;
+        let old_present = tables
+            .routes
+            .iter()
+            .any(|route| route.managed && same_route(route, old));
+        let desired_present = tables
+            .routes
+            .iter()
+            .any(|route| desired_was_journaled && route.managed && same_route(route, desired));
+
+        for route in &tables.routes {
+            let collides = route.destination == desired.destination
+                && route.table == desired.table.unwrap_or(RT_TABLE_MAIN)
+                && route.metric.unwrap_or(0) == desired.metric;
+            if !collides {
+                continue;
+            }
+
+            // Permit only the old owned object, or the desired object left
+            // by an earlier journaled migration attempt.
+            let ours = route.managed
+                && (same_route(route, old)
+                    || (desired_was_journaled && same_route(route, desired)));
+            if !ours {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "bypass route collides with a foreign route",
+                ));
+            }
+        }
+
+        if !desired_was_journaled {
+            self.journal.entries[index]
+                .resources
+                .push(OwnedResource::Route(desired.clone()));
+
+            // No kernel mutation before both old and desired intent are durable.
+            // Retain the conservative in-memory ownership superset on failure.
+            self.store.save(&self.journal)?;
+        }
+
+        let mut removed_old = false;
+        let mut changed = false;
+
+        if !desired_present {
+            let added = match self.routes.add_route(desired) {
+                Ok(()) => Ok(()),
+                Err(error)
+                    if error.kind() == io::ErrorKind::AlreadyExists
+                        && old_present
+                        && old.destination == desired.destination
+                        && old.metric == desired.metric
+                        && old.table.unwrap_or(RT_TABLE_MAIN)
+                            == desired.table.unwrap_or(RT_TABLE_MAIN) =>
+                {
+                    // The old route itself occupies the exclusive-add key.
+                    // Delete only that exact daemon-protocol object.
+                    match self.routes.remove_route(old) {
+                        Ok(()) => {
+                            removed_old = true;
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                            removed_old = true;
+                        }
+                        Err(error) => return Err(error),
+                    }
+
+                    self.routes.add_route(desired)
+                }
+                Err(error) => Err(error),
+            };
+
+            if let Err(error) = added {
+                if removed_old {
+                    // Exclusive rollback: never replace an intervening route.
+                    // Both intents remain journaled if rollback cannot finish.
+                    match self.routes.add_route(old) {
+                        Ok(()) => {}
+                        Err(rollback) if rollback.kind() == io::ErrorKind::AlreadyExists => {}
+                        Err(_) => {}
+                    }
+                }
+
+                if error.kind() == io::ErrorKind::AlreadyExists && !desired_was_journaled {
+                    // This exclusive add definitively did not acquire desired.
+                    // In particular, do not retain authority over a competing
+                    // route which appeared after preflight.
+                    self.journal.entries[index].resources.retain(|resource| {
+                        !matches!(
+                            resource,
+                            OwnedResource::Route(route) if route == desired
+                        )
+                    });
+                    self.store.save(&self.journal)?;
+                }
+
+                // For ambiguous I/O failures retain both intents: the kernel
+                // may have accepted the request before the actor failed.
+                return Err(error);
+            }
+
+            changed = true;
+        }
+
+        if !removed_old {
+            match self.routes.remove_route(old) {
+                Ok(()) => changed = true,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    // Desired is installed; old ownership remains until its
+                    // exact deletion succeeds on a later reconcile.
+                    return Err(error);
+                }
+            }
+        }
+
+        self.journal.entries[index]
+            .resources
+            .retain(|resource| !matches!(resource, OwnedResource::Route(route) if route == old));
+
+        // A crash before this save leaves a safe ownership superset on disk.
+        self.store.save(&self.journal)?;
+        Ok(changed)
+    }
+
     #[cfg(target_os = "linux")]
     fn restore_owned_network(
         &mut self,
@@ -4170,11 +4727,6 @@ impl DaemonCore {
         observed: &[AppliedRoute],
     ) -> io::Result<bool> {
         let resources = self.journal.entries[index].resources.clone();
-        // Tunnel routes ride the tunnel's own ifindex (journaled on the
-        // process resource); bypass host routes ride the physical uplink —
-        // either `via` the default gateway or `dev`-scoped when the host is
-        // on-link there. Entries with no tunnel index (static route owners)
-        // only ever treat gateway-carrying routes as bypasses.
         let tun_indices: Vec<u32> = resources
             .iter()
             .filter_map(|resource| match resource {
@@ -4182,58 +4734,68 @@ impl DaemonCore {
                 _ => None,
             })
             .collect();
+
         let mut restored = false;
         for resource in &resources {
             let OwnedResource::Route(route) = resource else {
                 continue;
             };
+
+            // An earlier migration in this pass may have removed this resource
+            // from the live journal. Never resurrect it from the old snapshot.
+            if !self.journal.entries[index]
+                .resources
+                .iter()
+                .any(|current| current == resource)
+            {
+                continue;
+            }
+
+            let is_bypass = route.gateway.is_some()
+                || (!tun_indices.is_empty() && !tun_indices.contains(&route.interface_index));
+
+            if is_bypass {
+                let Some(desired) = self.fresh_bypass_route(route) else {
+                    continue;
+                };
+
+                if desired != *route {
+                    match self.migrate_owned_bypass(index, route, &desired) {
+                        Ok(changed) => restored |= changed,
+                        Err(error) => {
+                            // A collision or flaky uplink defers migration.
+                            // Ownership remains journaled; do not tear down an
+                            // otherwise healthy tunnel for a bypass retry.
+                            eprintln!(
+                                "network-orchestrator-daemon: bypass migration deferred: {}",
+                                error.kind()
+                            );
+                        }
+                    }
+                    continue;
+                }
+            }
+
             if observed
                 .iter()
                 .any(|seen| kernel_route(seen) == kernel_route(route))
             {
                 continue;
             }
-            // Bypass host routes point at a physical uplink that can change
-            // on roam/DHCP renew/suspend — re-derive against the live
-            // uplink and update the journal instead of re-adding a stale
-            // route. No uplink at all is transient: skip and retry next pass.
-            let is_bypass = route.gateway.is_some()
-                || (!tun_indices.is_empty() && !tun_indices.contains(&route.interface_index));
-            let mut desired = route.clone();
-            if is_bypass {
-                match self.fresh_bypass_route(route) {
-                    Some(fresh) => {
-                        if fresh != *route {
-                            if let Some(slot) = self.journal.entries[index]
-                                .resources
-                                .iter_mut()
-                                .find(|res| {
-                                    matches!(res, OwnedResource::Route(existing) if existing == route)
-                                })
-                            {
-                                *slot = OwnedResource::Route(fresh.clone());
-                            }
-                            let _ = self.store.save(&self.journal);
-                        }
-                        desired = fresh;
-                    }
-                    None => continue,
-                }
-            }
-            match self.routes.add_route(&desired) {
+
+            match self.routes.add_route(route) {
                 Ok(()) => restored = true,
-                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
-                // A bypass add failing while the uplink is flaky must not
-                // kill the tunnel; the next reconcile pass retries.
-                Err(err) if is_bypass => {
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) if is_bypass => {
                     eprintln!(
                         "network-orchestrator-daemon: bypass route re-add deferred: {}",
-                        err.kind()
+                        error.kind()
                     );
                 }
-                Err(err) => return Err(err),
+                Err(error) => return Err(error),
             }
         }
+
         for resource in &resources {
             let OwnedResource::Rule(rule) = resource else {
                 continue;
@@ -4249,6 +4811,7 @@ impl DaemonCore {
                 restored = true;
             }
         }
+
         Ok(restored)
     }
 
@@ -5898,6 +6461,10 @@ impl DaemonCore {
 
     fn teardown_xray_entry(&mut self, index: usize) -> io::Result<()> {
         let entry = self.journal.entries[index].clone();
+        self.failovers.remove(&(entry.uid, entry.owner.clone()));
+        self.watchdogs.remove(&(entry.uid, entry.owner.clone()));
+        self.service_checks
+            .remove(&(entry.uid, entry.owner.clone()));
         let process = entry
             .resources
             .iter()
@@ -5911,6 +6478,11 @@ impl DaemonCore {
                     "Xray owner has no process marker",
                 )
             })?;
+        let quic_failed = process.reject_quic
+            && self
+                .quic_reject
+                .as_mut()
+                .is_none_or(|executor| executor.remove(entry.uid, &process.name).is_err());
         let Some(runner) = self.xray.as_mut() else {
             self.journal.entries[index].state = OwnedState::Stale;
             return Err(io::Error::new(
@@ -6004,7 +6576,10 @@ impl DaemonCore {
                 Err(ref e) if e.kind() == io::ErrorKind::NotFound => true,
                 Err(_) => false,
             };
-            if !removed || matches!(resource, OwnedResource::XrayProcess(_)) && !failed.is_empty() {
+            if !removed
+                || matches!(resource, OwnedResource::XrayProcess(_))
+                    && (!failed.is_empty() || quic_failed)
+            {
                 failed.push(resource.clone());
             }
         }
@@ -6330,6 +6905,7 @@ mod xray_core_tests {
         events: Events,
         gateways: Arc<Mutex<Vec<(std::net::IpAddr, u32)>>>,
         on_link: Arc<Mutex<Vec<(u32, IpNet)>>>,
+        routes: Arc<Mutex<Vec<SystemRoute>>>,
     }
     impl GatewayRoutes {
         fn new(events: Events) -> Self {
@@ -6340,6 +6916,7 @@ mod xray_core_tests {
                     ("fe80::abcd".parse().unwrap(), 3),
                 ])),
                 on_link: Arc::new(Mutex::new(Vec::new())),
+                routes: Arc::new(Mutex::new(Vec::new())),
             }
         }
         fn shared_gateways(&self) -> Arc<Mutex<Vec<(std::net::IpAddr, u32)>>> {
@@ -6351,10 +6928,42 @@ mod xray_core_tests {
     }
     impl RouteExecutor for GatewayRoutes {
         fn add_route(&mut self, route: &AppliedRoute) -> io::Result<()> {
+            let mut installed = self.routes.lock().unwrap();
+            let table = route.table.unwrap_or(RT_TABLE_MAIN);
+            if installed.iter().any(|old| {
+                old.destination == route.destination
+                    && old.table == table
+                    && old.metric.unwrap_or(0) == route.metric
+            }) {
+                return Err(io::ErrorKind::AlreadyExists.into());
+            }
+            installed.push(SystemRoute {
+                family: if route.destination.addr().is_ipv4() {
+                    IpFamily::Ipv4
+                } else {
+                    IpFamily::Ipv6
+                },
+                destination: route.destination,
+                table,
+                kind: "unicast".into(),
+                scope: "universe".into(),
+                protocol: crate::netlink::RTPROT_NETWORK_ORCHESTRATOR,
+                managed: true,
+                gateway: route.gateway,
+                interface_index: Some(route.interface_index),
+                interface_name: None,
+                metric: Some(route.metric),
+                pref_source: None,
+                nexthops: Vec::new(),
+            });
             self.events.push(format!("route-add:{}", route.destination));
             Ok(())
         }
         fn remove_route(&mut self, route: &AppliedRoute) -> io::Result<()> {
+            self.routes
+                .lock()
+                .unwrap()
+                .retain(|old| !(old.managed && same_route(old, route)));
             self.events.push(format!("route-del:{}", route.destination));
             Ok(())
         }
@@ -6363,6 +6972,13 @@ mod xray_core_tests {
         }
         fn on_link_networks(&self) -> io::Result<Vec<(u32, IpNet)>> {
             Ok(self.on_link.lock().unwrap().clone())
+        }
+        fn net_tables(&self) -> io::Result<NetTablesResult> {
+            Ok(NetTablesResult {
+                routes: self.routes.lock().unwrap().clone(),
+                rules: Vec::new(),
+                available: true,
+            })
         }
     }
     struct Links;
@@ -6453,6 +7069,12 @@ mod xray_core_tests {
             geo_assets: None,
             macos_data_root: None,
             role: Default::default(),
+            failover: None,
+            reject_quic: false,
+            probe_url: None,
+            mtu: None,
+            service_checks: Vec::new(),
+            proxy_exits: Vec::new(),
         }
     }
 
@@ -6718,6 +7340,7 @@ mod xray_core_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let routes = GatewayRoutes::new(events.clone());
         let gateways = routes.shared_gateways();
+        let installed = routes.routes.clone();
         let mut core = DaemonCore::open_with_xray(
             JournalStore::new(dir.join("state.json")),
             Box::new(routes),
@@ -6744,9 +7367,17 @@ mod xray_core_tests {
             .lock()
             .unwrap()
             .push(("198.51.100.1".parse().unwrap(), 7));
-        // The bypass route is missing from the kernel snapshot, so reconcile
-        // must re-add it against the *new* gateway, not the journaled one.
-        core.reconcile_network(&[]);
+        // The old bypass is still installed and visible in the snapshot.
+        // Reconcile must migrate it, not leave it pinned to the old uplink.
+        let observed = core.owned(1000)[0]
+            .resources
+            .iter()
+            .filter_map(|resource| match resource {
+                OwnedResource::Route(route) => Some(route.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        core.reconcile_network(&observed);
         let owned = core.owned(1000);
         let bypass = owned[0]
             .resources
@@ -6758,12 +7389,42 @@ mod xray_core_tests {
             .expect("bypass route");
         assert_eq!(bypass.gateway, Some("198.51.100.1".parse().unwrap()));
         assert_eq!(bypass.interface_index, 7);
+        let bypass_destination = bypass.destination;
+        let kernel = installed.lock().unwrap();
+        let actual = kernel
+            .iter()
+            .filter(|route| route.destination == bypass_destination)
+            .collect::<Vec<_>>();
+        assert_eq!(actual.len(), 1);
+        assert_eq!(actual[0].gateway, bypass.gateway);
+        assert_eq!(actual[0].interface_index, Some(7));
+        let mut foreign = actual[0].clone();
+        foreign.managed = false;
+        foreign.protocol = 4;
+        foreign.gateway = Some("203.0.113.1".parse().unwrap());
+        foreign.interface_index = Some(9);
+        drop(kernel);
+        gateways.lock().unwrap()[0] = ("203.0.113.1".parse().unwrap(), 9);
+        {
+            let mut kernel = installed.lock().unwrap();
+            kernel.retain(|route| route.destination != bypass_destination);
+            kernel.push(foreign.clone());
+        }
+        let before_collision = installed.lock().unwrap().clone();
+        core.reconcile_network(&observed);
+        assert_eq!(*installed.lock().unwrap(), before_collision);
+        assert!(core.owned(1000)[0]
+            .resources
+            .iter()
+            .any(|resource| matches!(resource, OwnedResource::Route(route)
+                if route.destination == bypass_destination && route.interface_index == 7)));
         // Uplink entirely gone (e.g. mid-suspend): the bypass is deferred,
         // the tunnel stays up.
         gateways.lock().unwrap().clear();
         core.reconcile_network(&[]);
         assert_eq!(core.xray_status(1000, "home").state, TunnelState::Running);
         core.disconnect_xray(1000, "home").unwrap();
+        assert_eq!(*installed.lock().unwrap(), vec![foreign]);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -6860,6 +7521,46 @@ mod xray_core_tests {
         assert!(!events.list().iter().any(|e| e.starts_with("reload:")));
         assert_eq!(core.xray_status(1000, "home").state, TunnelState::Running);
         core.disconnect_xray(1000, "home").unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn reload_cannot_retarget_a_running_named_listener() {
+        let events = Events::default();
+        let dir =
+            std::env::temp_dir().join(format!("netmgr-xray-proxy-binding-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut core = DaemonCore::open_with_xray(
+            JournalStore::new(dir.join("state.json")),
+            Box::new(Routes(events.clone())),
+            Box::new(Links),
+            Box::new(Tun(events.clone())),
+            Box::new(Flaky::new(events.clone())),
+        )
+        .unwrap();
+        let mut connected = params();
+        connected.proxy_exits = serde_json::from_value(json!([
+            {"name":"office","target":{"kind":"direct"}}
+        ]))
+        .unwrap();
+        core.connect_xray(1000, connected.clone()).unwrap();
+        connected.proxy_exits[0].target = net_manager_core::models::ProxyTarget::Rules;
+        assert_eq!(
+            core.reload_xray(1000, connected).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert!(!events
+            .list()
+            .iter()
+            .any(|event| event.starts_with("reload:")));
+        let status = core.xray_status(1000, "home");
+        assert_eq!(status.state, TunnelState::Running);
+        assert_eq!(
+            status.proxy_exits[0].target,
+            net_manager_core::models::ProxyTarget::Direct
+        );
+        core.disconnect_xray(1000, "home").unwrap();
+        assert!(core.xray_status(1000, "home").proxy_exits.is_empty());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -7014,6 +7715,7 @@ mod xray_core_tests {
             via: None,
         }];
         input.dns_servers = vec!["1.1.1.1".parse().unwrap()];
+        input.dns_bypass = vec!["1.1.1.1".into()];
         core.connect_xray(1000, input).unwrap();
         let applied = events.list();
         // Bypass host routes land before the policy rules that would send
@@ -7193,6 +7895,12 @@ mod xray_core_tests {
                             owner_marker: "network-orchestrator:1000:xray:home".into(),
                             transport_mark: 51820,
                             full: None,
+                            failover: None,
+                            reject_quic: false,
+                            probe_url: None,
+                            pinned_keys: Vec::new(),
+                            mtu: None,
+                            proxy_exits: Vec::new(),
                         }),
                         OwnedResource::Address(WireGuardAddressResource {
                             interface_index: 42,

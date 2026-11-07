@@ -62,6 +62,23 @@ impl DaemonClient {
         )
     }
 
+    /// GUI scheduling only: connection policy and protocol handling are the
+    /// same LinuxEngine operations used by netorch.
+    pub(crate) async fn engine_request<R: Send + 'static>(
+        &self,
+        operation: impl FnOnce(net_manager_engine::linux_engine::LinuxEngine) -> Result<R, String>
+            + Send
+            + 'static,
+    ) -> Result<R, String> {
+        let engine = net_manager_engine::linux_engine::LinuxEngine::for_socket(
+            self.path.clone(),
+            format!("net-manager-app/{}", env!("NETORCH_VERSION")),
+        );
+        tauri::async_runtime::spawn_blocking(move || operation(engine))
+            .await
+            .map_err(|_| "Network operation worker failed".to_string())?
+    }
+
     async fn exchange<P: Serialize, R: DeserializeOwned>(
         &self,
         method_name: &str,

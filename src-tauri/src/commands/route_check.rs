@@ -14,9 +14,9 @@ use std::path::Path;
 use std::path::PathBuf;
 use tauri::State;
 
-#[cfg(target_os = "linux")]
-use crate::geo_assets;
 use crate::state::AppState;
+#[cfg(target_os = "linux")]
+use net_manager_engine::linux_geo_assets as geo_assets;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -126,6 +126,7 @@ pub(crate) fn xray_test_route(
         domain_strategy: request.domain_strategy,
         domain_matcher: None,
         dns: request.dns,
+        ..ProfileRoutingOptions::default()
     };
     check_route(&request.domain_policies, &options, &request.target, &geo)
         .map_err(|err| err.to_string())

@@ -2847,7 +2847,6 @@ name = "net-manager-app"
 version = "0.0.0"
 dependencies = [
  "base64 0.22.1",
- "dbus-secret-service",
  "futures-util",
  "libc",
  "net-manager-core",
@@ -2889,7 +2888,7 @@ dependencies = [
 
 [[package]]
 name = "net-manager-core"
-version = "0.10.0"
+version = "0.14.0"
 dependencies = [
  "base64 0.22.1",
  "futures",
@@ -2897,6 +2896,7 @@ dependencies = [
  "libc",
  "net-route",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "sha2",
@@ -2909,19 +2909,23 @@ dependencies = [
 
 [[package]]
 name = "net-manager-engine"
-version = "0.10.0"
+version = "0.14.0"
 dependencies = [
  "base64 0.22.1",
+ "dbus-secret-service",
+ "libc",
  "net-manager-core",
+ "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
 ]
 
 [[package]]
 name = "net-manager-macos-bridge"
-version = "0.10.0"
+version = "0.10.2"
 dependencies = [
  "base64 0.22.1",
  "ipnet",
@@ -3017,7 +3021,7 @@ dependencies = [
 
 [[package]]
 name = "network-orchestrator-daemon"
-version = "0.10.1"
+version = "0.14.0"
 dependencies = [
  "base64 0.22.1",
  "futures",
@@ -3027,6 +3031,7 @@ dependencies = [
  "netlink-packet-core",
  "netlink-packet-route",
  "netlink-sys",
+ "reqwest",
  "rtnetlink",
  "serde",
  "serde_json",
@@ -3036,7 +3041,7 @@ dependencies = [
 
 [[package]]
 name = "network-orchestrator-macos-helper"
-version = "0.10.0"
+version = "0.10.2"
 dependencies = [
  "base64 0.22.1",
  "boringtun",
@@ -4005,6 +4010,7 @@ dependencies = [
  "base64 0.23.1",
  "bytes",
  "encoding_rs",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "h2",

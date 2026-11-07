@@ -4,7 +4,6 @@ use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
-use std::sync::Mutex;
 
 pub const PROFILE_DOCUMENT_VERSION: u32 = 1;
 
@@ -17,15 +16,11 @@ pub struct ProfileDocument {
 
 pub struct ProfileStore {
     path: PathBuf,
-    write_lock: Mutex<()>,
 }
 
 impl ProfileStore {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self {
-            path: path.into(),
-            write_lock: Mutex::new(()),
-        }
+        Self { path: path.into() }
     }
 
     pub fn load(&self) -> io::Result<ProfileDocument> {
@@ -39,26 +34,63 @@ impl ProfileStore {
             }
             Err(err) => return Err(err),
         };
-        let document: ProfileDocument = serde_json::from_str(&raw)
-            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+        let document: ProfileDocument =
+            serde_json::from_str(&raw).map_err(|_| invalid_data("invalid profile document"))?;
         if document.version != PROFILE_DOCUMENT_VERSION {
             return Err(invalid_data(format!(
                 "unsupported profile document version {}",
                 document.version
             )));
         }
+        for profile in &document.profiles {
+            crate::service_checks::validate_profile_service_checks(profile)?;
+            crate::proxy_exits::validate_profile_proxy_exits(profile)?;
+        }
         Ok(document)
     }
 
     pub fn save(&self, document: &ProfileDocument) -> io::Result<()> {
-        let _guard = self
-            .write_lock
-            .lock()
-            .map_err(|_| io::Error::other("profile store lock poisoned"))?;
+        // Reject invalid input before creating even the transaction lock.
+        for profile in &document.profiles {
+            crate::service_checks::validate_profile_service_checks(profile)?;
+            crate::proxy_exits::validate_profile_proxy_exits(profile)?;
+        }
+        let _guard = self.lock()?;
         self.save_locked(document)
     }
 
+    /// A separate file survives atomic replacement of the document. Each
+    /// transaction opens its own handle, so threads and other processes use
+    /// the same OS lock; dropping the handle releases it even on errors.
+    fn lock(&self) -> io::Result<fs::File> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)?;
+            crate::config_security::protect_path(parent)?;
+        }
+        let mut name = self.path.clone().into_os_string();
+        name.push(".lock");
+        let path = PathBuf::from(name);
+        let mut options = fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options
+            .open(&path)
+            .map_err(|_| io::Error::other("cannot open profile transaction lock"))?;
+        crate::config_security::protect_path(&path)?;
+        file.lock()
+            .map_err(|_| io::Error::other("cannot lock profile store"))?;
+        Ok(file)
+    }
+
     fn save_locked(&self, document: &ProfileDocument) -> io::Result<()> {
+        for profile in &document.profiles {
+            crate::service_checks::validate_profile_service_checks(profile)?;
+            crate::proxy_exits::validate_profile_proxy_exits(profile)?;
+        }
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
             crate::config_security::protect_path(parent)?;
@@ -79,10 +111,7 @@ impl ProfileStore {
 
     pub fn upsert(&self, profile: Profile) -> io::Result<ProfileDocument> {
         validate_profile(&profile)?;
-        let _guard = self
-            .write_lock
-            .lock()
-            .map_err(|_| io::Error::other("profile store lock poisoned"))?;
+        let _guard = self.lock()?;
         let mut document = self.load()?;
         if let Some(existing) = document.profiles.iter_mut().find(|p| p.id == profile.id) {
             *existing = profile;
@@ -93,12 +122,29 @@ impl ProfileStore {
         Ok(document)
     }
 
+    /// Change one existing profile under the store transaction, preserving
+    /// unrelated edits made while a network operation was in flight.
+    pub fn update_profile(
+        &self,
+        id: &str,
+        update: impl FnOnce(&mut Profile) -> io::Result<()>,
+    ) -> io::Result<ProfileDocument> {
+        let _guard = self.lock()?;
+        let mut document = self.load()?;
+        let profile = document
+            .profiles
+            .iter_mut()
+            .find(|profile| profile.id == id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "profile not found"))?;
+        update(profile)?;
+        validate_profile(profile)?;
+        self.save_locked(&document)?;
+        Ok(document)
+    }
+
     /// Flags whether the app starts this profile when it launches.
     pub fn set_auto_connect(&self, id: &str, enabled: bool) -> io::Result<ProfileDocument> {
-        let _guard = self
-            .write_lock
-            .lock()
-            .map_err(|_| io::Error::other("profile store lock poisoned"))?;
+        let _guard = self.lock()?;
         let mut document = self.load()?;
         let profile = document
             .profiles
@@ -115,10 +161,7 @@ impl ProfileStore {
     /// Whether a static-route profile arms its routes while the interface is
     /// absent (true) or refuses to connect (false).
     pub fn set_wait_for_interface(&self, id: &str, enabled: bool) -> io::Result<ProfileDocument> {
-        let _guard = self
-            .write_lock
-            .lock()
-            .map_err(|_| io::Error::other("profile store lock poisoned"))?;
+        let _guard = self.lock()?;
         let mut document = self.load()?;
         let profile = document
             .profiles
@@ -133,10 +176,7 @@ impl ProfileStore {
     }
 
     pub fn delete(&self, id: &str) -> io::Result<ProfileDocument> {
-        let _guard = self
-            .write_lock
-            .lock()
-            .map_err(|_| io::Error::other("profile store lock poisoned"))?;
+        let _guard = self.lock()?;
         let mut document = self.load()?;
         let len_before = document.profiles.len();
         document.profiles.retain(|p| p.id != id);
@@ -158,6 +198,7 @@ impl ProfileStore {
         backend: TunnelBackend,
         ordered_ids: &[String],
     ) -> io::Result<ProfileDocument> {
+        let _guard = self.lock()?;
         let mut document = self.load()?;
         let positions: Vec<usize> = document
             .profiles
@@ -192,7 +233,7 @@ impl ProfileStore {
         for &index in &positions {
             document.profiles[index] = ordered.next().expect("queue covers the group");
         }
-        self.save(&document)?;
+        self.save_locked(&document)?;
         Ok(document)
     }
 }
@@ -252,12 +293,33 @@ pub fn validate_profile(profile: &Profile) -> io::Result<()> {
             }
         }
     }
+    crate::service_checks::validate_profile_service_checks(profile)?;
+    crate::proxy_exits::validate_profile_proxy_exits(profile)?;
     if profile.backend != TunnelBackend::Xray && !profile.domain_policies.is_empty() {
         return Err(invalid_data(
             "domain policies are only supported for Xray profiles",
         ));
     }
     if profile.backend == TunnelBackend::Xray {
+        crate::xray::validate_routing_policy_selectors(&profile.domain_policies)
+            .map_err(|error| invalid_data(error.to_string()))?;
+        crate::xray::validate_dns_config(&profile.xray_dns)
+            .map_err(|error| invalid_data(error.to_string()))?;
+        crate::xray::validate_advanced_routing_options(
+            &profile.xray_traffic_rules,
+            &profile.xray_interface_routes,
+            profile.xray_sockopts.as_ref(),
+            profile.xray_connection_idle_secs,
+            profile.xray_direct_domain_strategy.as_deref(),
+        )
+        .map_err(|error| invalid_data(error.to_string()))?;
+        crate::xray::validate_tun_profile_settings(
+            profile.xray_tun_mtu,
+            &profile.xray_tun_dns_servers,
+        )
+        .map_err(|error| invalid_data(error.to_string()))?;
+        crate::xray::validate_pinned_routes(&profile.pinned_policies)
+            .map_err(|error| invalid_data(error.to_string()))?;
         for policy in &profile.domain_policies {
             if policy.domains.is_empty() {
                 return Err(invalid_data("domain policy must list at least one domain"));
@@ -365,6 +427,279 @@ mod tests {
             auto_connect: true,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn independent_stores_preserve_concurrent_profile_edits() {
+        let dir = unique_dir("concurrent-stores");
+        let path = dir.join("profiles.json");
+        let store = ProfileStore::new(path.clone());
+        let mut profile = wg_profile();
+        profile.name = "0".into();
+        let id = profile.id.clone();
+        store.upsert(profile).unwrap();
+        let start = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let path = path.clone();
+                let id = id.clone();
+                let start = start.clone();
+                std::thread::spawn(move || {
+                    let independent = ProfileStore::new(path);
+                    start.wait();
+                    for _ in 0..16 {
+                        independent
+                            .update_profile(&id, |profile| {
+                                let previous: usize = profile.name.parse().unwrap();
+                                profile.name = (previous + 1).to_string();
+                                Ok(())
+                            })
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(store.load().unwrap().profiles[0].name, "128");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn service_checks_refuse_non_https_destinations_before_persistence() {
+        let mut profile = wg_profile();
+        profile.backend = TunnelBackend::Xray;
+        profile.config_path = PathBuf::from("service-checks.json");
+        let mut value = serde_json::to_value(profile).unwrap();
+        value["xrayServiceChecks"] = serde_json::json!([{
+            "id": "service-example",
+            "name": "Example availability",
+            "url": "http://example.test/",
+            "endpointKey": "1111111111111111",
+            "background": false
+        }]);
+        value["subscription"] = serde_json::json!({
+            "url": "https://subscription.example.test/synthetic",
+            "hwid": "",
+            "endpointCount": 1,
+            "activeIndex": 0
+        });
+        value["xrayServiceChecks"][0]["url"] = serde_json::json!("https://example.test/");
+        let valid: Profile = serde_json::from_value(value.clone()).unwrap();
+        validate_profile(&valid).unwrap();
+        value["xrayServiceChecks"][0]["url"] = serde_json::json!("http://example.test/");
+        let invalid: Profile = serde_json::from_value(value).unwrap();
+        assert!(validate_profile(&invalid).is_err());
+    }
+
+    #[test]
+    fn named_proxy_exits_refuse_executable_configuration() {
+        let mut profile = wg_profile();
+        profile.backend = TunnelBackend::Xray;
+        profile.config_path = PathBuf::from("named-proxy.json");
+        let mut value = serde_json::to_value(profile).unwrap();
+        value["xrayProxyExits"] = serde_json::json!([{
+            "name": "default",
+            "target": {"kind": "rules"},
+            "noProxy": [],
+            "command": ["sh", "-c", "exit 0"]
+        }]);
+        assert!(serde_json::from_value::<Profile>(value).is_err());
+    }
+
+    fn subscription_meta() -> crate::models::SubscriptionMeta {
+        serde_json::from_value(serde_json::json!({
+            "url": "https://subscription.example.test/synthetic",
+            "hwid": "",
+            "endpointCount": 2,
+            "activeIndex": 0
+        }))
+        .unwrap()
+    }
+
+    fn xray_sub_profile() -> Profile {
+        let mut profile = wg_profile();
+        profile.id = "proxy-host".into();
+        profile.backend = TunnelBackend::Xray;
+        profile.config_path = PathBuf::from("proxy-host.json");
+        profile.subscription = Some(subscription_meta());
+        profile
+    }
+
+    #[test]
+    fn named_proxy_exits_persist_and_validate_boundaries() {
+        use crate::models::{NamedProxyExit, ProxyTarget};
+
+        // A valid mixed spec survives a store round trip with order intact.
+        let dir = unique_dir("named-exits");
+        let store = ProfileStore::new(dir.join("profiles.json"));
+        let mut profile = xray_sub_profile();
+        profile.xray_proxy_exits = vec![
+            NamedProxyExit {
+                name: "work".into(),
+                target: ProxyTarget::Node {
+                    endpoint_key: "1111111111111111".into(),
+                },
+                no_proxy: vec!["intranet.corp".into(), "10.0.0.0/8".into()],
+            },
+            NamedProxyExit {
+                name: "media-pool".into(),
+                target: ProxyTarget::Pool {
+                    endpoint_keys: vec!["2222222222222222".into(), "3333333333333333".into()],
+                },
+                no_proxy: Vec::new(),
+            },
+            NamedProxyExit {
+                name: "direct".into(),
+                target: ProxyTarget::Direct,
+                no_proxy: Vec::new(),
+            },
+        ];
+        store.upsert(profile).unwrap();
+        let stored = store.load().unwrap().profiles.remove(0);
+        assert_eq!(stored.xray_proxy_exits.len(), 3);
+        assert_eq!(stored.xray_proxy_exits[0].name, "work");
+        assert_eq!(stored.xray_proxy_exits[0].no_proxy.len(), 2);
+        assert!(matches!(
+            stored.xray_proxy_exits[1].target,
+            ProxyTarget::Pool { .. }
+        ));
+
+        // Rejected on upsert (validated before persistence): bad or
+        // reserved names, duplicates, malformed key rules.
+        let mut bad = xray_sub_profile();
+        for name in ["list", "set", "remove", "help", "UPPER", "-lead", "a b"] {
+            bad.xray_proxy_exits = vec![NamedProxyExit {
+                name: name.into(),
+                target: ProxyTarget::Direct,
+                no_proxy: Vec::new(),
+            }];
+            assert!(
+                store.upsert(bad.clone()).is_err(),
+                "name {name:?} must be rejected"
+            );
+        }
+        bad.xray_proxy_exits = vec![
+            NamedProxyExit {
+                name: "a".into(),
+                target: ProxyTarget::Direct,
+                no_proxy: Vec::new(),
+            },
+            NamedProxyExit {
+                name: "a".into(),
+                target: ProxyTarget::Rules,
+                no_proxy: Vec::new(),
+            },
+        ];
+        assert!(store.upsert(bad.clone()).is_err(), "duplicate names");
+        for target in [
+            ProxyTarget::Node {
+                endpoint_key: "nothex".into(),
+            },
+            ProxyTarget::Node {
+                endpoint_key: "AAAAAAAAAAAAAAAA".into(),
+            },
+            ProxyTarget::Pool {
+                endpoint_keys: Vec::new(),
+            },
+            ProxyTarget::Pool {
+                endpoint_keys: vec!["1111111111111111".into(), "1111111111111111".into()],
+            },
+            ProxyTarget::Pool {
+                endpoint_keys: (0..9).map(|i| format!("{i:016x}")).collect(),
+            },
+        ] {
+            bad.xray_proxy_exits = vec![NamedProxyExit {
+                name: "ok".into(),
+                target,
+                no_proxy: Vec::new(),
+            }];
+            assert!(store.upsert(bad.clone()).is_err(), "bad target rejected");
+        }
+        for entry in [
+            "",
+            "has space",
+            "user@host",
+            "host?query",
+            "a,b",
+            "semi;colon",
+        ] {
+            bad.xray_proxy_exits = vec![NamedProxyExit {
+                name: "ok".into(),
+                target: ProxyTarget::Direct,
+                no_proxy: vec![entry.into()],
+            }];
+            assert!(
+                store.upsert(bad.clone()).is_err(),
+                "noProxy {entry:?} must be rejected"
+            );
+        }
+        // 17 exits exceed the listener slot budget.
+        bad.xray_proxy_exits = (0..crate::proxy_exits::MAX_PROXY_EXITS + 1)
+            .map(|i| NamedProxyExit {
+                name: format!("exit{i}"),
+                target: ProxyTarget::Direct,
+                no_proxy: Vec::new(),
+            })
+            .collect();
+        assert!(store.upsert(bad.clone()).is_err(), "exit count budget");
+        // A 34th distinct pin key exceeds the daemon pin-listener budget.
+        let mut over = xray_sub_profile();
+        over.pinned_policies = (0..32)
+            .map(|i| crate::models::PinnedRoute {
+                selectors: vec![format!("domain:{i}.test")],
+                endpoint_key: format!("{i:016x}"),
+                missing: false,
+            })
+            .collect();
+        over.xray_dns.outbound_key = Some("eeeeeeeeeeeeeeee".into());
+        over.xray_proxy_exits = vec![NamedProxyExit {
+            name: "spare".into(),
+            target: ProxyTarget::Node {
+                endpoint_key: "ffffffffffffffff".into(),
+            },
+            no_proxy: Vec::new(),
+        }];
+        assert!(store.upsert(over).is_err(), "33-key pin budget");
+
+        // Node/pool exits need subscription metadata; rules/direct do not.
+        let mut plain = xray_sub_profile();
+        plain.subscription = None;
+        plain.xray_proxy_exits = vec![NamedProxyExit {
+            name: "work".into(),
+            target: ProxyTarget::Node {
+                endpoint_key: "1111111111111111".into(),
+            },
+            no_proxy: Vec::new(),
+        }];
+        assert!(
+            store.upsert(plain.clone()).is_err(),
+            "node without subscription"
+        );
+        plain.xray_proxy_exits = vec![
+            NamedProxyExit {
+                name: "lax".into(),
+                target: ProxyTarget::Rules,
+                no_proxy: Vec::new(),
+            },
+            NamedProxyExit {
+                name: "out".into(),
+                target: ProxyTarget::Direct,
+                no_proxy: Vec::new(),
+            },
+        ];
+        store.upsert(plain).unwrap();
+        // Non-Xray backends cannot carry exits at all.
+        let mut wg = wg_profile();
+        wg.id = "wg-exits".into();
+        wg.xray_proxy_exits = vec![NamedProxyExit {
+            name: "lax".into(),
+            target: ProxyTarget::Direct,
+            no_proxy: Vec::new(),
+        }];
+        assert!(store.upsert(wg).is_err(), "non-Xray exits rejected");
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

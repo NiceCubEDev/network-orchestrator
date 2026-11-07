@@ -5,7 +5,7 @@ FROM ubuntu:26.04
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
       systemd systemd-sysv systemd-resolved dbus polkitd iproute2 \
-      wireguard-tools openvpn python3 ca-certificates procps curl \
+      wireguard-tools openvpn nftables python3 ca-certificates procps curl \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --uid 1001 alice \
     && useradd --create-home --uid 1002 bob

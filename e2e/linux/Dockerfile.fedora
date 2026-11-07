@@ -4,7 +4,7 @@
 FROM fedora:44
 RUN dnf -y install --setopt=install_weak_deps=False \
       systemd systemd-resolved dbus-broker polkit iproute wireguard-tools \
-      openvpn python3 ca-certificates procps-ng curl openssl util-linux \
+      openvpn nftables python3 ca-certificates procps-ng curl openssl util-linux \
       shadow-utils firewalld which \
     && dnf clean all \
     && systemctl enable systemd-resolved firewalld \

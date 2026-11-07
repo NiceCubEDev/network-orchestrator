@@ -11,8 +11,8 @@ use net_manager_core::daemon_protocol::{
 };
 use net_manager_core::models::*;
 
-/// Remembered OpenVPN credentials (the system keyring or, without one, the
-/// process). The app and the CLI each bring their own store.
+/// Remembered OpenVPN credentials. Linux frontends share the Secret Service
+/// adapter in `linux_credentials`; root callers use no remembered credentials.
 pub trait CredentialSource {
     /// Remembered credentials plus an optional user notice. `legacy` is the
     /// old plaintext file, migrated and deleted on first access.
@@ -21,6 +21,16 @@ pub trait CredentialSource {
         profile_id: &str,
         legacy: &std::path::Path,
     ) -> Result<(Option<OpenVpnCredentials>, Option<&'static str>), String>;
+}
+
+impl CredentialSource for () {
+    fn load(
+        &self,
+        _: &str,
+        _: &std::path::Path,
+    ) -> Result<(Option<OpenVpnCredentials>, Option<&'static str>), String> {
+        Ok((None, None))
+    }
 }
 
 /// The `wireguard.connect` request: the managed config plus the routes the
@@ -196,14 +206,25 @@ pub fn prepare_linux_xray_tun_params(
     let config = net_manager_core::xray::apply_profile_routing(
         &base,
         &profile.domain_policies,
-        &net_manager_core::xray::ProfileRoutingOptions {
-            private_lan_direct: profile.private_lan_direct,
-            domain_strategy: profile.xray_domain_strategy,
-            domain_matcher: profile.xray_domain_matcher,
-            dns: profile.xray_dns.clone(),
-        },
+        &net_manager_core::xray::ProfileRoutingOptions::from(profile),
     )
     .map_err(|_| "invalid Xray routing rules".to_string())?;
+    // Multinode: a subscription profile with backups or pinned routes needs
+    // one outbound per candidate plus the pinned outbounds, and the daemon
+    // probe/switch policy.
+    let multinode = profile.subscription.as_ref().is_some_and(|subscription| {
+        !subscription.backup_keys.is_empty()
+            || subscription.node_pool.is_some() && !subscription.pool_keys.is_empty()
+    }) || !profile.pinned_policies.is_empty()
+        || profile.xray_dns.outbound_key.is_some();
+    let (mut config, failover) = if multinode {
+        build_multinode(vault, profile)?
+    } else {
+        (config, None)
+    };
+    // Named `netorch proxy` exits: dedicated pin-<key> outbounds appended
+    // after everything else — the default route and failover stay as built.
+    net_manager_core::proxy_exits::append_named_proxy_outbounds(vault, profile, &mut config)?;
     let effective_routes = profile.effective_routes();
     let default_route = effective_routes.is_empty();
     let route = |destination: &str| PolicyRoute {
@@ -236,7 +257,9 @@ pub fn prepare_linux_xray_tun_params(
         config: serde_json::to_string(&config)
             .map_err(|_| "cannot encode Xray TUN config".to_string())?,
         routes,
-        dns_servers: if default_route {
+        dns_servers: if !profile.xray_tun_dns_servers.is_empty() {
+            profile.xray_tun_dns_servers.clone()
+        } else if default_route {
             vec!["1.1.1.1".parse().unwrap()]
         } else {
             Vec::new()
@@ -247,9 +270,155 @@ pub fn prepare_linux_xray_tun_params(
         geo_assets: None,
         macos_data_root: None,
         role: profile.tunnel_role,
+        failover,
+        reject_quic: profile.xray_quic_reject,
+        probe_url: Some(
+            profile
+                .subscription
+                .as_ref()
+                .and_then(|meta| meta.probe_url.clone())
+                .unwrap_or_else(|| net_manager_core::subscription::DELAY_PROBE_URL.to_string()),
+        ),
+        mtu: profile.xray_tun_mtu,
+        service_checks: profile
+            .xray_service_checks
+            .iter()
+            .filter(|check| check.background)
+            .cloned()
+            .collect(),
+        proxy_exits: profile.xray_proxy_exits.clone(),
     };
     check_xray_frame_size(&params)?;
     Ok(params)
+}
+/// Build the multinode connect pieces: every failover candidate and pinned
+/// endpoint is generated from its *current* share link (not `config_path`,
+/// which may hold a stale selection), the routing rules land on the fresh
+/// primary config, and the daemon gets its ordered probe list.
+fn build_multinode(
+    vault: &net_manager_core::config_vault::ConfigVault,
+    profile: &Profile,
+) -> Result<
+    (
+        serde_json::Value,
+        Option<net_manager_core::daemon_protocol::XrayFailoverParams>,
+    ),
+    String,
+> {
+    use net_manager_core::daemon_protocol::{XrayFailoverNode, XrayFailoverParams};
+    use net_manager_core::xray::{multinode_outbound, PinnedOutbound};
+
+    let (nodes, pinned) = net_manager_core::subscription::failover_plan(vault, profile)
+        .map_err(|_| "The subscription's failover endpoints could not be resolved".to_string())?;
+    let primary_url = nodes[0].url.clone();
+    let primary_key = net_manager_core::subscription::endpoint_key(&primary_url);
+    let mut primary_config = net_manager_core::xray::tun_compatible_config(
+        &net_manager_core::xray::generate_share_link_config(&primary_url, 1)
+            .map_err(|_| "The selected endpoint is invalid".to_string())?,
+    )
+    .map_err(str::to_string)?;
+    primary_config = net_manager_core::xray::apply_profile_routing(
+        &primary_config,
+        &profile.domain_policies,
+        &net_manager_core::xray::ProfileRoutingOptions::from(profile),
+    )
+    .map_err(|_| "invalid Xray routing rules".to_string())?;
+    let mut backups = Vec::new();
+    for node in &nodes[1..] {
+        let key = net_manager_core::subscription::endpoint_key(&node.url);
+        backups.push((
+            key.clone(),
+            multinode_outbound(&node.url, &net_manager_core::xray::node_tag(&key))
+                .map_err(|_| "A backup endpoint is invalid".to_string())?,
+        ));
+    }
+    let mut pinned_outbounds = Vec::new();
+    for route in &pinned {
+        let outbound = if route.missing {
+            None
+        } else {
+            let endpoint = vault
+                .read_subscription_endpoints(&profile.id)
+                .ok()
+                .and_then(|endpoints| {
+                    net_manager_core::subscription::key_index(&endpoints, &route.endpoint_key)
+                        .map(|index| endpoints[index].url.clone())
+                });
+            match endpoint {
+                Some(url) => Some(
+                    multinode_outbound(&url, &net_manager_core::xray::pin_tag(&route.endpoint_key))
+                        .map_err(|_| "A pinned endpoint is invalid".to_string())?,
+                ),
+                // Resolution disagreed with the plan — fail closed.
+                None => None,
+            }
+        };
+        pinned_outbounds.push(PinnedOutbound {
+            key: route.endpoint_key.clone(),
+            outbound,
+            selectors: route.selectors.clone(),
+        });
+    }
+    if let Some(key) = &profile.xray_dns.outbound_key {
+        if !pinned_outbounds.iter().any(|route| &route.key == key) {
+            let endpoints = vault
+                .read_subscription_endpoints(&profile.id)
+                .map_err(|_| "cannot read subscription endpoints".to_string())?;
+            let outbound = endpoints
+                .iter()
+                .find(|endpoint| {
+                    net_manager_core::subscription::endpoint_key(&endpoint.url) == *key
+                })
+                .map(|endpoint| {
+                    multinode_outbound(&endpoint.url, &net_manager_core::xray::pin_tag(key))
+                })
+                .transpose()
+                .map_err(|_| "The DNS endpoint is invalid".to_string())?;
+            pinned_outbounds.push(PinnedOutbound {
+                key: key.clone(),
+                outbound,
+                selectors: Vec::new(),
+            });
+        }
+    }
+    let mut config = net_manager_core::xray::apply_multinode_config(
+        &primary_config,
+        &primary_key,
+        &backups,
+        &pinned_outbounds,
+    )
+    .map_err(|_| "cannot encode the multinode Xray config".to_string())?;
+    if let Some(sockopts) = &profile.xray_sockopts {
+        for outbound in config["outbounds"]
+            .as_array_mut()
+            .expect("generated outbounds")
+        {
+            if !matches!(
+                outbound["protocol"].as_str(),
+                Some("blackhole" | "dns" | "loopback")
+            ) {
+                net_manager_core::xray::apply_stream_sockopts(outbound, sockopts)
+                    .map_err(|_| "Invalid Xray socket settings".to_string())?;
+            }
+        }
+    }
+    let subscription = profile.subscription.as_ref().expect("multinode checked");
+    let failover = XrayFailoverParams {
+        nodes: nodes
+            .iter()
+            .map(|node| XrayFailoverNode {
+                key: net_manager_core::subscription::endpoint_key(&node.url),
+            })
+            .collect(),
+        primary_key,
+        auto_return_primary: subscription.auto_return_primary.unwrap_or(true),
+        probe_url: subscription
+            .probe_url
+            .clone()
+            .unwrap_or_else(|| net_manager_core::subscription::DELAY_PROBE_URL.to_string()),
+        interval_secs: 10,
+    };
+    Ok((config, Some(failover)))
 }
 
 /// Rejects `xray.connect` payloads that would exceed the daemon frame cap.
@@ -292,6 +461,8 @@ pub fn linux_xray_tunnel_status(status: XrayStatusResult, profile: &Profile) -> 
         state: status.state,
         message: (!notices.is_empty()).then(|| notices.join("; ")),
         interface_name: status.interface_name,
+        failover: status.failover,
+        watchdog: status.watchdog,
     }
 }
 
@@ -367,6 +538,8 @@ pub fn linux_openvpn_tunnel_status(status: OpenVpnStatusResult) -> TunnelStatus 
         state,
         message: (!notices.is_empty()).then(|| notices.join("; ")),
         interface_name: status.interface_name,
+        failover: None,
+        watchdog: None,
     }
 }
 
@@ -546,5 +719,7 @@ pub fn linux_wireguard_tunnel_status(status: WireGuardStatusResult) -> TunnelSta
         state: status.state,
         message: (!notices.is_empty()).then(|| notices.join("; ")),
         interface_name: status.interface_name,
+        failover: None,
+        watchdog: None,
     }
 }

@@ -15,7 +15,7 @@
 # Environment (defaults in brackets):
 #   DAEMON_BIN [target/release/network-orchestrator-daemon]
 #   CLI_BIN    [target/release/netorch]
-#   XRAY_DIR   [target/release/xray-package/v26.3.27]
+#   XRAY_DIR   [target/release/xray-package/v26.10.31]
 #   OUT_DIR    [target/release/packages]
 #   INSTALLER_OUT_DIR [target/release/installers]
 set -eu
@@ -26,9 +26,9 @@ umask 022
 
 DAEMON_BIN="${DAEMON_BIN:-target/release/network-orchestrator-daemon}"
 CLI_BIN="${CLI_BIN:-target/release/netorch}"
-XRAY_DIR="${XRAY_DIR:-target/release/xray-package/v26.3.27}"
+XRAY_DIR="${XRAY_DIR:-target/release/xray-package/v26.10.31}"
 OUT_DIR="${OUT_DIR:-target/release/packages}"
-XRAY_VERSION=v26.3.27
+XRAY_VERSION=v26.10.31
 
 SEMVER="$(python3 scripts/versions.py get linux)"
 # 0.10.0-beta.1 sorts before 0.10.0 in SemVer; Debian spells that with a tilde.
@@ -79,7 +79,7 @@ install -Dm0644 "$XRAY_DIR/README.md" "$D/usr/share/doc/network-orchestrator-dae
 install -Dm0644 packaging/linux/xray-NOTICES \
     "$D/usr/share/doc/network-orchestrator-daemon/xray/NOTICES"
 install -Dm0644 LICENSE "$D/usr/share/doc/network-orchestrator-daemon/copyright"
-control network-orchestrator-daemon "systemd, polkitd, iproute2" \
+control network-orchestrator-daemon "systemd, polkitd, iproute2, nftables" \
     "systemd-resolved, wireguard-tools, openvpn" \
     "Replaces: network-orchestrator (<< 0.10.1)
 Breaks: network-orchestrator (<< 0.10.1)" \
@@ -104,7 +104,8 @@ mkdir -p "$C/usr/share/bash-completion/completions" "$C/usr/share/zsh/vendor-com
 chmod 0644 "$C"/usr/share/*/completions/netorch "$C/usr/share/zsh/vendor-completions/_netorch" \
     "$C/usr/share/fish/vendor_completions.d/netorch.fish" 2>/dev/null || true
 install -Dm0644 LICENSE "$C/usr/share/doc/netorch/copyright"
-control netorch "network-orchestrator-daemon (>= ${LINE}.0)" "" "" \
+control netorch "network-orchestrator-daemon (>= ${LINE}.0), libdbus-1-3" "" \
+    "Breaks: network-orchestrator (<< ${LINE}.0)" \
     "Network Orchestrator command line client
  Connects the VPN profiles of Network Orchestrator (WireGuard, OpenVPN and
  Xray) from a terminal or a script, without the graphical app. It talks to the

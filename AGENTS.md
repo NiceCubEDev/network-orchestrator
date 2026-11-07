@@ -15,17 +15,17 @@ Guidance for agents/contributors working in this repository.
 - `crates/engine` — typed connection engine (`Engine`): connect/disconnect/
   status/system proxy/Xray install and the requests to the privileged helper.
   macOS (aarch64) `Engine` is shared by the bridge and the `netorch` CLI
-  (`docs/plans/2026-10-15-19-netorch-cli.md`). On Linux, `linux` holds the pure
-  builders of the daemon's requests (shared with `src-tauri`) and
-  `linux_engine::LinuxEngine` connects/disconnects/reads status through the
-  daemon socket for the Linux CLI. No UI, no FFI.
+  (`docs/plans/2026-10-15-19-netorch-cli.md`). On Linux, `linux` holds pure
+  daemon request builders and `linux_engine::LinuxEngine` serves both CLI and GUI.
+  `linux_session` hosts their unprivileged `netorch serve` runtime: local Xray
+  children and detached daemon client lifetime. No UI, no FFI.
 - `crates/cli` — the `netorch` command line tool. macOS: clap commands over
   `crates/engine` and the bridge's profile/import/routing services; ships in
   the app bundle next to the helper. Linux (`src/linux/`): a client of the
   network daemon built on `LinuxEngine` and the import/subscription code of
-  `crates/core`, no GUI needed; `hold` keeps a connection up in the
-  background (the daemon drops a tunnel 30 s after the user's last client
-  process exits). Plan: `docs/plans/2026-10-28-linux-netorch-cli.md`.
+  `crates/core`, no GUI needed. `serve` is started on demand as one systemd user
+  unit per data directory/daemon socket; no per-profile keepers. The user runtime
+  must stay unprivileged; routes/interfaces/DNS remain system-daemon-only.
 - `crates/macos-bridge` — unprivileged JSON C ABI staticlib the Swift client
   links; every macOS core operation goes through it. A thin JSON wrapper over
   `crates/engine` for runtime operations.
@@ -75,6 +75,10 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 npm run build
 ```
+
+On Linux, append `--exclude net-manager-macos-bridge --exclude
+network-orchestrator-macos-helper` to the workspace check/clippy/test commands:
+those crates use native macOS APIs and must be checked on macOS instead.
 
 CI (`.github/workflows/ci.yml`) is manual-only (`workflow_dispatch`) and
 mirrors this gate on Windows.

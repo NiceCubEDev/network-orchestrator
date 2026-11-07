@@ -5,6 +5,7 @@ CLIENT=@CLIENT@
 VERSION=@VERSION@
 ARCH=@ARCH@
 DAEMON=network-orchestrator-daemon
+WITH_CLI=@WITH_CLI@
 PAYLOAD_SHA256=@PAYLOAD_SHA256@
 PAYLOAD_LINE=@PAYLOAD_LINE@
 
@@ -86,11 +87,17 @@ else
 fi
 
 query_package "$DAEMON"
-if [ "$CLIENT" = netorch ] && [ -z "$old_version" ]; then
-    # Before 0.10.1 the GUI package owned the daemon's files itself.
+if [ "$CLIENT" = netorch ]; then
+    daemon_absent=no
+    [ -n "$old_version" ] || daemon_absent=yes
     query_package network-orchestrator
-    if [ -n "$old_version" ] && dpkg --compare-versions "$old_version" lt 0.10.1; then
-        fail 'The older GUI package includes the daemon. Update it with the GUI installer first, then run the CLI installer.'
+    version_base=${VERSION%%~*}
+    minimum_gui=${version_base%.*}.0
+    if [ -n "$old_version" ]; then
+        if dpkg --compare-versions "$old_version" lt "$minimum_gui" ||
+           { [ "$daemon_absent" = yes ] && dpkg --compare-versions "$old_version" lt 0.10.1; }; then
+            fail 'The installed GUI is older than this shared runtime. Update it with the GUI installer first.'
+        fi
     fi
     query_package "$DAEMON"
 fi
@@ -115,6 +122,30 @@ else
     printf '%s: %s -> update/repair to %s\n' "$DAEMON" "$old_version" "$VERSION"
 fi
 
+install_cli=no
+new_cli=no
+if [ "$WITH_CLI" = yes ]; then
+    query_package netorch
+    install_cli=yes
+    if [ -z "$old_version" ]; then
+        new_cli=yes
+        printf 'netorch: not installed -> install %s\n' "$VERSION"
+    elif dpkg --compare-versions "$old_version" ge "$VERSION" && [ "$old_status" = installed ]; then
+        version_base=${VERSION%%~*}
+        line=${version_base%.*}
+        case "$old_version" in
+            "$line".*) ;;
+            *) fail "netorch belongs to a newer release line ($old_version). Use a newer GUI installer." ;;
+        esac
+        install_cli=no
+        printf 'netorch: %s -> keep shared runtime\n' "$old_version"
+    elif dpkg --compare-versions "$old_version" gt "$VERSION"; then
+        fail "The incomplete netorch installation is newer ($old_version). Repair it with its matching installer."
+    else
+        printf 'netorch: %s -> update/repair to %s\n' "$old_version" "$VERSION"
+    fi
+fi
+
 if [ "$install_daemon" = yes ] && [ "$new_daemon" = no ]; then
     printf 'Updating the daemon will restart its service and may interrupt active connections.\n'
 fi
@@ -123,21 +154,46 @@ if [ "$check_only" = yes ]; then
     exit 0
 fi
 
-if [ "$install_client" = yes ] || [ "$install_daemon" = yes ]; then
-    tar -xzf "$work/payload.tar.gz" -C "$work" client.deb daemon.deb
+if [ "$install_client" = yes ] || [ "$install_daemon" = yes ] || [ "$install_cli" = yes ]; then
+    auto_daemon=$new_daemon
+    auto_cli=$new_cli
+    set --
+    if [ "$install_daemon" = yes ] && [ "$new_daemon" = no ]; then
+        set -- "$@" "$DAEMON"
+    fi
+    if [ "$install_cli" = yes ] && [ "$new_cli" = no ]; then
+        set -- "$@" netorch
+    fi
+    if [ "$#" -gt 0 ]; then
+        auto_marks=$(apt-mark showauto "$@") || fail 'Cannot read dependency installation marks.'
+        for package in $auto_marks; do
+            case "$package" in
+                "$DAEMON") auto_daemon=yes ;;
+                netorch) auto_cli=yes ;;
+            esac
+        done
+    fi
+    set -- client.deb daemon.deb
+    [ "$WITH_CLI" = no ] || set -- "$@" netorch.deb
+    tar -xzf "$work/payload.tar.gz" -C "$work" "$@"
     # APT's _apt user needs read/traverse access to these public package files.
     chmod 0755 "$work"
     chmod 0644 "$work/client.deb" "$work/daemon.deb"
+    [ "$WITH_CLI" = no ] || chmod 0644 "$work/netorch.deb"
     set -- --no-remove install
     [ "$assume_yes" = no ] || set -- "$@" --yes
     [ "$install_daemon" = no ] || set -- "$@" "$work/daemon.deb"
     [ "$install_client" = no ] || set -- "$@" "$work/client.deb"
+    [ "$install_cli" = no ] || set -- "$@" "$work/netorch.deb"
     if ! apt-get "$@"; then
         fail 'APT did not complete the installation. Resolve its reported dependency, hold or package-state error, then run this installer again.'
     fi
     # An existing daemon keeps its original manual/auto mark.
-    if [ "$new_daemon" = yes ]; then
+    if [ "$auto_daemon" = yes ]; then
         apt-mark auto "$DAEMON"
+    fi
+    if [ "$auto_cli" = yes ]; then
+        apt-mark auto netorch
     fi
 else
     printf 'All packages are already up to date.\n'

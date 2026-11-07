@@ -4,6 +4,7 @@ use super::args::UpArgs;
 use super::auth;
 use super::ctx::Ctx;
 use super::endpoints;
+#[cfg(test)]
 use super::hold;
 use super::library;
 use crate::prompt;
@@ -11,31 +12,11 @@ use crate::render::{kind_of, row_of, table};
 use crate::target::{self, Input};
 use net_manager_core::daemon_protocol::OpenVpnCredentials;
 use net_manager_core::models::{Profile, TunnelBackend, TunnelState, TunnelStatus};
-use net_manager_engine::linux::{openvpn_requirements, CredentialSource};
+use net_manager_engine::linux::openvpn_requirements;
 use net_manager_engine::linux_engine::LinuxEngine;
 use serde_json::{json, Value};
 
 pub type Output = (Value, String);
-
-/// No remembered credentials: the CLI has no keyring, so OpenVPN asks every
-/// time (terminal or `--auth-stdin`).
-struct NoRemembered;
-
-impl CredentialSource for NoRemembered {
-    fn load(
-        &self,
-        _: &str,
-        _: &std::path::Path,
-    ) -> Result<
-        (
-            Option<net_manager_core::daemon_protocol::OpenVpnCredentials>,
-            Option<&'static str>,
-        ),
-        String,
-    > {
-        Ok((None, None))
-    }
-}
 
 pub fn ls(ctx: &Ctx) -> Result<Output, String> {
     let profiles = ctx.profiles()?;
@@ -80,6 +61,11 @@ fn state_word(state: TunnelState) -> &'static str {
 }
 
 fn status_json(ctx: &Ctx, profile: &Profile, status: &TunnelStatus) -> Value {
+    let failover = serde_json::to_value(&status.failover).unwrap_or(Value::Null);
+    let active_node = failover
+        .get("activeKey")
+        .and_then(Value::as_str)
+        .and_then(|key| endpoints::node_name(ctx, profile, key));
     json!({
         "server": endpoints::active_name(ctx, profile),
         "id": profile.id,
@@ -88,10 +74,33 @@ fn status_json(ctx: &Ctx, profile: &Profile, status: &TunnelStatus) -> Value {
         "state": state_word(status.state),
         "interface": status.interface_name,
         "message": status.message,
+        "failover": failover,
+        "failoverServer": active_node,
+        "watchdog": status.watchdog,
     })
 }
 
-/// Profiles the daemon runs; the rest are not this CLI's yet.
+/// The node actually carrying traffic: the primary name, or the backup's
+/// name flagged while the failover chain is live.
+fn active_node(ctx: &Ctx, profile: &Profile, status: &TunnelStatus) -> String {
+    let failover = serde_json::to_value(&status.failover).unwrap_or(Value::Null);
+    if let Some(key) = failover.get("activeKey").and_then(Value::as_str) {
+        if let Some(name) = endpoints::node_name(ctx, profile, key) {
+            let on_backup = failover
+                .get("failoverActive")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            return if on_backup {
+                format!("{name} (backup)")
+            } else {
+                name
+            };
+        }
+    }
+    endpoints::active_name(ctx, profile).unwrap_or_default()
+}
+
+/// Profiles supported by the system daemon or shared user runtime.
 fn daemon_profiles(ctx: &Ctx) -> Result<Vec<Profile>, String> {
     Ok(ctx
         .profiles()?
@@ -126,7 +135,7 @@ pub fn status(ctx: &Ctx, target: Option<&str>) -> Result<Output, String> {
                         profile.name.clone(),
                         state_word(status.state).into(),
                         status.interface_name.clone().unwrap_or_default(),
-                        endpoints::active_name(ctx, profile).unwrap_or_default(),
+                        active_node(ctx, profile, status),
                     ]
                 })
                 .collect::<Vec<_>>(),
@@ -168,7 +177,7 @@ pub fn connect(
     }
     let status = auth::run(ctx.root_user, || {
         ctx.engine
-            .connect(&ctx.vault(), profile, credentials.clone(), &NoRemembered)
+            .connect(&ctx.vault(), profile, credentials.clone(), ctx)
     })?;
     if status.state == TunnelState::Failed {
         return Err(status
@@ -179,31 +188,41 @@ pub fn connect(
 }
 
 pub fn up(ctx: &Ctx, args: &UpArgs) -> Result<Output, String> {
+    if ctx.root_user && !args.foreground {
+        return Err(
+            "Use --foreground when connecting as root; the shared user service is unprivileged"
+                .into(),
+        );
+    }
     let mut profile = resolve_or_add(ctx, args)?;
     if let Some(server) = &args.endpoint {
         endpoints::use_endpoint(ctx, &profile.id, Some(server))?;
         profile = ctx.find(&profile.id)?;
     }
-    if !LinuxEngine::handles(&profile) {
-        return Err(format!(
-            "\"{}\" ({}) does not run through the network daemon; netorch connects \
-             WireGuard, OpenVPN and Xray TUN profiles for now",
-            profile.name,
-            kind_of(&profile)
-        ));
-    }
-    let credentials = if profile.backend == TunnelBackend::OpenVpn {
+    let connect_with_prompt = || {
         let needs = openvpn_requirements(&ctx.vault(), &profile)?;
-        prompt::collect(
+        let credentials = prompt::collect(
             needs.user_pass,
             needs.key_passphrase,
             args.auth_stdin,
             args.passphrase_stdin,
-        )?
-    } else {
-        None
+        )?;
+        connect(ctx, &profile, credentials)
     };
-    let status = connect(ctx, &profile, credentials)?;
+    let status = if profile.backend == TunnelBackend::OpenVpn {
+        if args.auth_stdin || args.passphrase_stdin {
+            connect_with_prompt()?
+        } else {
+            match connect(ctx, &profile, None) {
+                Err(error) if error == net_manager_engine::linux_engine::CREDENTIALS_REQUIRED => {
+                    connect_with_prompt()?
+                }
+                result => result?,
+            }
+        }
+    } else {
+        connect(ctx, &profile, None)?
+    };
     let server = endpoints::active_name(ctx, &profile);
     let text = format!(
         "Connected \"{}\"{}{}",
@@ -245,7 +264,6 @@ pub fn down(ctx: &Ctx, target: Option<&str>, all: bool) -> Result<Output, String
             auth::run(ctx.root_user, || ctx.engine.disconnect(profile))?;
             stopped.push(profile.name.clone());
         }
-        hold::stop_keeper(ctx, &profile.id);
     }
     let text = if stopped.is_empty() {
         "No connection is running.".to_string()
@@ -258,7 +276,7 @@ pub fn down(ctx: &Ctx, target: Option<&str>, all: bool) -> Result<Output, String
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::linux::compat;
+    use crate::linux::{compat, route};
     use net_manager_core::daemon_protocol::{method, HelloResult, PROTOCOL_VERSION};
     use net_manager_core::helper_client::HelperError;
     use net_manager_core::models::{PolicyRoute, TunnelRole};
@@ -307,8 +325,12 @@ mod tests {
     }
 
     /// A data directory with one WireGuard profile and one static profile.
-    fn setup(daemon: FakeDaemon) -> (tempfile::TempDir, Ctx, Arc<FakeDaemon>) {
+    fn setup(mut daemon: FakeDaemon) -> (tempfile::TempDir, Ctx, Arc<FakeDaemon>) {
         let dir = tempfile::tempdir().unwrap();
+        daemon
+            .replies
+            .entry(method::OWNED_LIST)
+            .or_insert_with(|| json!({"owners": []}));
         let daemon = Arc::new(daemon);
         let mut ctx = Ctx::new(
             dir.path().to_path_buf(),
@@ -361,15 +383,20 @@ mod tests {
 
     #[test]
     fn status_shows_only_running_connections_and_skips_the_rest() {
-        let (_dir, ctx, daemon) = setup(FakeDaemon {
+        let (_dir, ctx, _) = setup(FakeDaemon {
             replies: HashMap::from([(method::WIREGUARD_STATUS, wg_status("running"))]),
             ..Default::default()
         });
-        let (value, text) = status(&ctx, None).unwrap();
+        let (value, _) = status(&ctx, None).unwrap();
         assert_eq!(value[0]["interface"], "wg-test");
-        assert!(text.contains("running"));
-        // The static profile is not the daemon's: only one daemon call.
-        assert_eq!(daemon.calls.lock().unwrap().len(), 1);
+        assert_eq!(value[0]["state"], "running");
+        let reported: Vec<_> = value
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(reported, ["wg1"]);
     }
 
     #[test]
@@ -410,22 +437,6 @@ mod tests {
     }
 
     #[test]
-    fn up_refuses_a_profile_the_daemon_does_not_run() {
-        let (_dir, ctx, daemon) = setup(FakeDaemon::default());
-        let args = UpArgs {
-            target: "static1".into(),
-            name: None,
-            endpoint: None,
-            foreground: false,
-            auth_stdin: false,
-            passphrase_stdin: false,
-        };
-        let error = up(&ctx, &args).unwrap_err();
-        assert!(error.contains("does not run through the network daemon"));
-        assert!(daemon.calls.lock().unwrap().is_empty());
-    }
-
-    #[test]
     fn up_reports_a_failed_connect_as_an_error() {
         let (_dir, ctx, _) = setup(FakeDaemon {
             replies: HashMap::from([(
@@ -447,24 +458,15 @@ mod tests {
 
     #[test]
     fn down_all_disconnects_only_what_runs() {
-        let (_dir, ctx, daemon) = setup(FakeDaemon {
+        let (_dir, ctx, _) = setup(FakeDaemon {
             replies: HashMap::from([
                 (method::WIREGUARD_STATUS, wg_status("running")),
                 (method::WIREGUARD_DISCONNECT, json!({"stopped": true})),
             ]),
             ..Default::default()
         });
-        let (value, text) = down(&ctx, None, true).unwrap();
-        assert_eq!(value["stopped"][0], "Office");
-        assert_eq!(text, "Disconnected Office");
-        assert_eq!(
-            daemon.calls.lock().unwrap().as_slice(),
-            [
-                method::WIREGUARD_STATUS,
-                method::WIREGUARD_STATUS,
-                method::WIREGUARD_DISCONNECT
-            ]
-        );
+        let (value, _) = down(&ctx, None, true).unwrap();
+        assert_eq!(value["stopped"], json!(["Office"]));
     }
 
     #[test]
@@ -748,6 +750,278 @@ mod tests {
             .lock()
             .unwrap()
             .contains(&method::XRAY_CONNECT.to_string()));
+    }
+
+    fn backup_command(
+        kind: super::super::args::BackupCommand,
+    ) -> super::super::args::BackupCommand {
+        kind
+    }
+
+    #[test]
+    fn backups_form_an_ordered_chain_and_missing_keys_survive() {
+        use super::super::args::BackupCommand::*;
+        let (_dir, ctx, _) = subscription_setup(FakeDaemon {
+            replies: HashMap::from([(method::XRAY_STATUS, xray_status("stopped"))]),
+            ..Default::default()
+        });
+        let (_, text) = endpoints::backup(
+            &ctx,
+            backup_command(Set {
+                profile: "sub1".into(),
+                servers: vec!["gamma".into(), "beta".into()],
+            }),
+        )
+        .unwrap();
+        assert!(text.contains("Gamma DE, then Beta NL"), "{text}");
+        let meta = ctx.find("sub1").unwrap().subscription.unwrap();
+        assert_eq!(meta.backup_keys.len(), 2);
+        // A remembered-but-gone key is kept: it may reappear on refresh.
+        endpoints::backup(
+            &ctx,
+            backup_command(Set {
+                profile: "sub1".into(),
+                servers: vec!["deadbeefdeadbeef".into(), "beta".into()],
+            }),
+        )
+        .unwrap();
+        let (value, text) = endpoints::backup(
+            &ctx,
+            backup_command(Show {
+                profile: "sub1".into(),
+            }),
+        )
+        .unwrap();
+        assert!(text.contains("backup 1"), "{text}");
+        assert_eq!(value["backups"].as_array().unwrap().len(), 2);
+        assert_eq!(value["backups"][0]["missing"], true);
+        assert_eq!(value["autoReturn"], true);
+        // The primary cannot be its own backup.
+        assert!(endpoints::backup(
+            &ctx,
+            backup_command(Add {
+                profile: "sub1".into(),
+                server: "alpha".into(),
+            }),
+        )
+        .is_err());
+        endpoints::backup(
+            &ctx,
+            backup_command(Rm {
+                profile: "sub1".into(),
+                server: "deadbeefdeadbeef".into(),
+            }),
+        )
+        .unwrap();
+        let meta = ctx.find("sub1").unwrap().subscription.unwrap();
+        assert_eq!(meta.backup_keys.len(), 1);
+        endpoints::backup(
+            &ctx,
+            backup_command(Auto {
+                profile: "sub1".into(),
+                enabled: super::super::args::BoolOnOff::Off,
+            }),
+        )
+        .unwrap();
+        let meta = ctx.find("sub1").unwrap().subscription.unwrap();
+        assert_eq!(meta.auto_return_primary, Some(false));
+    }
+
+    #[test]
+    fn pinned_routes_bind_domains_to_a_node_and_unpin_frees_them() {
+        let (_dir, ctx, _) = subscription_setup(FakeDaemon {
+            replies: HashMap::from([(method::XRAY_STATUS, xray_status("stopped"))]),
+            ..Default::default()
+        });
+        let (value, text) = route::run(
+            &ctx,
+            super::super::args::RouteCommand::Pin {
+                profile: "sub1".into(),
+                via: "beta".into(),
+                selector: vec!["domain:bank.test".into(), "geosite:category-gov".into()],
+            },
+        )
+        .unwrap();
+        assert!(text.contains("Beta NL"), "{text}");
+        assert_eq!(value["selectors"].as_array().unwrap().len(), 2);
+        let profile = ctx.find("sub1").unwrap();
+        assert_eq!(profile.pinned_policies.len(), 1);
+        assert_eq!(profile.pinned_policies[0].selectors.len(), 2);
+        // Addresses and geoip selectors do not pin; domain rules do.
+        assert!(route::run(
+            &ctx,
+            super::super::args::RouteCommand::Pin {
+                profile: "sub1".into(),
+                via: "beta".into(),
+                selector: vec!["203.0.113.9".into()],
+            },
+        )
+        .is_err());
+        // The same selector cannot follow two routes.
+        assert!(route::run(
+            &ctx,
+            super::super::args::RouteCommand::Add {
+                profile: "sub1".into(),
+                rules: super::super::args::RuleArgs {
+                    proxy: vec!["domain:bank.test".into()],
+                    ..Default::default()
+                },
+            },
+        )
+        .is_err());
+        let (_, text) = route::run(
+            &ctx,
+            super::super::args::RouteCommand::Unpin {
+                profile: "sub1".into(),
+                via: "beta".into(),
+                selector: vec![],
+            },
+        )
+        .unwrap();
+        assert!(text.contains("Unpinned"), "{text}");
+        assert!(ctx.find("sub1").unwrap().pinned_policies.is_empty());
+    }
+
+    #[test]
+    fn pool_filters_bind_countries_and_clear_turns_the_pool_off() {
+        use super::super::args::{BackupCommand::*, PoolCommand};
+        let (_dir, ctx, _) = subscription_setup(FakeDaemon::default());
+        let (value, _) = endpoints::backup(
+            &ctx,
+            Pool(PoolCommand::Set {
+                profile: "sub1".into(),
+                filters: vec!["DE:erman|Герман".into()],
+                no_verify: false,
+            }),
+        )
+        .unwrap();
+        let meta = ctx.find("sub1").unwrap().subscription.unwrap();
+        let pool = meta.node_pool.unwrap();
+        assert!(pool.verify_exit_country);
+        assert_eq!(pool.filters.len(), 1);
+        assert_eq!(pool.filters[0].exit_country.as_deref(), Some("DE"));
+        assert_eq!(pool.filters[0].name_contains.len(), 2);
+        assert_eq!(value["pool"]["verifyExitCountry"], true);
+        // Country-less filters need --no-verify, which cannot promise exits.
+        assert!(endpoints::backup(
+            &ctx,
+            Pool(PoolCommand::Set {
+                profile: "sub1".into(),
+                filters: vec!["erman".into()],
+                no_verify: false,
+            }),
+        )
+        .is_err());
+        assert!(endpoints::backup(
+            &ctx,
+            Pool(PoolCommand::Set {
+                profile: "sub1".into(),
+                filters: vec!["DE:erman".into()],
+                no_verify: true,
+            }),
+        )
+        .is_err());
+        let (_, text) = endpoints::backup(
+            &ctx,
+            Pool(PoolCommand::Show {
+                profile: "sub1".into(),
+            }),
+        )
+        .unwrap();
+        assert!(text.contains("DE:erman|Герман"), "{text}");
+        endpoints::backup(
+            &ctx,
+            Pool(PoolCommand::Clear {
+                profile: "sub1".into(),
+            }),
+        )
+        .unwrap();
+        let meta = ctx.find("sub1").unwrap().subscription.unwrap();
+        assert!(meta.node_pool.is_none());
+        assert!(meta.pool_keys.is_empty());
+    }
+
+    #[test]
+    fn quic_reject_is_a_profile_flag_shown_with_the_rules() {
+        let (_dir, ctx, _) = subscription_setup(FakeDaemon::default());
+        let (_, text) = route::run(
+            &ctx,
+            super::super::args::RouteCommand::Quic {
+                profile: "sub1".into(),
+                enabled: Some(super::super::args::BoolOnOff::On),
+            },
+        )
+        .unwrap();
+        assert!(text.contains("on"), "{text}");
+        assert!(ctx.find("sub1").unwrap().xray_quic_reject);
+        let (value, _) = route::run(
+            &ctx,
+            super::super::args::RouteCommand::Quic {
+                profile: "sub1".into(),
+                enabled: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(value["quicReject"], true);
+        route::run(
+            &ctx,
+            super::super::args::RouteCommand::Quic {
+                profile: "sub1".into(),
+                enabled: Some(super::super::args::BoolOnOff::Off),
+            },
+        )
+        .unwrap();
+        assert!(!ctx.find("sub1").unwrap().xray_quic_reject);
+    }
+
+    #[test]
+    fn flag_country_reads_regional_indicators() {
+        assert_eq!(
+            crate::linux::endpoints::flag_country("🇷🇺 Россия"),
+            Some("RU".into())
+        );
+        assert_eq!(crate::linux::endpoints::flag_country("Beta NL"), None);
+    }
+
+    #[test]
+    fn migration_preview_reports_and_apply_refuses_unsupported_rules() {
+        use super::super::args::MigrateCommand::*;
+        let (_dir, ctx, _) = subscription_setup(FakeDaemon::default());
+        let source_dir = tempfile::tempdir().unwrap();
+        let file = source_dir.path().join("config.json");
+        std::fs::write(
+            &file,
+            r#"{"outbounds":[
+                {"tag":"proxy","protocol":"vless"},
+                {"tag":"direct","protocol":"freedom"},
+                {"tag":"block","protocol":"blackhole"},
+                {"tag":"exotic","protocol":"vless"}
+              ],
+              "routing":{"rules":[
+                {"type":"field","domain":["domain:home.test"],"outboundTag":"direct"},
+                {"type":"field","domain":["domain:mystery.test"],"outboundTag":"exotic"}
+              ]}}"#,
+        )
+        .unwrap();
+        let (value, _) = crate::linux::migrate::run(
+            &ctx,
+            Preview {
+                profile: "sub1".into(),
+                from: file.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(value["policies"]["direct"], 1, "{value}");
+        assert!(crate::linux::migrate::run(
+            &ctx,
+            Apply {
+                profile: "sub1".into(),
+                from: file,
+            },
+        )
+        .is_err());
+        // The refused apply changed nothing.
+        assert!(ctx.find("sub1").unwrap().domain_policies.is_empty());
     }
 
     #[test]

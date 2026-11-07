@@ -98,6 +98,10 @@ mod linux {
         // Recovery runs before the socket exists, so no client can observe
         // (or race with) leftovers from a previous run.
         let intents = IntentStore::new(options.state_dir.join("intents"));
+        let watchdog_network = network_orchestrator_daemon::watchdog::WatchdogNetwork {
+            netlink: netlink.clone(),
+            runtime: tokio::runtime::Handle::current(),
+        };
         let core = tokio::task::spawn_blocking(move || {
             let mut core = DaemonCore::open_with_all(
                 store,
@@ -110,6 +114,7 @@ mod linux {
                 Box::new(TrustedOpenVpnProcess::new()),
                 Box::new(TrustedXrayProcess::new()),
             )?;
+            core.set_watchdog_network(watchdog_network);
             core.intents = Some(intents);
             // Routing intents re-arm the same way: the store survives the
             // journal wipe `open` just did. Best effort either way — the

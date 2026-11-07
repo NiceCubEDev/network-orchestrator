@@ -60,6 +60,171 @@ daemon plus `wireguard-tools` or `openvpn`; per-link DNS needs
 No backend is silently downloaded or updated; the Profiles tab shows which
 backends were found.
 
+### Linux Xray subscriptions: backups and pinned nodes
+
+One Xray TUN can use a primary subscription server, an ordered chain of
+backups, and independent nodes for domain rules. In Profiles, use the
+endpoint-row controls to add/reorder backups and the **Pinned to a node**
+section to assign domain selectors. These settings are shared with `netorch`:
+
+```bash
+netorch endpoints work
+netorch backup set work "Germany" "Finland"
+netorch backup show work
+netorch route pin work --via "Netherlands" --selector domain:example.com
+netorch route show work
+netorch up work
+netorch status work
+```
+
+Servers may be selected by number, name, or a unique name fragment.
+`backup add|rm|clear` edits the chain; `route unpin` removes a pin.
+Settings saved while connected take effect on reconnect.
+
+The daemon probes each candidate through that node using HTTPS
+(`https://connectivitycheck.gstatic.com/generate_204` by default).
+It prefers the primary, tries backups in their saved order, and automatically
+returns when the primary recovers. `backup auto work off` keeps a healthy
+backup instead. Probes contact an external service and reveal the node's
+exit IP to it. Two consecutive failed/successful observations change a known
+node's health; checks are bounded but switching is not instantaneous.
+Existing connections may break when an exit changes.
+
+Pinned traffic never falls back to another node or direct. A missing pinned
+server stays configured and blocks its selectors; missing backup servers
+are retained but skipped. If all default-path candidates fail, that traffic
+is blocked; explicit direct rules still remain direct. This is not an
+OS-level kill switch when the whole tunnel is stopped.
+
+#### Named per-command proxy exits (Linux)
+
+Names are saved in the netorch profile, not executable hooks in an imported
+Xray config. Choose ordinary profile rules, a fixed subscription node, an
+independent ordered pool, or the daemon's marked direct outbound:
+
+```bash
+netorch proxy set default --profile work --rules
+netorch proxy set nl --profile work --via "Netherlands"
+netorch proxy set ru --profile work --pool "Moscow" "Saint Petersburg"
+netorch proxy set direct --profile work --direct
+netorch proxy list --profile work
+netorch up work
+netorch proxy nl -- curl https://example.com
+netorch proxy ru -- curl https://example.com
+netorch proxy direct -- curl https://example.com
+netorch proxy --profile work default -- curl https://example.com
+netorch proxy remove nl --profile work
+```
+
+Use your own endpoint names, numbers or stable keys. Exit names are arbitrary
+lowercase ASCII letters/digits/`-`/`_`, 1–32 characters, starting with a letter
+or digit; `list`, `set`, `remove` and `help` are reserved. A profile supports
+16 exits and each pool 1–8 unique, ordered nodes. Duplicate names across
+profiles require `--profile` before the exit name.
+
+Configuration and listing work offline. Launch requires an already connected
+Xray **TUN** profile and an updated Linux daemon supporting `xray.proxyExits`.
+Adding/changing listeners requires an explicit disconnect/reconnect; launch
+never starts, reloads or restarts the VPN. A stale or removed saved exit refuses
+before running the command. Node/pool settings retain missing keys and block
+instead of choosing an unconfigured endpoint. Pools probe their own members
+with the profile's HTTPS probe target, prefer the first healthy member and
+return to it after recovery; an all-down pool blocks, even if the main exit is
+healthy. They do not change the default exit. Explicit named nodes are excluded
+from automatic main-pool recruitment, but may still be selected as primary or
+manual backups.
+
+`--rules` retains profile routing, including blocks. Fixed node, pool and direct
+exits override those routing rules, including blocks, for their own listeners.
+`direct` uses marked daemon sockets to bypass this profile's TUN; it does not
+merely clear proxy variables or promise to bypass another VPN/firewall.
+
+Commands are executed as the invoking user with their original argument vector,
+terminal, exit status and signals; no shell is inserted. Both case spellings of
+`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and `NO_PROXY` are replaced. HTTP(S) uses
+the exit's loopback HTTP proxy; SOCKS uses `socks5h` for proxy-side name resolution.
+The bypass list is empty by default, even when the parent has `NO_PROXY=*`.
+To explicitly exempt destinations, save the exit with
+`--no-proxy 'internal.example,10.0.0.0/8'`; changing only that list applies to the
+next command without reconnecting. These exceptions use normal system routing,
+which can still traverse the TUN.
+
+This is **not process network isolation**: programs must honor proxy environment
+variables, and arbitrary UDP is not covered. The loopback listeners are
+unauthenticated and usable by other local processes while the profile is active.
+
+#### Filtered backup pools and exit-country checks
+
+Pools are opt-in and come after explicit backups in the eight-node default
+chain. Primary, manual backups, domain pins and the fixed DNS node are never
+automatically recruited into a pool.
+
+```bash
+netorch backup pool set work 'CA:Canada|Канада' 'FI:'
+netorch backup pool rebuild work
+netorch backup pool show work
+netorch backup verify work
+netorch backup pool clear work
+```
+
+`CC:words` matches any supplied name term and requires the measured country;
+`CC:` accepts any name with that measured exit country. A flag or country in a
+server name is only a hint, not verification. Name-only selection is explicit:
+`netorch backup pool set work --no-verify 'Canada|Канада'`.
+It does not require Xray or make country requests.
+
+Verified rebuilds and `backup verify` run temporary unprivileged loopback Xray
+processes and contact `api.country.is` / `ipinfo.io` through each candidate.
+Those services see its exit IP; no host routes are changed. Rebuilds bound
+candidate count, concurrency, response size and duration. Enabled pools also
+rebuild after subscription refresh. An outage retains eligible previous
+members, but a positively wrong country or a newly explicit choice removes a
+member. Clearing the pool leaves manual backups and pins unchanged.
+
+#### Importing an existing Xray policy
+
+```bash
+netorch migrate preview work --from "$HOME/vpn/config.json"
+netorch migrate apply work --from "$HOME/vpn/config.json"
+netorch route quic work on
+```
+
+The app exposes the same operations under **Backup pool** and **Import local
+Xray policy**. Disconnect before applying. Import reads the source without
+changing it; previews show counts, supported settings and refusal categories,
+not configuration contents or credentials.
+
+The importer maps nodes against the subscription and preserves the selected
+primary. It transfers representable domain/IP rules, fixed domain and DNS
+egress, DNS rewriting/scheduling, IP/port guards, interface-bound policies,
+connection idle and socket settings, TUN MTU/DNS and custom geodata URLs.
+A source default balancer becomes an ordered explicit backup chain rather than
+least-ping load balancing. Existing pins are retained; conflicting pins and
+unrepresentable conditions block the entire apply. Dedicated
+`proxy-ru` / `proxy-nl` / `direct` wrapper listeners are not imported.
+
+Linux's pinned Xray is **26.10.31**, including DNS rewrite support. Its bundled
+GeoIP Lite / GeoSite Standard data differs from older full country databases;
+custom imported geodata URLs remain explicit overrides.
+Use TLS or Reality for public VLESS endpoints; unencrypted VLESS test peers
+must use private addresses with this backend.
+
+#### Recovery and QUIC
+
+The daemon observes the physical gateway, device and selected source. An
+unchanged DHCP renewal does not reset established connections; a real underlay
+change rebinds owned endpoint bypasses and restarts only its managed child.
+Offline recovery waits for the uplink. Bounded HTTPS/DNS probes, fixed-pin
+health, owned-child UDP socket counts and inner application connection storms
+are visible in the profile and CLI status. DNS-only failures and connection
+storms are diagnostic, not reasons to reset a healthy HTTPS path.
+
+`route quic … on` installs an owned, tunnel-scoped UDP/443 **REJECT** using
+`nftables`, so clients can immediately fall back to TCP. `off` removes that rule;
+it does not install a silent drop. Disconnect removes only the daemon's table.
+
+
+
 ## Features (MVP-0–4)
 
 - **Network Explorer** — interface inventory (addresses, DNS, MTU, state),
@@ -161,14 +326,14 @@ scripts/build-linux-arch.sh
 
 For Debian/Ubuntu, distribute the single-file installers under
 `target/release/installers/`: `netorch-<version>-amd64.run` for the CLI and
-`network-orchestrator-<version>-amd64.run` for the GUI. Each contains its client
-and the shared daemon; users do not download a daemon package separately.
+`network-orchestrator-<version>-amd64.run` for the GUI. The CLI installer includes
+the shared daemon; the GUI installer includes both `netorch` and that daemon.
 
 ```bash
-sh ./netorch-0.10.1-amd64.run --check  # preview installed versions and planned actions
-sudo sh ./netorch-0.10.1-amd64.run    # install CLI or update an older installation
-# Later, add the GUI using the same daemon:
-sudo sh ./network-orchestrator-0.10.1-amd64.run
+sh ./netorch-0.14.0-amd64.run --check  # preview without installing
+sudo sh ./netorch-0.14.0-amd64.run
+# The GUI installer also installs/reuses netorch:
+sudo sh ./network-orchestrator-0.14.0-amd64.run
 ```
 
 Run the installer from a newer release to update. It compares installed Debian
@@ -181,11 +346,43 @@ The client and daemon are bundled; missing distribution dependencies may need
 internet access and current APT indexes. No application repository is required.
 When migrating from the former combined GUI package (0.10.0 or earlier), run the
 new GUI installer first to transfer the daemon files, then add the CLI.
+Do not mix an older GUI release line with the new shared CLI runtime; use the
+matching GUI installer to update both clients together.
 
 The CLI and daemon `.deb` files remain under `target/release/packages/`, the GUI
 `.deb` and `.rpm` under `target/release/bundle/{deb,rpm}/`, and the Arch package
-under `target/arch/`. RPM and Arch still use their existing packaging. The Arch
-build uses a disposable Docker container.
+under `target/arch/`. RPM and Arch contain GUI, CLI, daemon and the pinned Xray.
+The Arch build uses a disposable Docker container; on Arch/CachyOS install the
+resulting `target/arch/network-orchestrator-*.pkg.tar.zst` with `sudo pacman -U`.
+
+### One Linux backend, two clients
+
+`netorch` is the headless client; the GUI calls the same `LinuxEngine`, not a
+second connection implementation or a CLI subprocess for each action.
+Both use `${XDG_DATA_HOME:-$HOME/.local/share}/com.netmanager.app/` by default:
+profiles, managed configs, subscriptions, executable settings and remembered
+OpenVPN credentials are shared. `NETORCH_DATA_DIR` selects an absolute isolated
+data directory for either client; CLI `--data-dir` overrides it. The development
+GUI retains its separate `com.netmanager.app.dev` identity and daemon socket.
+Profile writes use an OS file lock and atomic replacement; CLI changes refresh
+the open GUI through its existing `route-changed` event.
+
+One unprivileged `netorch serve` process per data directory/daemon socket owns
+local Xray SOCKS/HTTP children and retains the daemon connection for detached
+WireGuard, OpenVPN, Xray TUN and static-route profiles. It starts on demand as
+a transient systemd user unit. Closing the GUI or the invoking shell does not
+disconnect it; either client can inspect/disconnect the same connection.
+Routes, interfaces and DNS remain polkit-authorized operations of the system
+daemon, never of the user service. Raw Xray JSON imports default to SOCKS mode.
+
+The user manager must be available (`systemctl --user status`). Without one,
+run `netorch serve` in a separate foreground session using the same data
+directory and daemon socket. User units normally stop at logout; keeping them
+across logout requires an explicit administrator-approved linger setting
+(`loginctl enable-linger "$USER"`). Nothing enables linger automatically.
+`netorch up --foreground` disconnects on interrupt, termination or terminal
+hangup. Root connections require `--foreground` and never launch the user service.
+
 
 ## Development
 

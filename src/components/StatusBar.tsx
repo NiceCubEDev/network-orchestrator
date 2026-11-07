@@ -94,8 +94,8 @@ export default function StatusBar({ activeCount }: StatusBarProps) {
           />
           Xray:{" "}
           <span className="status-bar-mono">
-            {xray.available && xray.version
-              ? xray.version
+            {xray.available
+              ? xray.version || t("statusbar.state.ready")
               : t("statusbar.state.absent")}
           </span>
         </span>

@@ -171,6 +171,9 @@ impl XrayExecutor {
             ipv6_covered: running,
             rx_bytes: None,
             tx_bytes: None,
+            failover: None,
+            watchdog: None,
+            proxy_exits: Vec::new(),
         }
     }
 
@@ -184,6 +187,9 @@ impl XrayExecutor {
             ipv6_covered: false,
             rx_bytes: None,
             tx_bytes: None,
+            failover: None,
+            watchdog: None,
+            proxy_exits: Vec::new(),
         }
     }
 
@@ -218,6 +224,11 @@ impl XrayExecutor {
     pub fn connect(&self, uid: u32, params: XrayConnectParams) -> Result<XrayConnectResult, Error> {
         if params.profile_id.is_empty() || params.profile_id.len() > 128 {
             return Err(Error::Invalid("invalid profile id".into()));
+        }
+        if !params.proxy_exits.is_empty() {
+            return Err(Error::Invalid(
+                "named process proxy exits are supported only on Linux".into(),
+            ));
         }
         let base: serde_json::Value = serde_json::from_str(&params.config)
             .map_err(|_| Error::Invalid("the Xray configuration is not valid JSON".into()))?;
@@ -714,6 +725,12 @@ mod tests {
             geo_assets: None,
             macos_data_root: None,
             role: Default::default(),
+            failover: None,
+            reject_quic: false,
+            probe_url: None,
+            mtu: None,
+            service_checks: Vec::new(),
+            proxy_exits: Vec::new(),
         }
     }
 

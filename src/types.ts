@@ -138,6 +138,137 @@ export interface DomainPolicy {
   target: DomainRouteTarget;
 }
 
+/** Linux multinode: selectors routed fail-closed through one specific
+ * subscription node (`node-<endpointKey>`); a missing or down node blocks
+ * them — they never fall back to direct or another node. */
+export interface PinnedRoute {
+  selectors: string[];
+  endpointKey: string;
+  /** The node left the subscription; kept so it works if it reappears. */
+  missing?: boolean;
+}
+
+/** Linux `netorch proxy NAME`: where a spawned command's traffic exits —
+ * the normal profile rules, one fixed node, an ordered pool or direct. */
+export type ProxyTarget =
+  | { kind: "rules" }
+  | { kind: "node"; endpointKey: string }
+  | { kind: "pool"; endpointKeys: string[] }
+  | { kind: "direct" };
+
+/** One named proxy exit; owned by the proxy commands — a profile form save
+ * carries it back unchanged, never edits it. */
+export interface NamedProxyExit {
+  name: string;
+  target: ProxyTarget;
+  /** Explicit per-command proxy opt-outs; empty means proxy everything. */
+  noProxy?: string[];
+}
+
+export interface ServiceCheck {
+  id: string;
+  name: string;
+  url: string;
+  endpointKey: string;
+  background: boolean;
+}
+
+export type ServiceCheckOutcome = "http" | "timeout" | "tlsError" | "transportError" | "unavailable";
+
+export interface ServiceCheckResult {
+  id: string;
+  name: string;
+  endpointKey: string;
+  outcome: ServiceCheckOutcome;
+  httpStatus: number | null;
+  latencyMs: number | null;
+  checkedAtUnix: number;
+  consecutiveFailures: number;
+  degraded: boolean;
+}
+
+/** A remembered node reference in `backupKeys`: key plus last known name. */
+export interface EndpointRef {
+  key: string;
+  name: string;
+}
+
+/** Opt-in pool: a node joins when ANY filter matches; a filter is name
+ * substrings plus an optional verified exit country (`CC:word` in the CLI). */
+export interface NodePoolFilter {
+  nameContains: string[];
+  exitCountry: string | null;
+}
+
+export interface NodePoolSettings {
+  filters: NodePoolFilter[];
+  /** Probe each candidate's real exit country through a temporary Xray. */
+  verifyExitCountry: boolean;
+}
+
+/** One candidate's verdict from a pool rebuild (NodePoolReport entry). */
+export interface PoolProbeEntry {
+  key: string;
+  name: string;
+  verdict: "member" | "explicit" | "unreachable" | "wrongCountry" | "skipped";
+  exitCountry: string | null;
+}
+
+export interface NodePoolReport {
+  probedAtUnix: number;
+  members: EndpointRef[];
+  entries: PoolProbeEntry[];
+  poolChanged: boolean;
+  /** Nothing usable answered; the previous pool was kept. */
+  keptPrevious: boolean;
+}
+
+/** Real exit verification of one failover candidate (backup verify). */
+export interface SubscriptionExitCheck {
+  key: string;
+  name: string;
+  role: string;
+  /** Country the display name claims (flag emoji), if any. */
+  namedCountry: string | null;
+  exitCountry: string | null;
+  exitIp: string | null;
+  /** Named country ≠ verified exit. */
+  mismatch: boolean;
+  error: string | null;
+}
+
+/** Sanitized client view of a local Xray policy migration. */
+export interface XrayPolicyPreview {
+  direct: number;
+  proxy: number;
+  block: number;
+  pinnedCount: number;
+  privateLanDirect: boolean;
+  quicReject: boolean;
+  domainStrategy: XrayDomainStrategy | null;
+  domainMatcher: XrayDomainMatcher | null;
+  endpointBypassCount: number;
+  hasGeoipOverride: boolean;
+  hasGeositeOverride: boolean;
+  hasDns: boolean;
+  hasSockopts: boolean;
+  trafficRuleCount: number;
+  interfaceRouteCount: number;
+  dnsServerCount: number;
+  dnsHostCount: number;
+  dnsRewriteRuleCount: number;
+  tunDnsServerCount: number;
+  tunMtu: number | null;
+  connectionIdleSecs: number | null;
+  directDomainStrategy: string | null;
+  dnsEnableParallelQuery: boolean | null;
+  hasDnsOutbound: boolean;
+  backupCount: number | null;
+  skipped: string[];
+  /** Rules with no equivalent — apply is refused while non-empty. */
+  refused: string[];
+}
+
 export type XrayDomainStrategy = "asIs" | "ipIfNonMatch" | "ipOnDemand";
 export type XrayDomainMatcher = "mph" | "hybrid" | "linear";
 export type XrayDnsQueryStrategy = "useIp" | "useIpv4" | "useIpv6";
@@ -156,6 +287,43 @@ export interface XrayDnsConfig {
   hosts: Record<string, string[]>;
   fakeDns: boolean;
   queryStrategy: XrayDnsQueryStrategy | null;
+  enableParallelQuery?: boolean | null;
+  outboundKey?: string | null;
+  outbound?: XrayDnsOutboundSettings | null;
+}
+
+export interface XraySockopts {
+  tcpKeepAliveIdle?: number | null;
+  tcpKeepAliveInterval?: number | null;
+  tcpUserTimeout?: number | null;
+  tcpNoDelay: boolean;
+}
+
+export interface XrayTrafficRule {
+  ips: string[];
+  port: number;
+  network: string;
+  target: DomainRouteTarget;
+}
+
+export interface XrayInterfaceRoute {
+  selectors: string[];
+  interfaceName: string;
+  domainStrategy?: string | null;
+}
+
+export interface XrayDnsRewriteRule {
+  action: string;
+  qType?: string | null;
+  rCode?: number | null;
+  domain?: string[];
+}
+
+export interface XrayDnsOutboundSettings {
+  rewriteAddress?: string | null;
+  rewriteNetwork?: string | null;
+  rewritePort?: number | null;
+  rules?: XrayDnsRewriteRule[];
 }
 
 /** Result of `parse_happ_routing`: fields recovered from a Happ/Incy
@@ -208,6 +376,13 @@ export interface SubscriptionMeta {
   hwid: string;
   endpointCount: number;
   activeIndex: number;
+  /** Stable key of the primary node; `activeIndex` is only a legacy hint. */
+  activeKey?: string | null;
+  /** Ordered, user-chosen backup nodes; keys may be absent from the current
+   * subscription list (kept, shown as missing). */
+  backupKeys?: EndpointRef[];
+  /** Probe the primary over HTTPS and return when healthy; absent = true. */
+  autoReturnPrimary?: boolean | null;
   refreshIntervalMinutes: number | null;
   lastRefreshAtUnix: number | null;
   lastRefreshError: string | null;
@@ -218,6 +393,10 @@ export interface SubscriptionMeta {
   webPageUrl: string | null;
   updateIntervalHours: number | null;
   skippedProtocols: string[];
+  /** Opt-in filtered pool (`null` = off); members verified by rebuild. */
+  nodePool?: NodePoolSettings | null;
+  /** Verified pool members appended after `backupKeys` in failover order. */
+  poolKeys?: EndpointRef[];
 }
 
 export interface SubscriptionUserInfo {
@@ -228,9 +407,62 @@ export interface SubscriptionUserInfo {
 }
 
 export interface SubscriptionEndpointInfo {
+  /** Stable 16-hex key of the node (never the share-link URL). */
+  key: string;
   name: string;
   active: boolean;
   protocol: string | null;
+  /** Member of the ordered backup chain. */
+  isBackup: boolean;
+  /** Kept from backups/pins but gone from the subscription list. */
+  isMissing: boolean;
+  /** Verified member of the opt-in filtered pool. */
+  inPool?: boolean;
+}
+
+/** One suspected outbound connection storm the watchdog saw. */
+export interface ConnStorm {
+  destination: string;
+  process: string | null;
+  count: number;
+}
+
+/** Bounded recovery diagnostics from the daemon's connect watchdog
+ * (TunnelStatus.watchdog; `null` when the core doesn't provide it). */
+export interface WatchdogStatus {
+  /** Physical uplink answers; `null` = not measured yet. */
+  uplink: boolean | null;
+  /** Fingerprint of the egress route (gw+dev+src), not a secret. */
+  egressSignature: string | null;
+  lastEgressChangeUnix: number | null;
+  httpsStallStreak: number;
+  httpsLatencyMs: number | null;
+  dnsStallStreak: number;
+  /** Explicit opt-in service diagnostics; absent means no readings. */
+  serviceChecks?: ServiceCheckResult[];
+  /** UDP sockets xray holds — a leak foreshadows port exhaustion. */
+  xrayUdpSockets: number;
+  connStorm: ConnStorm | null;
+  lastRecoveryUnix: number | null;
+  /** Human-readable anomalies the watchdog noticed (sanitized). */
+  anomalies: string[];
+}
+
+/** Per-node failover health from the daemon (TunnelStatus.failover). */
+export interface XrayNodeStatus {
+  key: string;
+  /** null = not probed yet. */
+  healthy: boolean | null;
+  lastProbeUnix: number | null;
+  latencyMs: number | null;
+}
+
+export interface XrayFailoverStatus {
+  primaryKey: string;
+  activeKey: string;
+  autoReturnPrimary: boolean;
+  failoverActive: boolean;
+  nodes: XrayNodeStatus[];
 }
 
 export interface SubscriptionRefreshResult {
@@ -239,6 +471,7 @@ export interface SubscriptionRefreshResult {
   skippedCount: number;
   fallbackUsed: boolean;
   cleanupFailed: boolean;
+  poolReport?: NodePoolReport | null;
 }
 
 export interface SubscriptionDelayResult {
@@ -275,6 +508,9 @@ export interface Profile {
   proxyBypass: string[];
   subscription: SubscriptionMeta | null;
   xrayMode: XrayMode;
+  /** Linux: domain selectors fail-closed to a specific subscription node. */
+  pinnedPolicies?: PinnedRoute[];
+  xrayServiceChecks?: ServiceCheck[];
   /** macOS: a secondary connection carries only `tunnelNetworks`. */
   tunnelRole?: "primary" | "secondary";
   tunnelNetworks?: string[];
@@ -289,6 +525,19 @@ export interface Profile {
   xrayDns?: XrayDnsConfig;
   /** Linux TUN: def1 halves instead of a single default route. */
   xraySplitDefault?: boolean;
+  /** Linux TUN: kernel rejects outbound UDP/443 on the tunnel interface so
+   * QUIC fails fast and browsers fall back to TCP (instead of the silent
+   * blackhole a plain routing rule gives). */
+  xrayQuicReject?: boolean;
+  xraySockopts?: XraySockopts | null;
+  xrayTrafficRules?: XrayTrafficRule[];
+  xrayInterfaceRoutes?: XrayInterfaceRoute[];
+  xrayConnectionIdleSecs?: number | null;
+  xrayTunMtu?: number | null;
+  xrayTunDnsServers?: string[];
+  xrayDirectDomainStrategy?: string | null;
+  /** Linux `netorch proxy` named exits; opaque to the profile form. */
+  xrayProxyExits?: NamedProxyExit[];
   /** Hosts pinned to the physical uplink, bypassing foreign capture tunnels. */
   endpointBypasses?: string[];
   /** Keep declared routes armed while the target interface is absent. */
@@ -308,6 +557,10 @@ export interface TunnelStatus {
   message: string | null;
   /** Live kernel interface name reported by the daemon when running. */
   interfaceName?: string | null;
+  /** Linux multinode: which node carries traffic and per-node health. */
+  failover?: XrayFailoverStatus | null;
+  /** Linux: bounded recovery diagnostics from the connect watchdog. */
+  watchdog?: WatchdogStatus | null;
 }
 
 export interface AutoConnectResult {

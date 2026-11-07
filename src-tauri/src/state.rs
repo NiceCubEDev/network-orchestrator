@@ -6,6 +6,7 @@ use net_manager_core::managed_xray;
 use net_manager_core::managed_xray::MANAGED_XRAY_VERSION;
 use net_manager_core::models::*;
 use net_manager_core::profiles::{ProfileDocument, ProfileStore};
+#[cfg(any(not(target_os = "linux"), test))]
 use net_manager_core::system_proxy::SystemProxyManager;
 use net_manager_core::vpn::{self, TunnelManager};
 use std::io;
@@ -15,6 +16,7 @@ use std::sync::atomic::AtomicBool;
 pub(crate) struct RuntimeState {
     pub(crate) tunnels: TunnelManager,
     pub(crate) routes: RouteRuntime,
+    #[cfg(any(not(target_os = "linux"), test))]
     pub(crate) proxy: SystemProxyManager,
 }
 
@@ -46,7 +48,8 @@ pub(crate) struct AppState {
     /// errors). Never persisted — ring buffer, newest last.
     pub(crate) log: std::sync::Mutex<std::collections::VecDeque<crate::commands::logs::LogEvent>>,
     #[cfg(target_os = "linux")]
-    pub(crate) openvpn_credentials: crate::openvpn_credentials::OpenVpnCredentialStore,
+    pub(crate) openvpn_credentials:
+        std::sync::Arc<net_manager_engine::linux_credentials::OpenVpnCredentialStore>,
 }
 
 pub(crate) fn resolve_backend_path(
@@ -65,6 +68,29 @@ pub(crate) fn resolve_backend_path(
 }
 
 impl AppState {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn data_dir(&self) -> &Path {
+        self.config_vault
+            .root()
+            .parent()
+            .expect("vault is under the application data directory")
+    }
+
+    pub(crate) async fn proxy_ownership(
+        &self,
+    ) -> io::Result<Option<net_manager_core::system_proxy::ProxyOwnership>> {
+        #[cfg(target_os = "linux")]
+        {
+            net_manager_core::system_proxy::load_ownership(
+                &self.data_dir().join("proxy-state.json"),
+            )
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Ok(self.runtime.lock().await.proxy.ownership().cloned())
+        }
+    }
+
     pub(crate) fn resolve_backend_executable(
         &self,
         backend: TunnelBackend,
@@ -162,13 +188,16 @@ pub(crate) fn build_state(data_dir: PathBuf) -> std::io::Result<AppState> {
                 data_dir.join("logs"),
             ),
             routes,
+            #[cfg(any(not(target_os = "linux"), test))]
             proxy: SystemProxyManager::new(data_dir.join("proxy-state.json"))?,
         }),
         log: std::sync::Mutex::new(std::collections::VecDeque::new()),
         #[cfg(target_os = "linux")]
-        openvpn_credentials: crate::openvpn_credentials::OpenVpnCredentialStore::new(Box::new(
-            crate::openvpn_credentials::SecretServiceStore,
-        )),
+        openvpn_credentials: std::sync::Arc::new(
+            net_manager_engine::linux_credentials::OpenVpnCredentialStore::new(Box::new(
+                net_manager_engine::linux_credentials::SecretServiceStore,
+            )),
+        ),
     })
 }
 

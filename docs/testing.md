@@ -1,5 +1,123 @@
 # E2E testing
 
+## Linux multinode routing and recovery
+
+```bash
+cargo build -p network-orchestrator-daemon -p net-manager-cli
+python3 e2e/linux/multinode_scenarios.py
+```
+
+Requires Docker, `/dev/net/tun`, the existing `netorch-e2e-client` image
+(`docker build -t netorch-e2e-client e2e/linux`) and the pinned Xray package
+staged under `target/release/xray-package/v26.10.31`.
+The script creates and removes a disposable container with `--network none`;
+route mutations never run on the host. It starts real local VLESS peers and
+HTTPS marker servers with a temporary CA trusted only inside the container.
+It verifies primary preference, ordered backups, automatic primary return,
+independent pinned routing, fail-closed pins/all-down, owned QUIC rejection,
+unchanged-DHCP stream preservation, gateway/source/interface migration,
+offline crash deferral and recovery of a `SIGSTOP`-stalled child.
+Real unprivileged CLI commands import a synthetic subscription, rebuild
+verified/name-only pools, reject advertised-country mismatches and apply a
+policy without changing its source. Local HTTPS country fixtures are reached
+through each candidate; no real subscription or public connectivity service
+is used.
+
+DNS A/AAAA/HTTPS queries exercise the pinned backend's rewrite policy. An
+injected DNS outage must clear without restarting a healthy HTTPS path.
+Foreign UDP sockets must not count as the child's sockets, and an application
+connection storm must remain diagnostic. The final scenarios create actual
+owned UDP transports and simulate a daemon crash plus a deleted old package
+executable, checking recovery/cleanup without killing unrelated Xray peers.
+The container has an explicit file-descriptor limit for these resource tests.
+
+## Linux named process proxy exits
+
+```bash
+cargo build -p network-orchestrator-daemon -p net-manager-cli
+python3 e2e/linux/multinode_scenarios.py --named-proxies
+```
+
+Uses the same disposable image, pinned backend and temporary CA, with real
+UID-65534 CLI commands and a full IPv4 TUN. Offline configuration/listing runs
+with an unreachable daemon socket and must send no service request. Synthetic
+HTTPS markers distinguish ordinary rules, fixed nodes, an independent ordered
+pool and the physical path: unproxied traffic first proves the target is captured
+by the TUN, while only a marked direct connection reaches the underlay marker.
+
+The scenario checks block/direct rules, fixed-node override, missing-key
+blackholes, ordered pool failover and all-down refusal despite a healthy main
+node/reserve. It poisons inherited HTTP/SOCKS proxies and `NO_PROXY=*`, then
+checks both the cleared default and an explicit bypass exception. It exercises
+literal argv, exit status 37, same-PID `exec`, SIGTERM, unchanged tunnel PID and
+kernel routes, stale/removed-alias refusal before command execution, listener
+cleanup and preservation of unrelated peers. No real subscription or public
+service is contacted.
+
+## Linux pinned service availability
+
+```bash
+cargo build -p network-orchestrator-daemon -p net-manager-cli
+python3 e2e/linux/multinode_scenarios.py --service-checks
+# Shorter focused pass for CLI configuration, live unpin and failed persistence:
+python3 e2e/linux/multinode_scenarios.py --service-checks-client
+```
+
+The same disposable Docker contract applies. Synthetic HTTPS services verify
+HEAD-only requests, HTTP 403/302 transport responses without redirect following,
+no cookie/auth reuse, typed TLS failures, child reaping and refresh preservation.
+The service-only outage keeps ordinary tunnel traffic healthy: three timeouts
+must degrade only that check, fresh HTTP must reset it, and PID/pins/default
+selection must remain unchanged. Disabling the checks must stop subsequent
+requests. Real unprivileged CLI operations also exercise live unpin cancellation
+and a failed atomic configuration write; an unsaved worker must not keep probing.
+
+### Configuration and interpretation
+
+In a Linux Xray subscription profile, use **Service availability**, or:
+
+```bash
+netorch checks list PROFILE
+netorch checks add PROFILE --via NODE --name 'API connectivity' --url 'https://service.example/health'
+netorch checks run PROFILE --id CHECK_ID
+netorch checks background PROFILE CHECK_ID on
+netorch checks background PROFILE CHECK_ID off
+netorch checks remove PROFILE CHECK_ID
+```
+
+Replace `PROFILE`, `NODE`, `CHECK_ID` and the example URL with your own choices.
+`NODE` is a stable endpoint key, current subscription number or unambiguous name,
+and must already be explicitly pinned by domain or fixed-DNS policy. Merely being
+the primary, backup or a pool member does not qualify. Missing/unbound pins are
+unavailable: no alternate node or direct connection is attempted.
+
+The initial list is empty; background is off. Manual checks work while
+disconnected and in SOCKS mode through a temporary unprivileged single-node
+Xray. Background preferences run only during an active TUN connection, starting
+60 seconds after enabling/connecting. Background changes require acknowledgment
+from the daemon; a transient socket failure is not treated as proof of opt-out.
+Ordinary profile editing and subscription refresh retain the settings.
+
+Each HTTPS HEAD request has a five-second limit. There are at most 16 checks;
+manual workers use up to four endpoints concurrently and serialize checks of
+the same endpoint. No cookies, authentication headers, user headers, response
+body reads or redirects are used. Do not supply passwords, query tokens, secret
+URLs or side-effect/webhook endpoints. Queries are allowed, not secret storage.
+Use non-secret names: they are diagnostic labels and may appear in logs.
+URLs remain in protected profile configuration/editor data, not results,
+transition logs or the ownership journal. CLI URLs can also enter shell history.
+
+Every HTTP status, including 403, 405 and 5xx, proves only an HTTP transport
+response; it does not prove API authorization or application correctness.
+Timeout/TLS/transport failures increment the background streak and mark
+degradation at three. HTTP or unavailable resets the streak. Remote SOCKS DNS
+failures are reported as transport errors when they cannot be distinguished
+reliably. Service results never request recovery, route changes, tunnel restart,
+country/IP changes or direct fallback. Existing global tunnel and failover
+health checks remain separate.
+
+
+
 ## Debian/Ubuntu installers and updates
 
 ```bash
@@ -22,6 +140,46 @@ CLI and daemon. The image must be available or downloaded before the run. Never
 run `test_installers.py` directly on the host. The manual CI workflow runs both
 checks in its Linux installer job. These checks do not validate real VPNs or the
 Tauri GUI package build.
+
+## Shared Linux CLI/GUI runtime
+
+Both frontends use `LinuxEngine`, the same protected profile store and one
+unprivileged `netorch serve` process per data directory/daemon socket.
+The systemd user manager starts it on demand; a manually started `netorch serve`
+supports isolated environments without that manager. Do not run GUI as root.
+
+Verified on 2026-11-07 with the built Arch `0.14.0-1` package, installed only
+inside disposable containers:
+
+- Real pinned Xray served loopback HTTP through SOCKS as the unprivileged user.
+  Independent CLI processes observed one child; duplicate `up` was rejected;
+  extra command fields in runtime IPC were rejected without echoing their value.
+- The native Tauri Profiles row displayed a CLI-started connection. Its actual
+  switch disconnected/reconnected that same runtime; a CLI rename refreshed the
+  rendered row without reloading. SOCKS auto-connect skipped an already-running
+  profile with the privileged daemon absent.
+- Window close followed by GUI process termination left real SOCKS traffic
+  working; CLI `down` reaped the Xray child. Foreground SIGHUP disconnected
+  instead of leaving the shared connection running.
+- A real `systemd --user` unit started automatically as uid 1001. The real
+  privileged daemon retained an armed static profile beyond its 30-second
+  last-client grace after the CLI exited; the deferred profile changed no
+  kernel routes. Explicit `down` removed both local and daemon-owned state.
+- The existing packaged-WebView scenario installed and removed a proto-79
+  route on a disposable dummy interface through the real daemon and the actual
+  rendered switch. The daemon owner and route were absent after disconnect.
+
+`e2e/linux/run_app_gui.sh` needs all three matching `.deb` packages (GUI in the
+Tauri bundle directory, CLI/daemon in `target/release/packages`) or the combined
+RPM. It starts a real user manager and uses its canonical D-Bus session.
+Never run the route-mutating inspector scenario directly on the host.
+
+The native status bar also renders an available Xray with no version metadata
+as ready rather than absent.
+
+Linux Rust checks omit the macOS-only bridge/helper crates; a full workspace
+check on Linux fails at macOS `libc` APIs rather than validating those targets.
+
 
 ## Browser sandbox on macOS
 

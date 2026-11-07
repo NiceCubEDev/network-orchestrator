@@ -1,7 +1,6 @@
 use crate::daemon_client::DaemonClient;
 use crate::state::AppState;
-use net_manager_core::daemon_protocol::{method, OwnedListResult};
-use net_manager_core::models::{Profile, TunnelBackend, XrayMode};
+use net_manager_core::models::{Profile, TunnelBackend, TunnelState, XrayMode};
 use serde::Serialize;
 use std::collections::HashSet;
 use std::future::Future;
@@ -66,7 +65,7 @@ where
 {
     let mut failures = Vec::new();
     let candidates = net_manager_core::connect_plan::auto_connect_candidates(profiles, |profile| {
-        daemon_owner(profile).is_some_and(|owner| owners.contains(&owner))
+        owners.contains(&daemon_owner(profile).unwrap_or_else(|| profile.id.clone()))
     });
     for profile in candidates {
         if connect(profile.id.clone()).await.is_err() {
@@ -93,25 +92,22 @@ async fn connect_on_startup(app: &tauri::AppHandle) -> AutoConnectResult {
         };
     }
     let client = DaemonClient::system();
-    if client.hello().await.is_err() {
-        return AutoConnectResult {
-            failed_count: 0,
-            startup_failed: true,
-        };
-    }
-    let owned: OwnedListResult = match client
-        .request(method::OWNED_LIST, serde_json::Value::Null)
-        .await
-    {
-        Ok(owned) => owned,
-        Err(_) => {
-            return AutoConnectResult {
-                failed_count: 0,
-                startup_failed: true,
+    let mut owners = HashSet::new();
+    let mut startup_failed = false;
+    let state = app.state::<AppState>();
+    for profile in profiles.iter().filter(|profile| profile.auto_connect) {
+        let status = crate::commands::tunnels::linux_profile_status(&client, &state, profile).await;
+        let skip = match status {
+            Ok(status) => status.state == TunnelState::Running,
+            Err(_) => {
+                startup_failed = true;
+                true // Unknown is not proof that another client has stopped it.
             }
+        };
+        if skip {
+            owners.insert(daemon_owner(profile).unwrap_or_else(|| profile.id.clone()));
         }
-    };
-    let owners = owned.owners.into_iter().map(|entry| entry.owner).collect();
+    }
     let failures = connect_saved_profiles(&profiles, &owners, |id| {
         let app = app.clone();
         async move {
@@ -124,7 +120,7 @@ async fn connect_on_startup(app: &tauri::AppHandle) -> AutoConnectResult {
     .await;
     AutoConnectResult {
         failed_count: failures.len(),
-        startup_failed: false,
+        startup_failed,
     }
 }
 

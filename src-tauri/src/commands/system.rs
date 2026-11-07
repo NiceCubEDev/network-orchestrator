@@ -271,9 +271,11 @@ pub(crate) struct SystemProxyStatus {
 pub(crate) async fn system_proxy_status(
     state: State<'_, AppState>,
 ) -> Result<SystemProxyStatus, String> {
-    let runtime = state.runtime.lock().await;
-    let owner_profile_id = runtime.proxy.ownership().map(|o| o.profile_id.clone());
-    drop(runtime);
+    let owner_profile_id = state
+        .proxy_ownership()
+        .await
+        .map_err(|error| error.to_string())?
+        .map(|ownership| ownership.profile_id);
     let owner_name = match &owner_profile_id {
         Some(id) => state.profiles.load().ok().and_then(|doc| {
             doc.profiles
@@ -404,6 +406,38 @@ fn backend_running_error(
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+async fn ensure_shared_xray_stopped(
+    state: &AppState,
+    backend: TunnelBackend,
+) -> Result<(), String> {
+    if backend != TunnelBackend::Xray {
+        return Ok(());
+    }
+    let profiles = state
+        .profiles
+        .load()
+        .map_err(|_| "Cannot read profiles")?
+        .profiles;
+    let root = state.data_dir().to_path_buf();
+    crate::daemon_client::DaemonClient::system()
+        .engine_request(move |engine| {
+            let engine = engine.with_data_root(root);
+            for profile in profiles.iter().filter(|profile| {
+                profile.backend == TunnelBackend::Xray
+                    && profile.xray_mode == net_manager_core::models::XrayMode::Socks
+            }) {
+                if engine.local_proxy_status(&profile.id)?.state == TunnelState::Running {
+                    return Err(
+                        "Cannot change the Xray executable while a local proxy is running".into(),
+                    );
+                }
+            }
+            Ok(())
+        })
+        .await
+}
+
 fn check_managed_replacement(
     current: Option<&BackendExecutableSetting>,
     managed_replacement_error: Option<&str>,
@@ -459,6 +493,8 @@ pub(crate) async fn set_backend_executable(
     } else {
         None
     };
+    #[cfg(target_os = "linux")]
+    ensure_shared_xray_stopped(&state, backend).await?;
     let mut runtime = state.runtime.lock().await;
     select_backend_executable(
         &mut runtime,
@@ -483,6 +519,8 @@ pub(crate) async fn reset_backend_executable(
     } else {
         None
     };
+    #[cfg(target_os = "linux")]
+    ensure_shared_xray_stopped(&state, backend).await?;
     let mut runtime = state.runtime.lock().await;
     select_backend_executable(
         &mut runtime,
@@ -884,6 +922,7 @@ async fn install_managed_xray_inner(app: tauri::AppHandle, state: &AppState) -> 
     use net_manager_core::daemon_protocol::{method, XrayInstallParams, XrayInstallResult};
 
     let _install_guard = state.backend_install_lock.lock().await;
+    ensure_shared_xray_stopped(state, TunnelBackend::Xray).await?;
     state.backend_install_cancel.store(false, Ordering::SeqCst);
     {
         let mut runtime = state.runtime.lock().await;
@@ -985,6 +1024,7 @@ pub(crate) async fn remove_managed_xray(state: State<'_, AppState>) -> Result<()
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 async fn remove_managed_xray_linux(state: &AppState) -> Result<(), String> {
     let _install_guard = state.backend_install_lock.lock().await;
+    ensure_shared_xray_stopped(state, TunnelBackend::Xray).await?;
     let mut runtime = state.runtime.lock().await;
     let profiles = state.profiles.load().map_err(|e| e.to_string())?.profiles;
     backend_running_error(&mut runtime.tunnels, &profiles, TunnelBackend::Xray)?;

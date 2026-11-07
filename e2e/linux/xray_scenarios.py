@@ -20,7 +20,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
-XRAY = Path(os.environ.get("XRAY_E2E_BINARY", str(Path.home() / ".local/bin/xray")))
+XRAY = Path(os.environ.get("XRAY_E2E_BINARY", str(ROOT / "target/release/xray-package/v26.10.31/xray")))
 GENERATOR = ROOT / "target/debug/examples/xray_e2e_config"
 CLIENT_XRAY = "/opt/netorch/bin/xray-e2e"
 
@@ -125,12 +125,12 @@ def main():
     client, server = sys.argv[1:]
     print("\n=== Xray userspace proxy across two containers", flush=True)
     version = run(str(XRAY), "version")
-    assert version.startswith("Xray 26.3.27 "), "unexpected Xray version"
+    assert version.startswith("Xray 26.10.31 "), "unexpected Xray version"
     run("cargo", "build", "-q", "-p", "net-manager-core", "--example", "xray_e2e_config")
     for container in (client, server):
         docker_exec(container, "mkdir", "-p", "/opt/netorch/bin")
         run("docker", "cp", str(XRAY), f"{container}:{CLIENT_XRAY}")
-        assert docker_exec(container, CLIENT_XRAY, "version").startswith("Xray 26.3.27 ")
+        assert docker_exec(container, CLIENT_XRAY, "version").startswith("Xray 26.10.31 ")
     docker_exec(client, "which", "curl")
     server_ip = docker_exec(
         client,
@@ -151,7 +151,9 @@ def main():
                 "settings": {"decryption": "none", "clients": [{"id": vless_id}]},
                 "streamSettings": {"network": "raw", "security": "none"},
             }],
-            "outbounds": [{"protocol": "freedom"}],
+            "outbounds": [{"protocol": "freedom", "settings": {
+                "finalRules": [{"action": "allow", "ip": [server_ip]}],
+            }}],
         }
         write_container_json(server, "/tmp/netorch-xray-vless.json", vless_server)
         start_xray(server, "/tmp/netorch-xray-vless.json", "server")
@@ -181,7 +183,7 @@ def main():
             "log": {"loglevel": "warning"},
             "inbounds": [{
                 "listen": "0.0.0.0", "port": 11002, "protocol": "hysteria",
-                "settings": {"clients": [{"auth": password}]},
+                "settings": {"version": 2, "clients": [{"auth": password}]},
                 "streamSettings": {
                     "network": "hysteria", "security": "tls",
                     "hysteriaSettings": {"version": 2},
@@ -191,7 +193,9 @@ def main():
                     }]},
                 },
             }],
-            "outbounds": [{"protocol": "freedom"}],
+            "outbounds": [{"protocol": "freedom", "settings": {
+                "finalRules": [{"action": "allow", "ip": [server_ip]}],
+            }}],
         }
         write_container_json(server, "/tmp/netorch-xray-hysteria.json", hysteria_server)
         start_xray(server, "/tmp/netorch-xray-hysteria.json", "server")

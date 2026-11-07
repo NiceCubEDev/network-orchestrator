@@ -100,6 +100,8 @@ mod tests {
             state,
             message: None,
             interface_name: interface_name.map(Into::into),
+            failover: None,
+            watchdog: None,
         }
     }
 

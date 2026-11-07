@@ -46,7 +46,8 @@
     "linux": {
       "deb": {
         "depends": [
-          "network-orchestrator-daemon"
+          "network-orchestrator-daemon",
+          "netorch (>= 0.14.0)"
         ]
       },
       "rpm": {
@@ -54,6 +55,7 @@
           "systemd",
           "polkit",
           "iproute",
+          "nftables",
           "libayatana-appindicator-gtk3"
         ],
         "recommends": [
@@ -63,14 +65,15 @@
         ],
         "files": {
           "/usr/bin/network-orchestrator-daemon": "../target/release/network-orchestrator-daemon",
-          "/usr/lib/network-orchestrator/xray/v26.3.27/xray": "../target/release/xray-package/v26.3.27/xray",
-          "/usr/lib/network-orchestrator/xray/v26.3.27/geoip.dat": "../target/release/xray-package/v26.3.27/geoip.dat",
-          "/usr/lib/network-orchestrator/xray/v26.3.27/geosite.dat": "../target/release/xray-package/v26.3.27/geosite.dat",
+          "/usr/bin/netorch": "../target/release/netorch",
+          "/usr/lib/network-orchestrator/xray/v26.10.31/xray": "../target/release/xray-package/v26.10.31/xray",
+          "/usr/lib/network-orchestrator/xray/v26.10.31/geoip.dat": "../target/release/xray-package/v26.10.31/geoip.dat",
+          "/usr/lib/network-orchestrator/xray/v26.10.31/geosite.dat": "../target/release/xray-package/v26.10.31/geosite.dat",
           "/usr/lib/systemd/system/network-orchestrator.service": "../packaging/linux/network-orchestrator.service",
           "/usr/lib/tmpfiles.d/network-orchestrator.conf": "../packaging/linux/tmpfiles.conf",
           "/usr/share/polkit-1/actions/com.netmanager.app.policy": "../packaging/linux/com.netmanager.app.policy",
-          "/usr/share/doc/network-orchestrator/xray/LICENSE": "../target/release/xray-package/v26.3.27/LICENSE",
-          "/usr/share/doc/network-orchestrator/xray/README.md": "../target/release/xray-package/v26.3.27/README.md",
+          "/usr/share/doc/network-orchestrator/xray/LICENSE": "../target/release/xray-package/v26.10.31/LICENSE",
+          "/usr/share/doc/network-orchestrator/xray/README.md": "../target/release/xray-package/v26.10.31/README.md",
           "/usr/share/doc/network-orchestrator/xray/NOTICES": "../packaging/linux/xray-NOTICES"
         },
         "postInstallScript": "../packaging/rpm/post",

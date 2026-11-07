@@ -273,6 +273,11 @@ impl SystemProxyManager {
     }
 }
 
+/// Read current persisted ownership without changing desktop settings.
+pub fn load_ownership(path: &Path) -> io::Result<Option<ProxyOwnership>> {
+    load_document(path).map(|document| document.ownership)
+}
+
 fn load_document(path: &Path) -> io::Result<ProxyStateDocument> {
     let raw = match fs::read_to_string(path) {
         Ok(raw) => raw,

@@ -10,13 +10,128 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-11-07
+
+Core 0.14.0.
+
 ### Added
 
+- Shared unprivileged `netorch serve` user service for local Xray SOCKS/HTTP
+  children and detached daemon connection lifetime. CLI and GUI control the
+  same runtime; closing the window does not terminate it.
+- Raw Xray JSON import in the CLI, defaulting to unprivileged SOCKS mode.
+- Arch/CachyOS packages include GUI, CLI, daemon, pinned Xray, shell completions
+  and tmpfiles configuration; Debian GUI installers also include the CLI runtime.
+
+### Changed
+
+- Linux CLI and GUI use one connection engine, data-directory convention,
+  OpenVPN credential store and geodata preparation. CLI profile changes refresh
+  the open GUI. OS file locks protect cross-process profile edits.
+- Replace per-profile CLI keeper processes with the shared user service.
+  A systemd user manager (or foreground `netorch serve`) is required; retaining
+  user units across logout requires explicit linger configuration.
+- Root connects require foreground mode. Foreground terminal hangup disconnects
+  instead of leaving a shared connection running.
+
+### Fixed
+
+- Show a ready Xray executable with an unknown version as ready, not absent.
+- Update vulnerable frontend build dependencies within compatible ranges.
+- Preserve automatic installation marks when upgrading shared daemon/CLI dependencies.
+
+## [0.13.1] - 2026-11-03
+
+Core 0.13.0.
+
+### Fixed
+
+- Accept geosite category names containing `!` (for example,
+  `category-ai-chat-!cn`) at the daemon boundary, matching generated profile
+  rules. External asset selectors and path traversal remain rejected.
+
+## [0.13.0] - 2026-11-03
+
+Core 0.13.0.
+
+### Added
+
+- `netorch proxy set|list|remove` and `netorch proxy [--profile PROFILE] NAME --
+  COMMAND` for user-defined rules/node/pool/direct exits of a connected Xray
+  TUN profile. Configuration is offline; launches verify actual daemon bindings
+  and never start/reload the tunnel. Stale exits refuse before execution.
+- Independent ordered pool controllers with fail-closed missing/all-down
+  members, and marked direct sockets that bypass the owned TUN. Commands retain
+  literal arguments, terminal, native signals and exit status through `exec`;
+  inherited HTTP/SOCKS proxy and no-proxy variables are replaced.
+- Disposable real-CLI coverage of full-TUN direct bypass, pool affinity and
+  isolation, failed exits, explicit bypass exceptions, command lifetime and
+  listener cleanup. Loopback listeners remain unauthenticated; environment
+  proxies are not process network isolation or arbitrary UDP routing.
+
+## [0.12.0] - 2026-11-02
+
+Core 0.12.0.
+
+### Added
+
+- `netorch checks list|add|remove|background|run` and a per-profile service
+  availability editor. Users supply the HTTPS targets and explicit node pins;
+  opening or saving the editor sends no service request.
+- Opt-in diagnostic-only checks every 60 seconds while a TUN profile is active.
+  Any HTTP response is transport evidence, not authenticated API success.
+  Results and transition logs omit URLs; disabling/removing checks cancels the
+  worker without reloading Xray, changing pins or selecting a fallback.
+
+### Changed
+
+- Stop inferring pinned service targets from routing domains and remove
+  pin-specific restart requests. Global tunnel/failover health and underlay
+  recovery remain separate from service-specific availability.
+
+## [0.11.0] - 2026-11-02
+
+Core 0.11.0.
+
+### Added
+
+- Xray subscription profiles can select ordered backup nodes and pin domain
+  selectors to independent nodes from the app or `netorch backup` and
+  `netorch route pin|unpin`. The daemon uses bounded HTTPS probes per node,
+  prefers the primary and automatically returns after recovery. Missing pins
+  stay fail-closed; all-down default traffic is blocked, never sent direct.
+  Live status includes the selected node and candidate health.
+- Opt-in filtered backup pools and real exit-country verification in the app
+  and CLI. Country-only filters are supported; explicit domain/DNS nodes are
+  excluded from automatic recruitment, and name-only mode does not need Xray.
+- Stopped-profile preview/apply of standalone Xray policies, including fixed
+  egress, DNS rewriting, IP/port guards, interface policies, TUN MTU/DNS and
+  connection/socket settings. Unsupported semantics and conflicting pins
+  refuse the whole import; ordinary profile edits preserve imported settings.
+- Owned-child recovery for real underlay changes, HTTPS/pin stalls and UDP
+  socket accumulation, with DNS and application connection-storm diagnostics.
+  Unchanged DHCP identity preserves live streams; recovery waits while offline.
+- Tunnel-scoped nftables QUIC rejection with ownership-safe cleanup.
 - Single-file Debian/Ubuntu installers for CLI and GUI, each bundling its client
   and the shared daemon package. They install missing packages, update older
   versions, preserve a newer daemon patch from the same release line, and refuse
   client downgrades. `--check` previews the version plan without root or changes;
   `--yes` accepts the APT plan. A CLI-only build avoids the GUI/WebKit toolchain.
+
+### Changed
+
+- Linux Xray is pinned to 26.10.31 for DNS rewriting. Bundled GeoIP Lite and
+  GeoSite Standard replace the old data set; explicit geodata overrides remain
+  supported, and package notices describe the current data licenses.
+
+### Fixed
+
+- Endpoint bypasses migrate from an existing old gateway/interface without
+  adopting foreign routes. Recovery acknowledges replaced children, cancels
+  positively cleared queued stalls and does not charge a crash against the
+  independent stall cooldown.
+- Orphan cleanup verifies protected process ownership independently of the
+  current Xray pin, including a deleted executable from an older package.
 
 ## [0.10.1] - 2026-10-30
 

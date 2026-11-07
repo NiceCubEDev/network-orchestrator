@@ -70,16 +70,22 @@ fn rename_to(ctx: &Ctx, id: &str, name: &str) -> Result<Profile, String> {
     if name.is_empty() || name.chars().count() > 128 || name.contains(['\r', '\n']) {
         return Err("The name must be 1-128 characters on one line".into());
     }
-    let mut profile = ctx.find(id)?;
-    profile.name = name.to_string();
-    ctx.store()
-        .upsert(profile.clone())
+    let document = ctx
+        .store()
+        .update_profile(id, |profile| {
+            profile.name = name.to_string();
+            Ok(())
+        })
         .map_err(|_| "The profile could not be saved".to_string())?;
-    Ok(profile)
+    Ok(document
+        .profiles
+        .into_iter()
+        .find(|profile| profile.id == id)
+        .expect("updated profile remains in its document"))
 }
 
 /// Saves what `input` points at: a share link, a subscription URL or a
-/// `.conf` / `.ovpn` file. A subscription can add several profiles.
+/// `.conf` / `.ovpn` / `.json` file. A subscription can add several profiles.
 pub fn add_input(ctx: &Ctx, input: &str, name: Option<&str>) -> Result<Vec<Profile>, String> {
     require_user(ctx)?;
     let before: HashSet<String> = ctx.profiles()?.into_iter().map(|p| p.id).collect();
@@ -88,7 +94,7 @@ pub fn add_input(ctx: &Ctx, input: &str, name: Option<&str>) -> Result<Vec<Profi
         Input::Saved(_) => {
             return Err(
                 "That is not a vless:// / hysteria2:// link, an https:// subscription \
-                        URL or an existing .conf / .ovpn file."
+                        URL or an existing .conf / .ovpn / .json file."
                     .into(),
             )
         }

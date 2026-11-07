@@ -38,11 +38,15 @@ pub(crate) use net_tables::{
 pub(crate) use netbird::{netbird_down, netbird_status, netbird_up};
 pub(crate) use nm::{nm_list_connections, nm_set_active};
 pub(crate) use profiles::{
-    delete_profile, get_profiles, get_subscription_endpoints, import_configs_batch,
-    import_share_link, import_subscription, measure_subscription_endpoint_delay,
-    refresh_subscription, reorder_profiles, save_profile, save_vless_profile,
-    save_wireguard_profile, set_subscription_refresh_interval, set_tunnel_networks,
-    set_tunnel_role, switch_subscription_endpoint,
+    apply_xray_policy_migration, delete_profile, get_profiles, get_subscription_endpoints,
+    import_configs_batch, import_share_link, import_subscription,
+    measure_subscription_endpoint_delay, preview_xray_policy_migration,
+    rebuild_subscription_node_pool, refresh_subscription, reorder_profiles,
+    run_xray_service_checks, save_profile, save_vless_profile, save_wireguard_profile,
+    set_pinned_routes, set_subscription_auto_return, set_subscription_backups,
+    set_subscription_node_pool, set_subscription_refresh_interval, set_tunnel_networks,
+    set_tunnel_role, set_xray_service_checks, switch_subscription_endpoint,
+    verify_subscription_exits,
 };
 pub(crate) use proxies::scan_local_proxies;
 pub(crate) use recovery::{cleanup_recovery, get_recovery_report};

@@ -6,7 +6,8 @@
 set -eu
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-PKG="$REPO_ROOT/target/release/bundle/deb/Network Orchestrator_0.1.1_amd64.deb"
+VERSION="$(python3 "$REPO_ROOT/scripts/versions.py" get linux)"
+PKG="$REPO_ROOT/target/release/bundle/deb/Network Orchestrator_${VERSION}_amd64.deb"
 BLANK_CONFIG=0
 for arg in "$@"; do
     case "$arg" in
@@ -16,6 +17,7 @@ for arg in "$@"; do
     esac
 done
 NAME="netorch-app-gui-$$"
+set --
 case "$PKG" in
     *.rpm)
         IMAGE=netorch-e2e-client-fedora DOCKERFILE=Dockerfile.fedora PKG_EXT=rpm
@@ -23,7 +25,15 @@ case "$PKG" in
         ;;
     *)
         IMAGE=netorch-e2e-client DOCKERFILE=Dockerfile PKG_EXT=deb
-        INSTALL='apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends xvfb xdotool scrot openbox dbus-x11 python3-websockets /opt/netorch/network-orchestrator.deb'
+        DEB_VERSION="$(python3 -c 'import sys; print(sys.argv[1].replace("-", "~", 1))' "$VERSION")"
+        DAEMON_PKG="$REPO_ROOT/target/release/packages/network-orchestrator-daemon_${DEB_VERSION}_amd64.deb"
+        CLI_PKG="$REPO_ROOT/target/release/packages/netorch_${DEB_VERSION}_amd64.deb"
+        for dependency in "$DAEMON_PKG" "$CLI_PKG"; do
+            [ -f "$dependency" ] || { echo "missing package: $dependency" >&2; exit 1; }
+        done
+        set -- -v "$DAEMON_PKG:/opt/netorch/daemon.deb:ro" \
+            -v "$CLI_PKG:/opt/netorch/netorch.deb:ro"
+        INSTALL='apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends xvfb xdotool scrot openbox dbus-x11 python3-websockets /opt/netorch/daemon.deb /opt/netorch/netorch.deb /opt/netorch/network-orchestrator.deb'
         ;;
 esac
 
@@ -45,6 +55,7 @@ docker run -d --name "$NAME" -e container=docker \
     --device /dev/net/tun --tmpfs /run --tmpfs /run/lock --cgroupns=private \
     -v "$PKG:/opt/netorch/network-orchestrator.$PKG_EXT:ro" \
     -v "$REPO_ROOT/e2e/linux:/opt/netorch/e2e:ro" \
+    "$@" \
     "$IMAGE" >/dev/null
 
 for _ in $(seq 60); do
@@ -62,9 +73,8 @@ docker exec "$NAME" bash -euc '
     systemctl restart polkit.service
     ip link add ne2e0 type dummy
     ip link set ne2e0 up
-    mkdir -p /run/user/1001
-    chown alice:alice /run/user/1001
-    chmod 0700 /run/user/1001
+    systemctl start user@1001.service
+    test -S /run/user/1001/bus
 '
 
 docker exec -d "$NAME" Xvfb :99 -screen 0 1280x800x24 -nolisten tcp
@@ -76,12 +86,13 @@ docker exec "$NAME" test -S /tmp/.X11-unix/X99
 
 # The inspector and WebKit sandbox overrides exist only inside this container.
 docker exec -d --user alice -e DISPLAY=:99 -e XDG_RUNTIME_DIR=/run/user/1001 \
+    -e DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1001/bus \
     -e XDG_SESSION_TYPE=x11 -e GDK_BACKEND=x11 \
     -e WEBKIT_DISABLE_DMABUF_RENDERER=1 \
     -e WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1 \
     -e WEBKIT_INSPECTOR_HTTP_SERVER=127.0.0.1:9222 \
     "$NAME" bash -c \
-    'dbus-run-session -- sh -c "openbox & exec /usr/bin/net-manager-app" >/tmp/netorch-app.log 2>&1'
+    'openbox & exec /usr/bin/net-manager-app >/tmp/netorch-app.log 2>&1'
 
 ready=0
 for _ in $(seq 60); do

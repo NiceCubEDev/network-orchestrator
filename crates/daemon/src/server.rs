@@ -813,6 +813,26 @@ async fn handle<A: Authorizer>(
             .await?;
             to_value(&status)
         }
+        method::XRAY_PROXY_EXITS => {
+            let params: XrayProfileParams = params(request.params)?;
+            validate_owner(&format!("xray:{}", params.profile_id)).map_err(invalid)?;
+            let exits = with_core(ctx, move |core| {
+                core.xray_proxy_exits(uid, &params.profile_id)
+            })
+            .await?;
+            to_value(&exits)
+        }
+        method::XRAY_SERVICE_CHECKS => {
+            let params: net_manager_core::daemon_protocol::XrayServiceChecksParams =
+                from_value(request.params)
+                    .map_err(|_| invalid("invalid service check parameters".into()))?;
+            validate_owner(&format!("xray:{}", params.profile_id)).map_err(invalid)?;
+            let result = with_core(ctx, move |core| {
+                core.set_xray_service_checks(uid, &params.profile_id, params.checks)
+            })
+            .await?;
+            to_value(&result)
+        }
         method::XRAY_RELOAD => {
             let params: XrayConnectParams = from_value(request.params)
                 .map_err(|_| invalid("invalid Xray reload parameters".into()))?;
@@ -2264,13 +2284,21 @@ mod tests {
         .unwrap()
         .unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {
-            while runner.cleaned.load(Ordering::SeqCst) == 0 {
+            // The runner's cleanup callback precedes the journal commit.
+            // Wait for the observable teardown, not the intermediate mock signal.
+            while !JournalStore::new(dir.join(JOURNAL_FILE))
+                .load()
+                .unwrap()
+                .entries
+                .is_empty()
+            {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
         .unwrap();
         assert_eq!(runner.stopped.load(Ordering::SeqCst), 1);
+        assert_eq!(runner.cleaned.load(Ordering::SeqCst), 1);
         assert!(JournalStore::new(dir.join(JOURNAL_FILE))
             .load()
             .unwrap()

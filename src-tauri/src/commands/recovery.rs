@@ -40,6 +40,17 @@ fn linux_leftover_owners(
             entry.state != OwnedState::Applied
                 || (!tunnel
                     && (!profiles.iter().any(|p| p.id == entry.owner)
+                        || profiles.iter().any(|profile| {
+                            profile.id == entry.owner
+                                && profile.backend == TunnelBackend::Xray
+                                && profile.xray_mode == XrayMode::Socks
+                                && statuses.iter().any(|(id, status)| {
+                                    id == &profile.id
+                                        && status.as_ref().is_ok_and(|status| {
+                                            status.state != TunnelState::Running
+                                        })
+                                })
+                        })
                         || entry.resources.iter().any(|resource| {
                             matches!(resource, OwnedResource::Route(route)
                                 if !os_routes.iter().any(|e| applied_route_present(route, e)))
@@ -211,34 +222,24 @@ async fn collect(state: &AppState) -> Result<(RecoveryReport, Vec<String>), Stri
     let client = crate::daemon_client::DaemonClient::system();
     #[cfg(target_os = "linux")]
     for profile in &profiles {
-        if daemon_owned_profile(profile) {
-            let result = if profile.backend == TunnelBackend::WireGuard {
-                crate::commands::tunnels::linux_wireguard_status(&client, profile).await
-            } else if profile.backend == TunnelBackend::OpenVpn {
-                crate::commands::tunnels::linux_openvpn_status(&client, profile).await
-            } else {
-                crate::commands::tunnels::linux_xray_status(&client, profile).await
-            };
-            statuses.push((profile.id.clone(), result));
-        }
+        let result = crate::commands::tunnels::linux_profile_status(&client, state, profile).await;
+        statuses.push((profile.id.clone(), result));
     }
+    #[cfg(not(target_os = "linux"))]
     let mut runtime = state.runtime.lock().await;
     #[cfg(not(target_os = "linux"))]
     let statuses: Vec<(String, TunnelStatus)> = profiles
         .iter()
         .map(|p| (p.id.clone(), runtime.tunnels.status(p)))
         .collect();
-    #[cfg(target_os = "linux")]
-    statuses.extend(
-        profiles
-            .iter()
-            .filter(|p| !daemon_owned_profile(p))
-            .map(|p| (p.id.clone(), Ok(runtime.tunnels.status(p)))),
-    );
     #[cfg(not(target_os = "linux"))]
     let (ownership, leftovers) = (runtime.routes.snapshot().await?, Vec::new());
-    let proxy_ownership = runtime.proxy.ownership().cloned();
+    #[cfg(not(target_os = "linux"))]
     drop(runtime);
+    let proxy_ownership = state
+        .proxy_ownership()
+        .await
+        .map_err(|error| error.to_string())?;
     #[cfg(target_os = "linux")]
     let (ownership, leftovers) = {
         use net_manager_core::daemon_protocol::{method, OwnedListResult};
@@ -265,10 +266,18 @@ async fn collect(state: &AppState) -> Result<(RecoveryReport, Vec<String>), Stri
                 state: TunnelState::Failed,
                 message: Some(err),
                 interface_name: None,
+                failover: None,
+                watchdog: None,
             });
             (profile_id, status)
         })
         .collect();
+    #[cfg(target_os = "linux")]
+    let proxy_ownership = proxy_ownership.filter(|owner| {
+        !statuses
+            .iter()
+            .any(|(id, status)| *id == owner.profile_id && status.state == TunnelState::Running)
+    });
     Ok((
         build_recovery_report(
             &profiles,
@@ -297,8 +306,12 @@ pub(crate) async fn cleanup_recovery(
     // routes and always-on state stay untouched.
     #[cfg(target_os = "linux")]
     {
-        let (_, leftovers) = collect(&state).await?;
         let client = crate::daemon_client::DaemonClient::system();
+        let root = state.data_dir().to_path_buf();
+        client
+            .engine_request(move |engine| engine.with_data_root(root).recover_local_proxy())
+            .await?;
+        let (_, leftovers) = collect(&state).await?;
         let mut failed = 0;
         for (method, params) in leftovers.iter().filter_map(|owner| cleanup_request(owner)) {
             if client
@@ -358,6 +371,8 @@ mod tests {
                 state,
                 message: None,
                 interface_name: None,
+                watchdog: None,
+                failover: None,
             },
         )
     }

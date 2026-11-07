@@ -201,6 +201,7 @@ fn advanced_from_args(args: &Value) -> Result<Advanced, String> {
         hosts: parse_dns_hosts(text(args, "dnsHosts"))?,
         fake_dns: text(args, "fakeDns") == "true",
         query_strategy: parse_query_strategy(text(args, "queryStrategy"))?,
+        ..XrayDnsConfig::default()
     };
     xray::validate_dns_config(&dns).map_err(|_| "The DNS settings are not valid".to_string())?;
     Ok(Advanced {
@@ -337,6 +338,7 @@ fn route_check(root: &Path, args: &Value) -> Result<Value, String> {
         domain_strategy: advanced.strategy,
         domain_matcher: advanced.matcher,
         dns: advanced.dns,
+        ..Default::default()
     };
     let result = check_route(&policies, &options, text(args, "target"), &geo)
         .map_err(|error| error.to_string())?;

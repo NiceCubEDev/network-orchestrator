@@ -112,10 +112,20 @@ def fake_tool(tool, args):
                 info = metadata(path)
                 state.setdefault("packages", {})[info["Package"]] = {"version": info["Version"], "arch": info["Architecture"]}
         state_path.write_text(json.dumps(state))
+    elif tool == "apt-mark":
+        if args[0] == "showauto":
+            for package in args[1:]:
+                if state.get("packages", {}).get(package, {}).get("auto", False):
+                    print(package)
+        else:
+            assert args[0] in {"auto", "manual"}, args
+            for package in args[1:]:
+                state["packages"][package]["auto"] = args[0] == "auto"
+            state_path.write_text(json.dumps(state))
     elif tool == "systemctl":
         if args[0] == "show":
             return state.get("systemd_error", 0)
-    elif tool != "apt-mark":
+    else:
         raise AssertionError(tool)
     return 0
 
@@ -197,6 +207,11 @@ class LinuxInstallersTest(unittest.TestCase):
     def test_gui_then_cli_also_reuses_the_daemon(self):
         self.built()
         self.assertEqual(self.run_installer("network-orchestrator").returncode, 0)
+        self.assertEqual(
+            set(json.loads(self.state.read_text())["packages"]),
+            {DAEMON, "netorch", "network-orchestrator"},
+            "the GUI must include its netorch runtime on a fresh machine",
+        )
         self.assertEqual(self.run_installer().returncode, 0)
         self.assertEqual(sum(p.endswith("daemon.deb") for call in self.calls("apt-get") for p in call), 1)
 
@@ -208,7 +223,20 @@ class LinuxInstallersTest(unittest.TestCase):
         self.assertEqual(result.stdout.count("update"), 2)
         packages = json.loads(self.state.read_text())["packages"]
         self.assertTrue(all(p["version"] == "0.10.1" for p in packages.values()))
-        self.assertEqual(self.calls("apt-mark"), [], "preserve existing manual/auto state")
+        self.assertFalse(packages[DAEMON].get("auto", False))
+
+    def test_gui_upgrade_preserves_auto_marks_of_shared_runtime(self):
+        self.built()
+        self.installed({"netorch": "0.10.0", DAEMON: "0.10.0", "network-orchestrator": "0.10.0"})
+        state = json.loads(self.state.read_text())
+        state["packages"][DAEMON]["auto"] = True
+        state["packages"]["netorch"]["auto"] = True
+        self.state.write_text(json.dumps(state))
+        result = self.run_installer("network-orchestrator")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        packages = json.loads(self.state.read_text())["packages"]
+        self.assertTrue(packages[DAEMON].get("auto", False))
+        self.assertTrue(packages["netorch"].get("auto", False))
 
     def test_same_version_does_not_reinstall(self):
         self.built()
@@ -291,6 +319,13 @@ class LinuxInstallersTest(unittest.TestCase):
         result = self.run_installer()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("GUI installer first", result.stderr)
+        self.assert_no_mutations()
+
+    def test_cli_refuses_an_older_gui_even_when_daemon_is_present(self):
+        self.built()
+        self.installed({"network-orchestrator": "0.9.9", DAEMON: "0.10.1"})
+        result = self.run_installer()
+        self.assertNotEqual(result.returncode, 0)
         self.assert_no_mutations()
 
     def test_builder_rejects_mixed_releases_architectures_and_wrong_packages(self):

@@ -52,6 +52,12 @@ pub fn classify(input: &str, exists: impl Fn(&Path) -> bool) -> Input {
                     backend: TunnelBackend::OpenVpn,
                 }
             }
+            Some("json") => {
+                return Input::File {
+                    path,
+                    backend: TunnelBackend::Xray,
+                }
+            }
             _ => {}
         }
     }
@@ -177,6 +183,13 @@ mod tests {
                 ..
             }
         ));
+        assert_eq!(
+            classify("/tmp/local.JSON", always),
+            Input::File {
+                path: "/tmp/local.JSON".into(),
+                backend: TunnelBackend::Xray,
+            }
+        );
     }
 
     #[test]
