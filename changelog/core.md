@@ -10,6 +10,22 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-11-07
+
+### Added
+
+- Shared Linux connection engine for static routes, WireGuard, OpenVPN, Xray TUN
+  and local proxies; unprivileged per-data-directory runtime coordination keeps
+  privileged mutations in the calling client and system daemon.
+- Common Linux data paths, protected OpenVPN credential storage and bounded
+  geodata preparation for both frontends.
+
+### Fixed
+
+- Serialize independent profile-store writers with an OS file lock; preserve
+  concurrent narrow profile edits and routing-selector additions.
+- Preserve concurrent metadata edits when rewriting generated listener ports.
+
 ## [0.13.0] - 2026-11-03
 
 ### Added

@@ -4,7 +4,7 @@
 
 [core]
 # net-manager-core, net-manager-engine: the logic every product shares.
-version = "0.13.0"
+version = "0.14.0"
 
 [macos]
 # The macOS app, its helper and bridge, and netorch for macOS.
