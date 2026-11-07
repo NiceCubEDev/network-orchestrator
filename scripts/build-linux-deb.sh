@@ -42,8 +42,9 @@ printf '%s  %s\n' "$XRAY_SHA256" "$XRAY_ARCHIVE" | sha256sum --check --status
 cargo run -q --release -p net-manager-core --example package_linux_xray -- \
     install "$XRAY_ARCHIVE" "$REPO_ROOT/target/release/xray-package"
 
-cargo build --release -p network-orchestrator-daemon
+cargo build --release -p network-orchestrator-daemon -p net-manager-cli
 chmod 0755 target/release/network-orchestrator-daemon \
+    target/release/netorch \
     target/release/xray-package/v26.10.31/xray
 chmod 0644 target/release/xray-package/v26.10.31/*.dat \
     target/release/xray-package/v26.10.31/LICENSE \
@@ -54,20 +55,19 @@ test -x target/release/network-orchestrator-daemon
 # An up-to-date app binary is not relinked, so fix a mode left by an old umask.
 if [ -f target/release/net-manager-app ]; then chmod 0755 target/release/net-manager-app; fi
 if [ "$KIND" != rpm ]; then
-    cargo build --release -p net-manager-cli
-    chmod 0755 target/release/netorch
     sh scripts/package-linux-deb.sh
     [ "$KIND" != cli ] || exit 0
     # The app needs the daemon of its own major.minor line or newer. Tauri
     # replaces an array from a --config override, so the whole list is given.
     LINE="$(python3 scripts/versions.py get linux | sed -E 's/^([0-9]+\.[0-9]+).*/\1/')"
     npm run tauri build -- --bundles deb --no-sign --config \
-        "{\"bundle\":{\"linux\":{\"deb\":{\"depends\":[\"network-orchestrator-daemon (>= ${LINE}.0)\"]}}}}"
+        "{\"bundle\":{\"linux\":{\"deb\":{\"depends\":[\"network-orchestrator-daemon (>= ${LINE}.0)\",\"netorch (>= ${LINE}.0)\"]}}}}"
     SEMVER="$(python3 scripts/versions.py get linux)"
     DEB_VERSION="$(printf '%s' "$SEMVER" | sed 's/-/~/')"
     ARCH="$(dpkg --print-architecture)"
     python3 scripts/package-linux-installers.py \
         --daemon "${OUT_DIR:-target/release/packages}/network-orchestrator-daemon_${DEB_VERSION}_${ARCH}.deb" \
+        --cli "${OUT_DIR:-target/release/packages}/netorch_${DEB_VERSION}_${ARCH}.deb" \
         --gui "target/release/bundle/deb/Network Orchestrator_${SEMVER}_${ARCH}.deb" \
         --output-dir "${INSTALLER_OUT_DIR:-target/release/installers}"
 else

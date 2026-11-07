@@ -1,7 +1,7 @@
 pkgname=network-orchestrator
 pkgver=0.1.1
-pkgrel=2
-pkgdesc='Desktop network route and VPN manager'
+pkgrel=1
+pkgdesc='Network Orchestrator GUI, netorch CLI and shared network daemon'
 arch=('x86_64')
 url='https://github.com/Nie1iX/network-orchestrator'
 license=('MIT' 'MPL-2.0' 'GPL-3.0-only')
@@ -10,7 +10,7 @@ license=('MIT' 'MPL-2.0' 'GPL-3.0-only')
 depends=('webkit2gtk-4.1' 'polkit' 'iproute2' 'nftables' 'systemd' 'libappindicator-gtk3')
 optdepends=('wireguard-tools: WireGuard tunnels'
             'openvpn: OpenVPN tunnels')
-makedepends=('cargo' 'nodejs' 'npm' 'pkgconf' 'openssl' 'libappindicator-gtk3' 'librsvg' 'xdotool')
+makedepends=('cargo' 'nodejs' 'npm' 'python' 'pkgconf' 'openssl' 'libappindicator-gtk3' 'librsvg' 'xdotool')
 options=('!lto' '!debug' '!strip')
 install="${pkgname}.install"
 source=("${pkgname}-${pkgver}.tar.gz"
@@ -25,7 +25,7 @@ build() {
     npm ci
     cargo run --locked --release -p net-manager-core --example package_linux_xray -- \
         install "${srcdir}/Xray-linux-64.zip" "${srcdir}/xray-verified"
-    cargo build --locked --release -p network-orchestrator-daemon
+    cargo build --locked --release -p network-orchestrator-daemon -p net-manager-cli
     npm run tauri build -- --no-bundle --no-sign
 }
 
@@ -33,10 +33,22 @@ package() {
     cd "${srcdir}/${pkgname}-${pkgver}"
 
     install -Dm0755 target/release/net-manager-app "${pkgdir}/usr/bin/net-manager-app"
+    install -Dm0755 target/release/netorch "${pkgdir}/usr/bin/netorch"
+    install -d "${pkgdir}/usr/share/bash-completion/completions" \
+        "${pkgdir}/usr/share/zsh/site-functions" \
+        "${pkgdir}/usr/share/fish/vendor_completions.d"
+    target/release/netorch completions bash \
+        > "${pkgdir}/usr/share/bash-completion/completions/netorch"
+    target/release/netorch completions zsh \
+        > "${pkgdir}/usr/share/zsh/site-functions/_netorch"
+    target/release/netorch completions fish \
+        > "${pkgdir}/usr/share/fish/vendor_completions.d/netorch.fish"
     install -Dm0755 target/release/network-orchestrator-daemon \
         "${pkgdir}/usr/bin/network-orchestrator-daemon"
     install -Dm0644 packaging/linux/network-orchestrator.service \
         "${pkgdir}/usr/lib/systemd/system/network-orchestrator.service"
+    install -Dm0644 packaging/linux/tmpfiles.conf \
+        "${pkgdir}/usr/lib/tmpfiles.d/network-orchestrator.conf"
     install -Dm0644 packaging/linux/com.netmanager.app.policy \
         "${pkgdir}/usr/share/polkit-1/actions/com.netmanager.app.policy"
     install -Dm0644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"

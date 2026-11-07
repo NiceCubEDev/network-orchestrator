@@ -46,7 +46,8 @@
     "linux": {
       "deb": {
         "depends": [
-          "network-orchestrator-daemon"
+          "network-orchestrator-daemon",
+          "netorch (>= 0.14.0)"
         ]
       },
       "rpm": {
@@ -64,6 +65,7 @@
         ],
         "files": {
           "/usr/bin/network-orchestrator-daemon": "../target/release/network-orchestrator-daemon",
+          "/usr/bin/netorch": "../target/release/netorch",
           "/usr/lib/network-orchestrator/xray/v26.10.31/xray": "../target/release/xray-package/v26.10.31/xray",
           "/usr/lib/network-orchestrator/xray/v26.10.31/geoip.dat": "../target/release/xray-package/v26.10.31/geoip.dat",
           "/usr/lib/network-orchestrator/xray/v26.10.31/geosite.dat": "../target/release/xray-package/v26.10.31/geosite.dat",

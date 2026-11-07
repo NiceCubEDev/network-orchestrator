@@ -141,6 +141,46 @@ run `test_installers.py` directly on the host. The manual CI workflow runs both
 checks in its Linux installer job. These checks do not validate real VPNs or the
 Tauri GUI package build.
 
+## Shared Linux CLI/GUI runtime
+
+Both frontends use `LinuxEngine`, the same protected profile store and one
+unprivileged `netorch serve` process per data directory/daemon socket.
+The systemd user manager starts it on demand; a manually started `netorch serve`
+supports isolated environments without that manager. Do not run GUI as root.
+
+Verified on 2026-11-07 with the built Arch `0.14.0-1` package, installed only
+inside disposable containers:
+
+- Real pinned Xray served loopback HTTP through SOCKS as the unprivileged user.
+  Independent CLI processes observed one child; duplicate `up` was rejected;
+  extra command fields in runtime IPC were rejected without echoing their value.
+- The native Tauri Profiles row displayed a CLI-started connection. Its actual
+  switch disconnected/reconnected that same runtime; a CLI rename refreshed the
+  rendered row without reloading. SOCKS auto-connect skipped an already-running
+  profile with the privileged daemon absent.
+- Window close followed by GUI process termination left real SOCKS traffic
+  working; CLI `down` reaped the Xray child. Foreground SIGHUP disconnected
+  instead of leaving the shared connection running.
+- A real `systemd --user` unit started automatically as uid 1001. The real
+  privileged daemon retained an armed static profile beyond its 30-second
+  last-client grace after the CLI exited; the deferred profile changed no
+  kernel routes. Explicit `down` removed both local and daemon-owned state.
+- The existing packaged-WebView scenario installed and removed a proto-79
+  route on a disposable dummy interface through the real daemon and the actual
+  rendered switch. The daemon owner and route were absent after disconnect.
+
+`e2e/linux/run_app_gui.sh` needs all three matching `.deb` packages (GUI in the
+Tauri bundle directory, CLI/daemon in `target/release/packages`) or the combined
+RPM. It starts a real user manager and uses its canonical D-Bus session.
+Never run the route-mutating inspector scenario directly on the host.
+
+The native status bar also renders an available Xray with no version metadata
+as ready rather than absent.
+
+Linux Rust checks omit the macOS-only bridge/helper crates; a full workspace
+check on Linux fails at macOS `libc` APIs rather than validating those targets.
+
+
 ## Browser sandbox on macOS
 
 ```bash

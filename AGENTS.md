@@ -76,6 +76,10 @@ cargo test --workspace
 npm run build
 ```
 
+On Linux, append `--exclude net-manager-macos-bridge --exclude
+network-orchestrator-macos-helper` to the workspace check/clippy/test commands:
+those crates use native macOS APIs and must be checked on macOS instead.
+
 CI (`.github/workflows/ci.yml`) is manual-only (`workflow_dispatch`) and
 mirrors this gate on Windows.
 

@@ -104,7 +104,8 @@ mkdir -p "$C/usr/share/bash-completion/completions" "$C/usr/share/zsh/vendor-com
 chmod 0644 "$C"/usr/share/*/completions/netorch "$C/usr/share/zsh/vendor-completions/_netorch" \
     "$C/usr/share/fish/vendor_completions.d/netorch.fish" 2>/dev/null || true
 install -Dm0644 LICENSE "$C/usr/share/doc/netorch/copyright"
-control netorch "network-orchestrator-daemon (>= ${LINE}.0)" "" "" \
+control netorch "network-orchestrator-daemon (>= ${LINE}.0), libdbus-1-3" "" \
+    "Breaks: network-orchestrator (<< ${LINE}.0)" \
     "Network Orchestrator command line client
  Connects the VPN profiles of Network Orchestrator (WireGuard, OpenVPN and
  Xray) from a terminal or a script, without the graphical app. It talks to the

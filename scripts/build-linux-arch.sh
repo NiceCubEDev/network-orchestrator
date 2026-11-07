@@ -15,10 +15,12 @@ BUILD_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$BUILD_ROOT"' EXIT
 mkdir -p "$BUILD_ROOT/build/$PKGNAME-$PKGVER" "$REPO_ROOT/target/arch"
 
-tar -C "$REPO_ROOT" -cf - \
-    Cargo.toml Cargo.lock LICENSE package.json package-lock.json index.html \
-    tsconfig.json tsconfig.node.json vite.config.ts crates src src-tauri public packaging/linux \
-    packaging/arch/xray-NOTICES \
+tar -C "$REPO_ROOT" --exclude=__pycache__ --exclude=target --exclude=node_modules -cf - \
+    Cargo.toml Cargo.lock versions.toml build-support LICENSE \
+    package.json package-lock.json index.html \
+    tsconfig.json tsconfig.node.json vite.config.ts \
+    crates src src-tauri public packaging/linux packaging/arch/xray-NOTICES \
+    scripts locales design macos/Sources tests \
     | tar -C "$BUILD_ROOT/build/$PKGNAME-$PKGVER" -xf -
 tar -C "$BUILD_ROOT/build" -czf "$BUILD_ROOT/build/$PKGNAME-$PKGVER.tar.gz" \
     "$PKGNAME-$PKGVER"
@@ -45,8 +47,8 @@ docker run --rm \
     -v "$BUILD_ROOT/build:/build" -v "$REPO_ROOT/target/arch:/out" \
     -w /build archlinux:latest bash -euc '
         if [ "$VERIFY_ONLY" = 0 ]; then
-            pacman -Syu --noconfirm --needed base-devel rust nodejs npm pkgconf openssl \
-                libappindicator-gtk3 librsvg xdotool webkit2gtk-4.1 polkit iproute2
+            pacman -Syu --noconfirm --needed base-devel rust nodejs npm python pkgconf openssl \
+                libappindicator-gtk3 librsvg xdotool webkit2gtk-4.1 polkit iproute2 nftables
         fi
         groupadd -g "$HOST_GID" pkgbuild
         useradd -m -u "$HOST_UID" -g "$HOST_GID" pkgbuild

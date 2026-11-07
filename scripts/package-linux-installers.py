@@ -49,13 +49,16 @@ def validate(path, package, version, arch=None):
     return actual_arch
 
 
-def bundle(client, daemon, package, version, release, arch, out_dir):
+def bundle(client, daemon, package, version, release, arch, out_dir, cli=None):
     template = (ROOT / "packaging/linux/installer.sh.in").read_text()
     # Stream the payload; the pinned backend can be tens of megabytes.
     with tempfile.TemporaryFile() as payload:
         with gzip.GzipFile(fileobj=payload, mode="wb", filename="", mtime=0) as zipped:
             with tarfile.open(fileobj=zipped, mode="w|") as archive:
-                for path, name in [(client, "client.deb"), (daemon, "daemon.deb")]:
+                packages = [(client, "client.deb"), (daemon, "daemon.deb")]
+                if cli:
+                    packages.append((cli, "netorch.deb"))
+                for path, name in packages:
                     entry = tarfile.TarInfo(name)
                     entry.size = path.stat().st_size
                     entry.mode = 0o644
@@ -66,6 +69,7 @@ def bundle(client, daemon, package, version, release, arch, out_dir):
         for chunk in iter(lambda: payload.read(1024 * 1024), b""):
             checksum.update(chunk)
         values = {"CLIENT": package, "VERSION": version, "ARCH": arch,
+                  "WITH_CLI": "yes" if cli else "no",
                   "PAYLOAD_SHA256": checksum.hexdigest(),
                   "PAYLOAD_LINE": str(template.count("\n") + 1)}
         for key, value in values.items():
@@ -95,6 +99,8 @@ def main():
     args = parser.parse_args()
     if not args.cli and not args.gui:
         parser.error("provide --cli and/or --gui")
+    if args.gui and not args.cli:
+        parser.error("the GUI installer requires --cli for its shared user runtime")
     release = Repo(ROOT).versions()["linux"]
     version = release.replace("-", "~", 1)
     try:
@@ -107,7 +113,8 @@ def main():
         args.output_dir.mkdir(parents=True, exist_ok=True)
         for path, package in clients:
             if path:
-                print(bundle(path, args.daemon, package, version, release, arch, args.output_dir))
+                print(bundle(path, args.daemon, package, version, release, arch, args.output_dir,
+                             args.cli if package == "network-orchestrator" else None))
     except (OSError, ValueError, subprocess.CalledProcessError) as error:
         parser.exit(1, f"Cannot build installer: {error}\n")
 

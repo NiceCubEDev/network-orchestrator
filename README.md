@@ -326,14 +326,14 @@ scripts/build-linux-arch.sh
 
 For Debian/Ubuntu, distribute the single-file installers under
 `target/release/installers/`: `netorch-<version>-amd64.run` for the CLI and
-`network-orchestrator-<version>-amd64.run` for the GUI. Each contains its client
-and the shared daemon; users do not download a daemon package separately.
+`network-orchestrator-<version>-amd64.run` for the GUI. The CLI installer includes
+the shared daemon; the GUI installer includes both `netorch` and that daemon.
 
 ```bash
-sh ./netorch-0.10.1-amd64.run --check  # preview installed versions and planned actions
-sudo sh ./netorch-0.10.1-amd64.run    # install CLI or update an older installation
-# Later, add the GUI using the same daemon:
-sudo sh ./network-orchestrator-0.10.1-amd64.run
+sh ./netorch-0.14.0-amd64.run --check  # preview without installing
+sudo sh ./netorch-0.14.0-amd64.run
+# The GUI installer also installs/reuses netorch:
+sudo sh ./network-orchestrator-0.14.0-amd64.run
 ```
 
 Run the installer from a newer release to update. It compares installed Debian
@@ -346,11 +346,43 @@ The client and daemon are bundled; missing distribution dependencies may need
 internet access and current APT indexes. No application repository is required.
 When migrating from the former combined GUI package (0.10.0 or earlier), run the
 new GUI installer first to transfer the daemon files, then add the CLI.
+Do not mix an older GUI release line with the new shared CLI runtime; use the
+matching GUI installer to update both clients together.
 
 The CLI and daemon `.deb` files remain under `target/release/packages/`, the GUI
 `.deb` and `.rpm` under `target/release/bundle/{deb,rpm}/`, and the Arch package
-under `target/arch/`. RPM and Arch still use their existing packaging. The Arch
-build uses a disposable Docker container.
+under `target/arch/`. RPM and Arch contain GUI, CLI, daemon and the pinned Xray.
+The Arch build uses a disposable Docker container; on Arch/CachyOS install the
+resulting `target/arch/network-orchestrator-*.pkg.tar.zst` with `sudo pacman -U`.
+
+### One Linux backend, two clients
+
+`netorch` is the headless client; the GUI calls the same `LinuxEngine`, not a
+second connection implementation or a CLI subprocess for each action.
+Both use `${XDG_DATA_HOME:-$HOME/.local/share}/com.netmanager.app/` by default:
+profiles, managed configs, subscriptions, executable settings and remembered
+OpenVPN credentials are shared. `NETORCH_DATA_DIR` selects an absolute isolated
+data directory for either client; CLI `--data-dir` overrides it. The development
+GUI retains its separate `com.netmanager.app.dev` identity and daemon socket.
+Profile writes use an OS file lock and atomic replacement; CLI changes refresh
+the open GUI through its existing `route-changed` event.
+
+One unprivileged `netorch serve` process per data directory/daemon socket owns
+local Xray SOCKS/HTTP children and retains the daemon connection for detached
+WireGuard, OpenVPN, Xray TUN and static-route profiles. It starts on demand as
+a transient systemd user unit. Closing the GUI or the invoking shell does not
+disconnect it; either client can inspect/disconnect the same connection.
+Routes, interfaces and DNS remain polkit-authorized operations of the system
+daemon, never of the user service. Raw Xray JSON imports default to SOCKS mode.
+
+The user manager must be available (`systemctl --user status`). Without one,
+run `netorch serve` in a separate foreground session using the same data
+directory and daemon socket. User units normally stop at logout; keeping them
+across logout requires an explicit administrator-approved linger setting
+(`loginctl enable-linger "$USER"`). Nothing enables linger automatically.
+`netorch up --foreground` disconnects on interrupt, termination or terminal
+hangup. Root connections require `--foreground` and never launch the user service.
+
 
 ## Development
 
