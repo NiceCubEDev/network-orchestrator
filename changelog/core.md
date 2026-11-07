@@ -10,6 +10,8 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-11-07
+
 ### Added
 
 - Shared Linux profile, network, service, diagnostic, system and connection-set
