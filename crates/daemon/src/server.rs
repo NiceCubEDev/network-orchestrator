@@ -2284,13 +2284,21 @@ mod tests {
         .unwrap()
         .unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {
-            while runner.cleaned.load(Ordering::SeqCst) == 0 {
+            // The runner's cleanup callback precedes the journal commit.
+            // Wait for the observable teardown, not the intermediate mock signal.
+            while !JournalStore::new(dir.join(JOURNAL_FILE))
+                .load()
+                .unwrap()
+                .entries
+                .is_empty()
+            {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
         .unwrap();
         assert_eq!(runner.stopped.load(Ordering::SeqCst), 1);
+        assert_eq!(runner.cleaned.load(Ordering::SeqCst), 1);
         assert!(JournalStore::new(dir.join(JOURNAL_FILE))
             .load()
             .unwrap()
