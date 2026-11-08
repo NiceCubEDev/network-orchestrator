@@ -10,6 +10,10 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+## [0.15.1] - 2026-11-08
+
+Core 0.15.1.
+
 ### Fixed
 
 - Show the connected NetBird service when it uses a per-profile daemon socket.
