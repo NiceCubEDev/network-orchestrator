@@ -43,6 +43,8 @@ export class SandboxBackend {
   private serviceResults = new Map<string, ServiceCheckResult[]>();
   private serviceDue = new Map<string, number>();
   private serviceAttempts = new Map<string, Map<string, number>>();
+  private editRevisions = new Map<string, string>();
+  private nextEditRevision = 0;
 
   private serviceBindings(p: Profile): Set<string> {
     return new Set([
@@ -675,12 +677,21 @@ export class SandboxBackend {
         this.clearServiceState(p.id);
         return this.statuses().find((status) => status.profileId === p.id);
       }
+      case "get_profile_for_edit": {
+        const profile = this.find(args.id);
+        const revision = String(++this.nextEditRevision);
+        this.editRevisions.set(revision, JSON.stringify(profile));
+        return { profile, revision };
+      }
       case "save_profile":
       case "save_vless_profile":
       case "save_wireguard_profile": {
         const p = structuredClone(args.profile) as Profile;
         if (!p.id || !p.name?.trim()) throw new Error("Profile name is required");
         const existing = this.profiles.find((e) => e.id === p.id);
+        if (existing ? this.editRevisions.get(String(args.expectedRevision)) !== JSON.stringify(existing) : args.expectedRevision != null) {
+          throw new Error("profile changed; close and reopen the editor to reload");
+        }
         if (existing) this.stopped(existing);
         // Mirrors the Tauri command: failover settings are owned by their own
         // commands, a generic form save never drops them.

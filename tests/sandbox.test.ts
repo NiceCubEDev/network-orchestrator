@@ -107,17 +107,17 @@ test("service results cannot be attributed to a URL changed during a manual chec
   await assert.rejects(pending);
 });
 
-test("a stale ordinary profile edit preserves newer dedicated service settings", () => {
+test("a stale ordinary profile edit rejects newer dedicated service settings", () => {
   const backend = new SandboxBackend();
-  const stale = (backend.invoke("get_profiles") as Profile[]).find((p) => p.subscription)!;
+  const { profile: stale, revision } = backend.invoke("get_profile_for_edit", { id: "xray" }) as { profile: Profile; revision: string };
   const check: ServiceCheck = {
     id: "service-preserved", name: "Synthetic service", url: "https://service.example/health",
     endpointKey: stale.pinnedPolicies![0].endpointKey, background: false,
   };
   backend.invoke("set_xray_service_checks", { profileId: stale.id, checks: [check] });
   stale.name = "Edited ordinary name";
-  backend.invoke("save_profile", { profile: stale });
+  assert.throws(() => backend.invoke("save_profile", { profile: stale, expectedRevision: revision }), /profile changed/);
   const saved = (backend.invoke("get_profiles") as Profile[]).find((p) => p.id === stale.id)!;
-  assert.equal(saved.name, "Edited ordinary name");
+  assert.notEqual(saved.name, "Edited ordinary name");
   assert.deepEqual(saved.xrayServiceChecks, [check]);
 });

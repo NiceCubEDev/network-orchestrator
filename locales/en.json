@@ -495,6 +495,7 @@
     "form.endpointBypassesHint": "IPs or hostnames routed via the physical gateway, so another tunnel cannot swallow this tunnel's handshake.",
     "form.endpointBypassesPh": "vpn.example.com, 203.0.113.10",
     "form.errAnalysis": "Profile was saved, but static analysis failed: {err}",
+    "form.profileConflict": "This profile changed elsewhere. Close and reopen the editor to reload it before saving.",
     "form.errBypassSemicolon": "Proxy bypass entries must not contain ';'.",
     "form.errIfaceRequired": "Target interface is required when policy routes are set.",
     "form.errNoCidrs": "No CIDRs found in the pasted list.",

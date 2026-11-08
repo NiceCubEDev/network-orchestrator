@@ -367,6 +367,30 @@ pub(crate) async fn get_profiles(state: State<'_, AppState>) -> Result<Vec<Profi
         .map_err(|e| e.to_string())
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ProfileForEdit {
+    profile: Profile,
+    revision: String,
+}
+
+#[tauri::command]
+pub(crate) async fn get_profile_for_edit(
+    id: String,
+    state: State<'_, AppState>,
+) -> Result<ProfileForEdit, String> {
+    let document = state.profiles.load().map_err(|e| e.to_string())?;
+    let profile = document
+        .profiles
+        .into_iter()
+        .find(|p| p.id == id)
+        .ok_or_else(|| "profile not found".to_string())?;
+    let revision =
+        net_manager_core::profiles::profile_edit_revision(&profile).map_err(|e| e.to_string())?;
+    let profile = redact_profiles_for_ipc(vec![profile]).remove(0);
+    Ok(ProfileForEdit { profile, revision })
+}
+
 #[tauri::command]
 pub(crate) async fn reorder_profiles(
     backend: TunnelBackend,
@@ -383,6 +407,7 @@ pub(crate) async fn reorder_profiles(
 #[tauri::command]
 pub(crate) async fn save_profile(
     mut profile: Profile,
+    expected_revision: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<Vec<Profile>, String> {
     let _guard = SUBSCRIPTION_REFRESH_LOCK.lock().await;
@@ -425,7 +450,10 @@ pub(crate) async fn save_profile(
         Some(import.config_path)
     };
     let new_path = profile.config_path.clone();
-    let doc = match state.profiles.upsert(profile) {
+    let doc = match state
+        .profiles
+        .compare_upsert(profile, expected_revision.as_deref())
+    {
         Ok(doc) => doc,
         Err(err) => {
             if let Some(path) = imported {
@@ -486,6 +514,7 @@ pub(crate) async fn delete_profile(
 pub(crate) async fn save_vless_profile(
     mut profile: Profile,
     vless_url: String,
+    expected_revision: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<Vec<Profile>, String> {
     let _guard = SUBSCRIPTION_REFRESH_LOCK.lock().await;
@@ -517,7 +546,10 @@ pub(crate) async fn save_vless_profile(
     let import =
         store_generated_xray(&state.config_vault, &profile.id, &body).map_err(|e| e.to_string())?;
     profile.config_path = import.config_path.clone();
-    let doc = match state.profiles.upsert(profile) {
+    let doc = match state
+        .profiles
+        .compare_upsert(profile, expected_revision.as_deref())
+    {
         Ok(doc) => doc,
         Err(err) => {
             let _ = state
@@ -576,6 +608,7 @@ pub(crate) fn render_wireguard_config(fields: &WireGuardFields) -> String {
 pub(crate) async fn save_wireguard_profile(
     mut profile: Profile,
     fields: WireGuardFields,
+    expected_revision: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<Vec<Profile>, String> {
     let _guard = SUBSCRIPTION_REFRESH_LOCK.lock().await;
@@ -619,7 +652,10 @@ pub(crate) async fn save_wireguard_profile(
         .store_wireguard_config(&profile.id, &body)
         .map_err(|e| e.to_string())?;
     profile.config_path = import.config_path.clone();
-    let doc = match state.profiles.upsert(profile) {
+    let doc = match state
+        .profiles
+        .compare_upsert(profile, expected_revision.as_deref())
+    {
         Ok(doc) => doc,
         Err(err) => {
             let _ = state
@@ -1008,11 +1044,17 @@ fn set_tunnel_role_into(
     id: &str,
     role: net_manager_core::models::TunnelRole,
 ) -> Result<Vec<Profile>, String> {
-    let mut profile = tunnel_profile(store, id)?;
-    profile.tunnel_role = role;
     let document = store
-        .upsert(profile)
-        .map_err(|_| "failed to store the connection role".to_string())?;
+        .update_profile(id, |profile| {
+            if profile.backend == TunnelBackend::None {
+                return Err(std::io::Error::other(
+                    "Static routes do not create a tunnel",
+                ));
+            }
+            profile.tunnel_role = role;
+            Ok(())
+        })
+        .map_err(|e| e.to_string())?;
     Ok(redact_profiles_for_ipc(document.profiles))
 }
 
@@ -1022,12 +1064,20 @@ fn set_tunnel_networks_into(
     networks: &str,
     dns_domains: &str,
 ) -> Result<Vec<Profile>, String> {
-    let mut profile = tunnel_profile(store, id)?;
-    profile.tunnel_networks = net_manager_core::models::parse_networks(networks)?;
-    profile.tunnel_dns_domains = net_manager_core::models::parse_dns_domains(dns_domains)?;
+    let networks = net_manager_core::models::parse_networks(networks)?;
+    let dns_domains = net_manager_core::models::parse_dns_domains(dns_domains)?;
     let document = store
-        .upsert(profile)
-        .map_err(|_| "failed to store the connection networks".to_string())?;
+        .update_profile(id, |profile| {
+            if profile.backend == TunnelBackend::None {
+                return Err(std::io::Error::other(
+                    "Static routes do not create a tunnel",
+                ));
+            }
+            profile.tunnel_networks = networks;
+            profile.tunnel_dns_domains = dns_domains;
+            Ok(())
+        })
+        .map_err(|e| e.to_string())?;
     Ok(redact_profiles_for_ipc(document.profiles))
 }
 

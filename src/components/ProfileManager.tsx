@@ -1175,13 +1175,18 @@ export default function ProfileManager() {
     openNew(backend);
   };
 
-  const openEdit = (profile: Profile) => {
+  const openEdit = async (profile: Profile) => {
     if (alwaysOn?.profiles.some((item) => item.profileId === profile.id)) {
       setError(t("profiles.disableAlwaysOnEdit"));
       return;
     }
-    setEditing(editFormState(profile));
-    setFormOpen(true);
+    try {
+      const editable = await invoke<{ profile: Profile; revision: string }>("get_profile_for_edit", { id: profile.id });
+      setEditing(editFormState(editable.profile, editable.revision));
+      setFormOpen(true);
+    } catch (err) {
+      setError(String(err));
+    }
   };
 
   const onToggleAlwaysOn = async (profile: Profile, kind: AlwaysOnKind, enrolled: boolean) => {

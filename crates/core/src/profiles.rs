@@ -7,6 +7,15 @@ use std::path::PathBuf;
 
 pub const PROFILE_DOCUMENT_VERSION: u32 = 1;
 
+pub fn profile_edit_revision(profile: &Profile) -> io::Result<String> {
+    use sha2::{Digest, Sha256};
+    let canonical = serde_json::to_value(profile).map_err(|_| invalid_data("invalid profile"))?;
+    let bytes = serde_json::to_vec(&canonical).map_err(|_| invalid_data("invalid profile"))?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+pub const PROFILE_EDIT_CONFLICT: &str = "profile changed; close and reopen the editor to reload";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ProfileDocument {
@@ -117,6 +126,32 @@ impl ProfileStore {
             *existing = profile;
         } else {
             document.profiles.push(profile);
+        }
+        self.save_locked(&document)?;
+        Ok(document)
+    }
+
+    pub fn compare_upsert(
+        &self,
+        profile: Profile,
+        expected_revision: Option<&str>,
+    ) -> io::Result<ProfileDocument> {
+        validate_profile(&profile)?;
+        let _guard = self.lock()?;
+        let mut document = self.load()?;
+        match document.profiles.iter_mut().find(|p| p.id == profile.id) {
+            Some(existing) => {
+                if expected_revision != Some(profile_edit_revision(existing)?.as_str()) {
+                    return Err(io::Error::other(PROFILE_EDIT_CONFLICT));
+                }
+                *existing = profile;
+            }
+            None => {
+                if expected_revision.is_some() {
+                    return Err(io::Error::other(PROFILE_EDIT_CONFLICT));
+                }
+                document.profiles.push(profile);
+            }
         }
         self.save_locked(&document)?;
         Ok(document)
@@ -430,6 +465,55 @@ mod tests {
     }
 
     #[test]
+    fn compare_upsert_requires_matching_existence() {
+        let dir = unique_dir("compare-existence");
+        let store = ProfileStore::new(dir.join("profiles.json"));
+        let profile = wg_profile();
+        store.compare_upsert(profile.clone(), None).unwrap();
+        assert!(store.compare_upsert(profile.clone(), None).is_err());
+        let revision = profile_edit_revision(&profile).unwrap();
+        store.delete(&profile.id).unwrap();
+        assert!(store.compare_upsert(profile, Some(&revision)).is_err());
+        assert!(store.load().unwrap().profiles.is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn stale_whole_profile_replacement_preserves_narrow_edits() {
+        let dir = unique_dir("stale-replacement");
+        let path = dir.join("profiles.json");
+        let gui = ProfileStore::new(path.clone());
+        let cli = ProfileStore::new(path);
+        let original = wg_profile();
+        gui.upsert(original.clone()).unwrap();
+        let baseline = gui.load().unwrap().profiles.remove(0);
+        let revision = profile_edit_revision(&baseline).unwrap();
+        cli.update_profile(&original.id, |profile| {
+            profile.name = "CLI rename".into();
+            profile.routes[0].metric = 42;
+            Ok(())
+        })
+        .unwrap();
+        let mut stale = baseline;
+        stale.auto_connect = false;
+        assert!(gui.compare_upsert(stale, Some(&revision)).is_err());
+        let latest = cli.load().unwrap().profiles.remove(0);
+        assert_eq!(latest.name, "CLI rename");
+        assert_eq!(latest.routes[0].metric, 42);
+        assert!(latest.auto_connect);
+        let fresh_revision = profile_edit_revision(&latest).unwrap();
+        let mut replacement = latest;
+        replacement.auto_connect = false;
+        gui.compare_upsert(replacement, Some(&fresh_revision))
+            .unwrap();
+        let saved = cli.load().unwrap().profiles.remove(0);
+        assert_eq!(saved.name, "CLI rename");
+        assert_eq!(saved.routes[0].metric, 42);
+        assert!(!saved.auto_connect);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn independent_stores_preserve_concurrent_profile_edits() {
         let dir = unique_dir("concurrent-stores");
         let path = dir.join("profiles.json");
@@ -525,6 +609,38 @@ mod tests {
         profile.config_path = PathBuf::from("proxy-host.json");
         profile.subscription = Some(subscription_meta());
         profile
+    }
+
+    #[test]
+    fn edit_revision_tracks_hidden_subscription_metadata_across_stores() {
+        let dir = unique_dir("hidden-subscription-revision");
+        let path = dir.join("profiles.json");
+        let gui = ProfileStore::new(path.clone());
+        let cli = ProfileStore::new(path);
+        let profile = xray_sub_profile();
+        gui.upsert(profile.clone()).unwrap();
+        let baseline = gui.load().unwrap().profiles.remove(0);
+        let revision = profile_edit_revision(&baseline).unwrap();
+        assert_eq!(
+            revision,
+            profile_edit_revision(&cli.load().unwrap().profiles[0]).unwrap()
+        );
+        assert!(!revision.contains(&baseline.subscription.as_ref().unwrap().url));
+        cli.update_profile(&profile.id, |current| {
+            current.subscription.as_mut().unwrap().hwid = "changed-private-hwid".into();
+            Ok(())
+        })
+        .unwrap();
+        assert!(gui.compare_upsert(baseline, Some(&revision)).is_err());
+        assert_eq!(
+            cli.load().unwrap().profiles[0]
+                .subscription
+                .as_ref()
+                .unwrap()
+                .hwid,
+            "changed-private-hwid"
+        );
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

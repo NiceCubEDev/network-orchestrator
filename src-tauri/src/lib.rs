@@ -144,6 +144,7 @@ pub fn run() {
             remove_always_on_profile,
             resume_always_on,
             get_profiles,
+            get_profile_for_edit,
             save_profile,
             save_vless_profile,
             save_wireguard_profile,

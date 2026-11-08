@@ -115,6 +115,7 @@ function parseBypass(text: string): string[] {
 export interface ProfileFormState {
   /** Preserve settings owned by dedicated editors, not this form. */
   preservedProfile: Profile | null;
+  expectedRevision: string | null;
   id: string;
   name: string;
   backend: TunnelBackend;
@@ -199,6 +200,7 @@ export function newFormState(
 ): ProfileFormState {
   return {
     preservedProfile: null,
+    expectedRevision: null,
     id: newProfileId(),
     name: "",
     backend,
@@ -238,9 +240,10 @@ export function newFormState(
   };
 }
 
-export function editFormState(profile: Profile): ProfileFormState {
+export function editFormState(profile: Profile, revision: string): ProfileFormState {
   return {
     preservedProfile: structuredClone(profile),
+    expectedRevision: revision,
     id: profile.id,
     name: profile.name,
     backend: profile.backend,
@@ -694,15 +697,17 @@ export default function ProfileFormModal({
       if (isVlessImport) {
         updated = await invoke<Profile[]>("save_vless_profile", {
           profile: payload,
+          expectedRevision: current.expectedRevision,
           vlessUrl: current.vlessUrl.trim(),
         });
       } else if (isWgFields) {
         updated = await invoke<Profile[]>("save_wireguard_profile", {
           profile: payload,
+          expectedRevision: current.expectedRevision,
           fields: current.wgFields,
         });
       } else {
-        updated = await invoke<Profile[]>("save_profile", { profile: payload });
+        updated = await invoke<Profile[]>("save_profile", { profile: payload, expectedRevision: current.expectedRevision });
       }
       let inspection: ProfileInspection | null = null;
       try {
@@ -717,7 +722,8 @@ export default function ProfileFormModal({
       setForm(null);
       setFormError(null);
     } catch (err) {
-      setFormError(String(err));
+      setFormError(String(err).includes("profile changed; close and reopen the editor to reload")
+        ? tr("form.profileConflict") : String(err));
     } finally {
       setSaving(false);
     }
