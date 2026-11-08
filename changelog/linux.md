@@ -10,12 +10,6 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
-### Fixed
-
-- Show the connected NetBird service when it uses a per-profile daemon socket.
-- Exclude NetworkManager's external-device placeholders (including NetBird's
-  `wt0`) from controllable VPN/WireGuard profiles; keep NM-managed connections.
-
 ## [0.16.0] - 2026-11-08
 
 Core 0.16.0.
@@ -53,6 +47,16 @@ Core 0.16.0.
   that has not yet executed its program.
 - Avoid repeated full-buffer scans while receiving daemon events, including
   oversized frames that must be rejected without exposing their contents.
+
+## [0.15.1] - 2026-11-08
+
+Core 0.15.1.
+
+### Fixed
+
+- Show the connected NetBird service when it uses a per-profile daemon socket.
+- Exclude NetworkManager's external-device placeholders (including NetBird's
+  `wt0`) from controllable VPN/WireGuard profiles; keep NM-managed connections.
 
 ## [0.15.0] - 2026-11-07
 
