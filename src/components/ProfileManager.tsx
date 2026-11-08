@@ -4,7 +4,6 @@ import { confirm } from "@tauri-apps/plugin-dialog";
 import { ensureElevation, requiresElevation } from "../elevation";
 import { usePlatformCapabilities } from "../platform";
 import {
-  setLastProfileId,
   useAppMode,
   useProfileListMode,
   useScanLocalProxies,
@@ -868,7 +867,6 @@ export default function ProfileManager() {
             t("profiles.connectFailedDiag", { name: profile.name }),
         );
       } else {
-        setLastProfileId(profile.id);
         if (status.message) toast("info", status.message);
       }
     }, (err) => {
@@ -2307,9 +2305,8 @@ export default function ProfileManager() {
           setOpenVpnCredentialProfile(null);
           pending.resolve({ credentials, remember });
         } : undefined}
-        onConnected={(profile, status) => {
+        onConnected={(_profile, status) => {
           if (status.message) toast("info", status.message);
-          setLastProfileId(profile.id);
           setOpenVpnCredentialProfile(null);
           void refreshAll();
         }}

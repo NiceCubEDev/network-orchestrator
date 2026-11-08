@@ -139,22 +139,3 @@ export function useAppMode(): AppMode {
   }, []);
   return mode;
 }
-
-const LAST_PROFILE_KEY = "netmanager.home.lastProfile";
-
-/** The profile last connected from this app, for the Home quick action. */
-export function getLastProfileId(): string | null {
-  try {
-    return localStorage.getItem(LAST_PROFILE_KEY);
-  } catch {
-    return null;
-  }
-}
-
-export function setLastProfileId(id: string): void {
-  try {
-    localStorage.setItem(LAST_PROFILE_KEY, id);
-  } catch {
-    // ignore storage errors (e.g. storage disabled)
-  }
-}

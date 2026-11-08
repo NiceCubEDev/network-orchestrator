@@ -10,6 +10,11 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+### Changed
+
+- Open directly to Profiles and remove the redundant Home dashboard and its
+  navigation shortcuts. Connection controls remain in Profiles and the tray.
+
 ## [0.10.3] - 2026-11-08
 
 Core 0.16.0.

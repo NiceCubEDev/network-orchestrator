@@ -1,7 +1,7 @@
-import { ActivityIcon, HomeIcon, ConditionsIcon, ProfileIcon, NetworkIcon, RouteIcon, LogsIcon, SettingsIcon } from "../icons";
+import { ActivityIcon, ConditionsIcon, ProfileIcon, NetworkIcon, RouteIcon, LogsIcon, SettingsIcon } from "../icons";
 import { TranslationKey, useT } from "../i18n";
 
-export type Tab = "home" | "profiles" | "monitor" | "routes" | "conditions" | "network" | "logs" | "settings";
+export type Tab = "profiles" | "monitor" | "routes" | "conditions" | "network" | "logs" | "settings";
 
 interface NavItem {
   id: Tab;
@@ -10,7 +10,6 @@ interface NavItem {
 }
 
 const PRIMARY: NavItem[] = [
-  { id: "home", labelKey: "Home", icon: <HomeIcon size={20} /> },
   { id: "profiles", labelKey: "nav.profiles", icon: <ProfileIcon size={20} /> },
   { id: "monitor", labelKey: "nav.monitor", icon: <ActivityIcon size={20} /> },
   { id: "routes", labelKey: "nav.routes", icon: <RouteIcon size={20} /> },
