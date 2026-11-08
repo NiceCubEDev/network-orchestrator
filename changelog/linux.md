@@ -10,6 +10,10 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-11-08
+
+Core 0.16.0.
+
 ### Added
 
 - Headless `netorch watch` JSONL snapshots, `diagnose` findings and explicit
