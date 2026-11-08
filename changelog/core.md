@@ -10,6 +10,11 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+### Fixed
+
+- Detect NetBird's default per-profile daemon socket when the legacy socket is
+  absent, so a running service is not reported as stopped.
+
 ## [0.16.0] - 2026-11-08
 
 ### Added

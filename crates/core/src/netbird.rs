@@ -50,6 +50,17 @@ fn executable(path: &Path) -> bool {
     std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
+fn default_socket(legacy: &Path) -> PathBuf {
+    if !legacy.exists() {
+        // Profile-based installs keep the default daemon in netbird/default.sock.
+        let profile = legacy.with_extension("").join("default.sock");
+        if profile.exists() {
+            return profile;
+        }
+    }
+    legacy.to_path_buf()
+}
+
 impl NetBird {
     /// The installed CLI and the daemon socket; both can be pointed elsewhere
     /// for tests and unusual installs.
@@ -61,7 +72,7 @@ impl NetBird {
             .find(|path| executable(path));
         let socket = std::env::var_os("NETORCH_NETBIRD_SOCKET")
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_SOCKET));
+            .unwrap_or_else(|| default_socket(Path::new(DEFAULT_SOCKET)));
         Self { cli, socket }
     }
 
@@ -715,6 +726,29 @@ mod tests {
         assert!(!text.contains("SECRETKEYMATERIAL") && !text.contains("private event"));
         assert!(calls(dir.path()).contains("--daemon-addr unix://"));
         assert!(calls(dir.path()).contains("status --json"));
+    }
+
+    #[test]
+    fn profile_socket_is_used_when_the_legacy_socket_is_absent() {
+        let _turn = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        cancel_pending();
+        let dir = tempfile::tempdir().unwrap();
+        let mut nb = fake_cli(dir.path(), STATUS, "0");
+        std::fs::remove_file(&nb.socket).unwrap();
+        let legacy = dir.path().join("run/netbird.sock");
+        let profile = dir.path().join("run/netbird/default.sock");
+        std::fs::create_dir_all(profile.parent().unwrap()).unwrap();
+        std::fs::write(&profile, b"").unwrap();
+        nb.socket = default_socket(&legacy);
+        assert_eq!(nb.status()["state"], "connected");
+        assert_eq!(nb.socket, profile);
+
+        std::fs::write(&legacy, b"").unwrap();
+        assert_eq!(default_socket(&legacy), legacy);
+        std::fs::remove_file(&legacy).unwrap();
+        std::fs::remove_file(&profile).unwrap();
+        nb.socket = default_socket(&legacy);
+        assert_eq!(nb.status()["state"], "daemonStopped");
     }
 
     #[test]
