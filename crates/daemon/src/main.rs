@@ -24,7 +24,7 @@ mod linux {
     use network_orchestrator_daemon::netlink::{watch_network_changes, NetlinkExecutor};
     use network_orchestrator_daemon::openvpn_process::TrustedOpenVpnProcess;
     use network_orchestrator_daemon::server::{
-        bind_socket, eval_conditional, serve, watch_client_sessions, OwnerEvent, ServerContext,
+        bind_socket, eval_conditional, serve, OwnerEvent, ServerContext,
     };
     use network_orchestrator_daemon::settings::{SettingsStore, SETTINGS_FILE};
     use network_orchestrator_daemon::xray_process::TrustedXrayProcess;
@@ -214,8 +214,6 @@ mod linux {
         // so the reconcile refreshes bypass gateways right after resume.
         let suspend_wake = network_wake.clone();
         let suspend_watch = tokio::spawn(watch_suspend_resume(suspend_wake));
-        let session_ctx = ctx.clone();
-        let session_watch = tokio::spawn(watch_client_sessions(session_ctx));
         let network_core = ctx.core.clone();
         let network_events = ctx.events.clone();
         let network_ctx = ctx.clone();
@@ -266,8 +264,6 @@ mod linux {
         let _ = network_reconcile.await;
         suspend_watch.abort();
         let _ = suspend_watch.await;
-        session_watch.abort();
-        let _ = session_watch.await;
         if let Some(watch) = network_watch {
             watch.abort();
             let _ = watch.await;

@@ -366,22 +366,62 @@ data directory for either client; CLI `--data-dir` overrides it. The development
 GUI retains its separate `com.netmanager.app.dev` identity and daemon socket.
 Profile writes use an OS file lock and atomic replacement; CLI changes refresh
 the open GUI through its existing `route-changed` event.
+Opening an existing GUI editor obtains the profile and an opaque edit revision
+from one read. Saving uses an atomic revision comparison; a concurrent CLI edit
+causes a reload conflict instead of silently overwriting the newer profile.
+
+System connections (WireGuard, OpenVPN, Xray TUN and static-route profiles) are
+owned by the privileged daemon until explicit disconnect or backend cleanup.
+They require neither an open CLI/GUI nor a user service to keep them alive.
+Either client can inspect/disconnect the same connection. Routes, interfaces
+and DNS remain polkit-authorized operations of the system daemon.
 
 One unprivileged `netorch serve` process per data directory/daemon socket owns
-local Xray SOCKS/HTTP children and retains the daemon connection for detached
-WireGuard, OpenVPN, Xray TUN and static-route profiles. It starts on demand as
-a transient systemd user unit. Closing the GUI or the invoking shell does not
-disconnect it; either client can inspect/disconnect the same connection.
-Routes, interfaces and DNS remain polkit-authorized operations of the system
-daemon, never of the user service. Raw Xray JSON imports default to SOCKS mode.
-
-The user manager must be available (`systemctl --user status`). Without one,
-run `netorch serve` in a separate foreground session using the same data
-directory and daemon socket. User units normally stop at logout; keeping them
-across logout requires an explicit administrator-approved linger setting
-(`loginctl enable-linger "$USER"`). Nothing enables linger automatically.
+local Xray SOCKS/HTTP children and user proxy rollback. It starts on demand as
+a transient systemd user unit; closing the GUI or invoking shell does not
+disconnect it. Raw Xray JSON imports default to SOCKS mode.
+For these local proxies, the user manager must be available
+(`systemctl --user status`). Without one, run `netorch serve` in a separate
+foreground session using the same data directory and daemon socket. User units
+normally stop at logout; keeping them across logout requires an explicit
+administrator-approved linger setting (`loginctl enable-linger "$USER"`).
+Nothing enables linger automatically.
 `netorch up --foreground` disconnects on interrupt, termination or terminal
 hangup. Root connections require `--foreground` and never launch the user service.
+
+The user service restarts on failure to restore saved proxy settings, not to
+reconnect profiles. Its global proxy lock and ownership marker live in
+`${XDG_STATE_HOME:-$HOME/.local/state}/netorch/`, independently of ephemeral
+session sockets. A different data directory cannot take over an unrestored proxy.
+
+Headless observation and explicit recovery:
+
+```bash
+netorch diagnose [PROFILE]
+netorch --json watch [PROFILE]
+netorch recover
+netorch recover --cleanup
+```
+
+`diagnose` and `recover` without `--cleanup` are read-only reports. Diagnostics
+exit successfully when the report is produced, even when its findings describe
+failures. **`recover --cleanup` disconnects all current-user daemon and local
+connections, restores the saved user proxy and pauses always-on definitions**;
+it is not limited to stale owners and does not delete saved profiles.
+
+JSON `watch` emits one snapshot per line, with `type`, `reason`, `daemon` and
+`profiles` fields. Reasons are `initial`, `change`, `resync`, `disconnected` and
+`reconnected`; profile states are `running`, `stopped`, `failed` or `unknown`.
+Lost IPC never preserves a cached `running` state. Subscription events trigger
+fresh snapshots; bounded polling also observes local children and profile edits.
+The GUI uses the same event transport and refreshes after reconnect/event gaps.
+
+CLI exit codes are 0 for success, 1 for operation failure and 2 for invalid usage.
+With `--json`, errors on stderr use
+`{"error":{"kind":"usage|operation","message":"..."}}`; watch stdout remains JSONL.
+
+The cross-platform target and migration boundary are defined in
+[`ARCHITECTURE_CONTRACT.md`](ARCHITECTURE_CONTRACT.md).
 
 
 ## Development

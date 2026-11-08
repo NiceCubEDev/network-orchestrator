@@ -15,6 +15,7 @@ mod endpoints;
 mod hold;
 mod library;
 mod migrate;
+mod observe;
 mod proxy;
 mod route;
 
@@ -28,8 +29,22 @@ pub fn main() -> ExitCode {
         Some("proxy") => Some("proxy"),
         _ => None,
     });
+    let json_requested = std::env::args_os().any(|arg| arg == "--json");
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
+        Err(error)
+            if json_requested
+                && !matches!(
+                    error.kind(),
+                    clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+                ) =>
+        {
+            eprintln!(
+                "{}",
+                serde_json::json!({"error":{"kind":"usage","message":"Invalid arguments; use --help for usage."}})
+            );
+            return ExitCode::from(2);
+        }
         Err(error)
             if private_command.is_some()
                 && !matches!(
@@ -53,6 +68,8 @@ pub fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     let json = cli.json;
+    let recovery_cleanup = matches!(&cli.command, Command::Recover { cleanup: true });
+    let watch = matches!(&cli.command, Command::Watch { .. });
     let result = cli
         .data_dir
         .clone()
@@ -70,11 +87,35 @@ pub fn main() -> ExitCode {
         .and_then(|ctx| run(&ctx, cli.command, json));
     match result {
         Ok((value, text)) => {
-            print_output(json, &value, &text);
+            if !(value.is_null() && text.is_empty()) {
+                print_output(json, &value, &text);
+            }
             ExitCode::SUCCESS
         }
         Err(error) => {
-            eprintln!("netorch: {error}");
+            if json {
+                let message = if (recovery_cleanup
+                    && (error.starts_with("local cleanup or proxy restoration failed")
+                        || error.starts_with("daemon cleanup failed")))
+                    || (watch
+                        && [
+                            observe::WATCH_UNSUPPORTED,
+                            observe::WATCH_INCOMPATIBLE,
+                            observe::WATCH_PROTOCOL,
+                        ]
+                        .contains(&error.as_str()))
+                {
+                    error.as_str()
+                } else {
+                    "The operation failed."
+                };
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"error":{"kind":"operation","message":message}})
+                );
+            } else {
+                eprintln!("netorch: {error}");
+            }
             ExitCode::FAILURE
         }
     }
@@ -151,6 +192,9 @@ fn run(ctx: &ctx::Ctx, command: Command, json: bool) -> Result<commands::Output,
         Command::Version => compat::version(ctx),
         Command::Ls => commands::ls(ctx),
         Command::Status { target } => commands::status(ctx, target.as_deref()),
+        Command::Watch { target } => observe::watch(ctx, target.as_deref(), json),
+        Command::Diagnose { target } => observe::diagnose(ctx, target.as_deref()),
+        Command::Recover { cleanup } => observe::recover(ctx, cleanup),
         Command::Add(args) => library::add(ctx, &args.input, args.name.as_deref()),
         Command::Rm { target } => library::rm(ctx, &target),
         Command::Rename { target, name } => library::rename(ctx, &target, &name),
@@ -176,8 +220,7 @@ fn run(ctx: &ctx::Ctx, command: Command, json: bool) -> Result<commands::Output,
     }
 }
 
-/// Detached connections belong to the shared user service; foreground mode
-/// additionally disconnects when this terminal receives a termination signal.
+/// Foreground mode disconnects when this terminal receives a termination signal.
 fn up(ctx: &ctx::Ctx, args: &args::UpArgs, json: bool) -> Result<commands::Output, String> {
     let (value, mut text) = commands::up(ctx, args)?;
     if args.foreground {
@@ -189,6 +232,6 @@ fn up(ctx: &ctx::Ctx, args: &args::UpArgs, json: bool) -> Result<commands::Outpu
             message,
         ));
     }
-    text.push_str("\nManaged by the shared netorch user service; `netorch down` disconnects.");
+    text.push_str("\nUse `netorch down` to disconnect.");
     Ok((value, text))
 }

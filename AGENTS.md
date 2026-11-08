@@ -18,14 +18,21 @@ Guidance for agents/contributors working in this repository.
   (`docs/plans/2026-10-15-19-netorch-cli.md`). On Linux, `linux` holds pure
   daemon request builders and `linux_engine::LinuxEngine` serves both CLI and GUI.
   `linux_session` hosts their unprivileged `netorch serve` runtime: local Xray
-  children and detached daemon client lifetime. No UI, no FFI.
+  children and user proxy supervision. System connections belong to the daemon
+  independently of client lifetime. `linux_events` provides the bounded shared
+  daemon subscription transport; CLI snapshots and GUI invalidations resync after
+  gaps/reconnects. Global user-proxy ownership lives in persistent XDG state.
+  Target architecture: `ARCHITECTURE_CONTRACT.md`. No UI, no FFI.
 - `crates/cli` — the `netorch` command line tool. macOS: clap commands over
   `crates/engine` and the bridge's profile/import/routing services; ships in
   the app bundle next to the helper. Linux (`src/linux/`): a client of the
   network daemon built on `LinuxEngine` and the import/subscription code of
   `crates/core`, no GUI needed. `serve` is started on demand as one systemd user
-  unit per data directory/daemon socket; no per-profile keepers. The user runtime
-  must stay unprivileged; routes/interfaces/DNS remain system-daemon-only.
+  unit per data directory/daemon socket; no per-profile keepers. `watch`, `diagnose`
+  and `recover` provide headless observation and explicit recovery; `recover
+  --cleanup` disconnects all current-user sessions and pauses always-on.
+  The user runtime must stay unprivileged; routes/interfaces/DNS remain
+  system-daemon-only.
 - `crates/macos-bridge` — unprivileged JSON C ABI staticlib the Swift client
   links; every macOS core operation goes through it. A thin JSON wrapper over
   `crates/engine` for runtime operations.

@@ -79,9 +79,18 @@ impl LinuxEngine {
 
     /// Explicit transport endpoint for a sandbox or isolated development daemon.
     pub fn for_socket(socket: PathBuf, client_name: impl Into<String>) -> Self {
+        Self::for_socket_with_timeout(socket, client_name, std::time::Duration::from_secs(330))
+    }
+
+    /// Bounded read-only observation must not wait for a mutation's polkit deadline.
+    pub fn for_socket_with_timeout(
+        socket: PathBuf,
+        client_name: impl Into<String>,
+        timeout: std::time::Duration,
+    ) -> Self {
         let client = HelperClient::new(&socket)
             .with_client_name(client_name)
-            .with_timeout(std::time::Duration::from_secs(330));
+            .with_timeout(timeout);
         Self {
             privileged: Arc::new(client),
             data_root: None,
@@ -129,28 +138,6 @@ impl LinuxEngine {
     pub fn recover_local_proxy(&self) -> Result<(), String> {
         self.local_request(crate::linux_session::Request::RecoverProxy)
             .map(|_| ())
-    }
-
-    /// Retain a daemon connection independently of the frontend process.
-    /// The frontend still performs all polkit-authorized mutations itself.
-    #[cfg(target_os = "linux")]
-    pub fn retain_connection(&self, profile: &Profile) -> Result<(), String> {
-        if !Self::requires_daemon(profile)
-            || self.data_root.is_none()
-            || self.socket.is_none()
-            || unsafe { libc::geteuid() } == 0
-        {
-            return Ok(());
-        }
-        if let Err(error) = self.local_request(crate::linux_session::Request::ObserveDaemon) {
-            return Err(match self.disconnect(profile) {
-                Ok(_) => format!("Cannot retain the connection: {error}"),
-                Err(cleanup) => {
-                    format!("Cannot retain the connection: {error}; rollback failed: {cleanup}")
-                }
-            });
-        }
-        Ok(())
     }
 
     pub fn requires_daemon(profile: &Profile) -> bool {
@@ -271,6 +258,23 @@ impl LinuxEngine {
             || cfg!(target_os = "linux")
     }
 
+    #[cfg(target_os = "linux")]
+    fn rollback_local_route_failure(
+        &self,
+        id: &str,
+        error: String,
+        cleanup: impl FnOnce() -> Result<(), String>,
+    ) -> String {
+        let mut message = error;
+        if let Err(cause) = self.remove_profile_routes(id) {
+            message.push_str(&format!("; route cleanup failed: {cause}"));
+        }
+        if let Err(cause) = cleanup() {
+            message.push_str(&format!("; local cleanup failed: {cause}"));
+        }
+        message
+    }
+
     pub fn connect(
         &self,
         vault: &ConfigVault,
@@ -297,14 +301,12 @@ impl LinuxEngine {
                 })?;
                 if Self::requires_daemon(profile) {
                     if let Err(error) = self.apply_profile_routes(profile) {
-                        let cleanup =
+                        return Err(self.rollback_local_route_failure(&profile.id, error, || {
                             self.local_request(crate::linux_session::Request::Disconnect {
                                 id: profile.id.clone(),
-                            });
-                        return Err(match cleanup {
-                            Ok(_) => error,
-                            Err(cleanup) => format!("{error}; local cleanup failed: {cleanup}"),
-                        });
+                            })
+                            .map(|_| ())
+                        }));
                     }
                 }
                 Ok(status)
@@ -328,8 +330,6 @@ impl LinuxEngine {
             }
             _ => self.start_xray(vault, profile, method::XRAY_CONNECT),
         }?;
-        #[cfg(target_os = "linux")]
-        self.retain_connection(profile)?;
         Ok(status)
     }
     fn xray_params(
@@ -561,6 +561,59 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ambiguous_route_apply_rolls_back_owned_routes_and_local_proxy() {
+        struct CommittedDaemon(Mutex<Option<String>>);
+        impl Privileged for CommittedDaemon {
+            fn hello(&self) -> Result<HelloResult, HelperError> {
+                FakeDaemon::default().hello()
+            }
+            fn call_raw(&self, method: &str, params: Value) -> Result<Value, HelperError> {
+                match method {
+                    method::ROUTES_APPLY => {
+                        *self.0.lock().unwrap() = Some(params["owner"].as_str().unwrap().into());
+                        Ok(json!({}))
+                    }
+                    method::ROUTES_REMOVE => {
+                        assert_eq!(self.0.lock().unwrap().as_deref(), params["owner"].as_str());
+                        *self.0.lock().unwrap() = None;
+                        Ok(json!({"removed": 1}))
+                    }
+                    _ => panic!("unexpected daemon method"),
+                }
+            }
+            fn log_dir(&self) -> PathBuf {
+                PathBuf::new()
+            }
+        }
+        let daemon = Arc::new(CommittedDaemon(Mutex::new(None)));
+        let engine = LinuxEngine::with_privileged(daemon.clone());
+        let apply: Result<net_manager_core::daemon_protocol::RoutesApplyResult, String> =
+            engine.ask(method::ROUTES_APPLY, json!({"owner": "mixed"}));
+        let mut local_running = true;
+        let error = engine.rollback_local_route_failure("mixed", apply.unwrap_err(), || {
+            local_running = false;
+            Ok(())
+        });
+        assert!(!error.is_empty());
+        assert!(!local_running);
+        assert!(daemon.0.lock().unwrap().is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn route_and_local_rollback_failures_are_both_reported() {
+        let (engine, daemon) = engine(FakeDaemon::default());
+        let message = engine.rollback_local_route_failure("mixed", "apply failed".into(), || {
+            Err("local failed".into())
+        });
+        assert!(message.contains("apply failed"));
+        assert!(message.contains("route cleanup failed"));
+        assert!(message.contains("local cleanup failed: local failed"));
+        assert_eq!(daemon.calls.lock().unwrap()[0].1["owner"], "mixed");
+    }
+
     struct NoCredentials;
     impl CredentialSource for NoCredentials {
         fn load(
@@ -600,6 +653,27 @@ mod tests {
         json!({"profileId": "wg1", "state": state, "interfaceName": "wg1",
             "latestHandshake": null, "rxBytes": 0, "txBytes": 0, "dnsApplied": true,
             "warnings": []})
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn daemon_connection_does_not_require_a_user_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, profile) = wireguard_profile(dir.path());
+        let (mut engine, daemon) = engine(FakeDaemon {
+            replies: HashMap::from([(
+                method::WIREGUARD_CONNECT,
+                json!({"status": wg_status("running")}),
+            )]),
+            ..Default::default()
+        });
+        engine.data_root = Some(PathBuf::from("not-an-absolute-data-root"));
+        engine.socket = Some(dir.path().join("daemon.sock"));
+        let status = engine
+            .connect(&vault, &profile, None, &NoCredentials)
+            .unwrap();
+        assert_eq!(status.state, TunnelState::Running);
+        assert_eq!(daemon.calls.lock().unwrap().len(), 1);
     }
 
     #[test]

@@ -104,7 +104,7 @@ pub(crate) async fn linux_xray_status_result(
 ) -> Result<XrayStatusResult, String> {
     let id = profile.id.clone();
     client
-        .engine_request(move |engine| engine.xray_status_result(&id))
+        .engine_observation(move |engine| engine.xray_status_result(&id))
         .await
 }
 
@@ -213,7 +213,7 @@ pub(crate) async fn linux_openvpn_status_result(
 ) -> Result<OpenVpnStatusResult, String> {
     let id = profile.id.clone();
     client
-        .engine_request(move |engine| engine.openvpn_status_result(&id))
+        .engine_observation(move |engine| engine.openvpn_status_result(&id))
         .await
 }
 
@@ -265,7 +265,7 @@ pub(crate) async fn linux_wireguard_status_result(
 ) -> Result<WireGuardStatusResult, String> {
     let id = profile.id.clone();
     client
-        .engine_request(move |engine| engine.wireguard_status_result(&id))
+        .engine_observation(move |engine| engine.wireguard_status_result(&id))
         .await
 }
 
@@ -308,7 +308,7 @@ pub(crate) async fn linux_profile_status(
             let interface = profile.interface_name.clone();
             let proxy = profile.backend == TunnelBackend::Xray;
             client
-                .engine_request(move |engine| {
+                .engine_observation(move |engine| {
                     let engine = engine.with_data_root(root);
                     if proxy {
                         engine.local_proxy_status(&id)
@@ -319,14 +319,6 @@ pub(crate) async fn linux_profile_status(
                 .await
         }
     }
-}
-
-#[cfg(target_os = "linux")]
-async fn retain_linux_connection(state: &AppState, profile: Profile) -> Result<(), String> {
-    let root = state.data_dir().to_path_buf();
-    crate::daemon_client::DaemonClient::system()
-        .engine_request(move |engine| engine.with_data_root(root).retain_connection(&profile))
-        .await
 }
 
 #[cfg(any(not(target_os = "linux"), test))]
@@ -376,7 +368,6 @@ async fn connect_profile_inner(
             &profile,
         )
         .await?;
-        retain_linux_connection(state, profile).await?;
         let _ = app.emit("route-changed", ());
         return Ok(status);
     }
@@ -389,7 +380,6 @@ async fn connect_profile_inner(
             &profile,
         )
         .await?;
-        retain_linux_connection(state, profile).await?;
         let _ = app.emit("route-changed", ());
         return Ok(status);
     }
@@ -409,7 +399,6 @@ async fn connect_profile_inner(
                 None => notice,
             });
         }
-        retain_linux_connection(state, profile).await?;
         let _ = app.emit("route-changed", ());
         return Ok(status);
     }
@@ -697,7 +686,6 @@ async fn connect_openvpn_with_credentials_inner(
             remember,
         )
         .await?;
-        retain_linux_connection(state, profile).await?;
         let _ = app.emit("route-changed", ());
         Ok(status)
     }

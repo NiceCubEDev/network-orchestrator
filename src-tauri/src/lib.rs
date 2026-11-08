@@ -3,6 +3,8 @@ mod auto_connect;
 mod commands;
 #[cfg(target_os = "linux")]
 mod daemon_client;
+#[cfg(target_os = "linux")]
+mod daemon_watcher;
 mod elevation;
 mod lifecycle;
 #[cfg(target_os = "linux")]
@@ -69,6 +71,11 @@ pub fn run() {
             app.manage(state::build_state(data_dir)?);
             #[cfg(target_os = "linux")]
             tauri::async_runtime::spawn(profile_watcher::watch(app.handle().clone(), profile_path));
+            #[cfg(target_os = "linux")]
+            {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn_blocking(move || daemon_watcher::watch(handle));
+            }
             #[cfg(target_os = "linux")]
             {
                 app.handle().plugin(tauri_plugin_autostart::init(

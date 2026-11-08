@@ -213,12 +213,11 @@ Windows-пакету `Program Files/INCY` + легacy-конфигам в `~/.co
   `prepare_xray`/`is_full_route`/`full_coverage` считают каноническую пару
   полным покрытием (та же tunnel-table + policy-rules семантика, `/2` и
   прочие неканонические разбиения по-прежнему отвергаются).
-- **Grace-очистка по смерти клиента** — `ClientTracker` держит pidfd
-  (`SO_PEERPIDFD`) каждого подключения; `watch_client_sessions` раз в 5 с
-  жнёт умершие pidfd (`pidfd_send_signal(0)`) и после 30-секундного
-  grace-окна без переподключения сносит сессионные owner'ы
-  (`cleanup_session_uid`), исключая always-on (replayable) и `cond:*` —
-  демон-управляемые. Рестарт приложения внутри окна отменяет очистку.
+- **Lifetime системных подключений** — первоначальная grace-очистка по
+  смерти последнего клиента отменена контрактом
+  `ARCHITECTURE_CONTRACT.md` (2026-11-08). Подключения принадлежат демону;
+  выход CLI/GUI не отключает их и не требует пользовательского keeper.
+  Явное отключение, shutdown и recovery сохраняют очистку ресурсов.
 - **Wake на resume** — `watch_suspend_resume` слушает logind
   `PrepareForSleep` по system D-Bus: после пробуждения 2-секундный settle,
   затем общий reconcile (маршруты/DNS/links/bypass-гейтвеи/cond-правила).

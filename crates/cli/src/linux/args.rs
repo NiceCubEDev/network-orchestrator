@@ -45,6 +45,16 @@ pub enum Command {
 
     /// Show which connections are running
     Status { target: Option<String> },
+    /// Stream connection snapshots as state changes
+    Watch { target: Option<String> },
+    /// Inspect connection and daemon readiness without changing state
+    Diagnose { target: Option<String> },
+    /// Report recovery state, or explicitly clean up all current-user connections
+    Recover {
+        /// Disconnect ALL current user's daemon and local sessions, restore the proxy, and pause always-on
+        #[arg(long)]
+        cleanup: bool,
+    },
     /// Save a profile from a share link, subscription URL or config file
     Add(AddArgs),
     /// Delete a saved profile
@@ -357,8 +367,7 @@ pub struct UpArgs {
     /// Subscription server to use: its number or part of its name
     #[arg(long, value_name = "SERVER")]
     pub endpoint: Option<String>,
-    /// Stay in this terminal and disconnect on Ctrl+C, instead of leaving a
-    /// background process that keeps the connection up
+    /// Stay in this terminal and disconnect on Ctrl+C
     #[arg(long, short = 'f')]
     pub foreground: bool,
     /// Read OpenVPN username and password (two lines) from stdin

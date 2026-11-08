@@ -70,9 +70,31 @@ impl DaemonClient {
             + Send
             + 'static,
     ) -> Result<R, String> {
-        let engine = net_manager_engine::linux_engine::LinuxEngine::for_socket(
+        self.engine_request_with_timeout(std::time::Duration::from_secs(330), operation)
+            .await
+    }
+
+    pub(crate) async fn engine_observation<R: Send + 'static>(
+        &self,
+        operation: impl FnOnce(net_manager_engine::linux_engine::LinuxEngine) -> Result<R, String>
+            + Send
+            + 'static,
+    ) -> Result<R, String> {
+        self.engine_request_with_timeout(std::time::Duration::from_secs(2), operation)
+            .await
+    }
+
+    async fn engine_request_with_timeout<R: Send + 'static>(
+        &self,
+        timeout: std::time::Duration,
+        operation: impl FnOnce(net_manager_engine::linux_engine::LinuxEngine) -> Result<R, String>
+            + Send
+            + 'static,
+    ) -> Result<R, String> {
+        let engine = net_manager_engine::linux_engine::LinuxEngine::for_socket_with_timeout(
             self.path.clone(),
             format!("net-manager-app/{}", env!("NETORCH_VERSION")),
+            timeout,
         );
         tauri::async_runtime::spawn_blocking(move || operation(engine))
             .await

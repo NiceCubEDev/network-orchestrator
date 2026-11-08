@@ -34,7 +34,6 @@ pub(crate) enum Request {
     Status { id: String },
     Cleanup,
     RecoverProxy,
-    ObserveDaemon,
 }
 
 fn error(message: &str) -> io::Error {
@@ -80,6 +79,15 @@ fn runtime_root() -> io::Result<PathBuf> {
     }
     Ok(path.join("netorch"))
 }
+fn proxy_state_root(xdg_state: Option<&Path>, home: Option<&Path>) -> io::Result<PathBuf> {
+    if let Some(path) = xdg_state.filter(|path| path.is_absolute()) {
+        return Ok(path.join("netorch"));
+    }
+    home.filter(|path| path.is_absolute())
+        .map(|path| path.join(".local/state/netorch"))
+        .ok_or_else(|| error("An absolute user state directory is required"))
+}
+
 fn session_directory(root: &Path, daemon: &Path) -> io::Result<PathBuf> {
     if uid() == 0 {
         return Err(error(
@@ -152,6 +160,7 @@ fn start_service(root: &Path, daemon: &Path, directory: &Path) -> io::Result<()>
         .args(["--user", "--quiet", "--collect", "--service-type=exec"])
         .arg(format!("--unit=netorch-{}", key.to_string_lossy()))
         .arg("--property=KillMode=control-group")
+        .arg("--property=Restart=on-failure")
         .arg(format!(
             "--setenv={}={}",
             net_manager_core::daemon_protocol::SOCKET_ENV,
@@ -230,7 +239,12 @@ pub(crate) fn request(
         if !peer_is_user(&stream) {
             return Err(error("Local runtime peer ownership mismatch"));
         }
-        stream.set_read_timeout(Some(Duration::from_secs(330)))?;
+        let timeout = if matches!(&request, Request::Status { .. }) {
+            2
+        } else {
+            330
+        };
+        stream.set_read_timeout(Some(Duration::from_secs(timeout)))?;
         stream.set_write_timeout(Some(Duration::from_secs(5)))?;
         serde_json::to_writer(&mut stream, &request)
             .map_err(|_| error("Cannot encode local runtime request"))?;
@@ -299,23 +313,69 @@ fn listener_targets(profile: &Profile) -> Result<Vec<ListenerTarget>, String> {
 
 struct Runtime {
     root: PathBuf,
-    daemon: net_manager_core::helper_client::HelperClient,
     tunnels: TunnelManager,
     active: HashMap<String, Profile>,
     proxy: SystemProxyManager,
     proxy_lock: Option<File>,
+    proxy_lock_root: PathBuf,
     proxy_cleanup_failed: bool,
-    observe_daemon: bool,
-    daemon_unreachable: bool,
 }
 impl Runtime {
+    fn new(root: PathBuf, proxy: SystemProxyManager, proxy_lock_root: PathBuf) -> io::Result<Self> {
+        let mut runtime = Self {
+            tunnels: TunnelManager::with_log_dir(root.join("logs")),
+            root,
+            active: HashMap::new(),
+            proxy,
+            proxy_lock: None,
+            proxy_lock_root,
+            proxy_cleanup_failed: false,
+        };
+        if let Err(cause) = runtime.proxy_guard() {
+            if cause.kind() != io::ErrorKind::WouldBlock || runtime.proxy.ownership().is_some() {
+                return Err(cause);
+            }
+            return Ok(runtime);
+        }
+        runtime.restore_proxy()?;
+        Ok(runtime)
+    }
+
     fn proxy_guard(&mut self) -> io::Result<()> {
         if self.proxy_lock.is_none() {
-            let root = runtime_root()?;
-            private_directory(&root)?;
-            let lock = lock_file(&root.join("system-proxy.lock"))?;
-            lock.try_lock()
-                .map_err(|_| error("System proxy is owned by another netorch data directory"))?;
+            private_directory(&self.proxy_lock_root)?;
+            let lock = lock_file(&self.proxy_lock_root.join("system-proxy.lock"))?;
+            lock.try_lock().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "System proxy is owned by another netorch data directory",
+                )
+            })?;
+            let root = self
+                .root
+                .canonicalize()
+                .unwrap_or_else(|_| self.root.clone());
+            let owner = format!("{:x}", Sha256::digest(root.as_os_str().as_encoded_bytes()));
+            let marker = self.proxy_lock_root.join("system-proxy.owner");
+            match fs::read_to_string(&marker) {
+                Ok(existing) if existing != owner => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "System proxy is owned by another netorch data directory",
+                    ));
+                }
+                Ok(_) => {}
+                Err(cause) if cause.kind() == io::ErrorKind::NotFound => {
+                    let temporary = self.proxy_lock_root.join("system-proxy.owner.tmp");
+                    let mut file = lock_file(&temporary)?;
+                    file.set_len(0)?;
+                    file.write_all(owner.as_bytes())?;
+                    file.sync_all()?;
+                    fs::rename(temporary, marker)?;
+                }
+                Err(cause) => return Err(cause),
+            }
+            self.proxy.reload_ownership()?;
             self.proxy_lock = Some(lock);
         }
         Ok(())
@@ -325,7 +385,14 @@ impl Runtime {
             self.proxy_guard()?;
             self.proxy.restore_any()?;
         }
-        self.proxy_lock = None;
+        if self.proxy_lock.is_some() {
+            match fs::remove_file(self.proxy_lock_root.join("system-proxy.owner")) {
+                Ok(()) => {}
+                Err(cause) if cause.kind() == io::ErrorKind::NotFound => {}
+                Err(cause) => return Err(cause),
+            }
+            self.proxy_lock = None;
+        }
         self.proxy_cleanup_failed = false;
         Ok(())
     }
@@ -413,13 +480,6 @@ impl Runtime {
                     .map_err(|_| "Cannot restore previous system proxy")?;
             }
         }
-        // A hello registers this long-lived process with the privileged daemon
-        // when the profile also owns routes. It requires no authorization.
-        if !profile.routes.is_empty() || !profile.endpoint_bypasses.is_empty() {
-            self.daemon
-                .hello()
-                .map_err(|_| "The network daemon is unavailable")?;
-        }
         let listeners = listener_targets(&profile)?;
         let mut status = self
             .tunnels
@@ -461,21 +521,15 @@ impl Runtime {
     }
     fn handle(&mut self, request: Request) -> Result<TunnelStatus, String> {
         match request {
-            Request::ObserveDaemon => {
-                let _: net_manager_core::daemon_protocol::OwnedListResult = self
-                    .daemon
-                    .call(
-                        net_manager_core::daemon_protocol::method::OWNED_LIST,
-                        serde_json::Value::Null,
-                    )
-                    .map_err(crate::linux_engine::daemon_error)?;
-                self.observe_daemon = true;
-                Ok(stopped(""))
-            }
             Request::Connect { id } => {
                 let result = self.connect(&id);
-                if result.is_err() && self.proxy.ownership().is_none() {
-                    self.proxy_lock = None;
+                if let Err(message) = &result {
+                    if self.proxy.ownership().is_none()
+                        && self.proxy_lock.is_some()
+                        && self.restore_proxy().is_err()
+                    {
+                        return Err(format!("{message}; cannot release system proxy ownership"));
+                    }
                 }
                 result
             }
@@ -517,6 +571,19 @@ impl Runtime {
             }
         }
     }
+    fn check_child_health(&mut self) {
+        let restore = self.active.iter().any(|(id, profile)| {
+            self.tunnels.status(profile).state != TunnelState::Running
+                && self
+                    .proxy
+                    .ownership()
+                    .is_some_and(|owner| owner.profile_id == *id)
+        });
+        if restore && !self.proxy_cleanup_failed && self.restore_proxy().is_err() {
+            self.proxy_cleanup_failed = true;
+            eprintln!("netorch: system proxy cleanup failed; ownership kept for recovery");
+        }
+    }
 }
 extern "C" fn on_signal(_: libc::c_int) {
     STOP.store(true, Ordering::Relaxed);
@@ -539,20 +606,14 @@ pub fn serve(root: PathBuf, daemon: PathBuf) -> Result<(), String> {
             Err(cause) if cause.kind() == io::ErrorKind::NotFound => {}
             Err(cause) => return Err(cause),
         }
+        let proxy = SystemProxyManager::new(root.join("proxy-state.json"))?;
+        let state = std::env::var_os("XDG_STATE_HOME").map(PathBuf::from);
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let proxy_root = proxy_state_root(state.as_deref(), home.as_deref())?;
+        let mut runtime = Runtime::new(root, proxy, proxy_root)?;
         let listener = UnixListener::bind(&socket)?;
         fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
         listener.set_nonblocking(true)?;
-        let mut runtime = Runtime {
-            tunnels: TunnelManager::with_log_dir(root.join("logs")),
-            proxy: SystemProxyManager::new(root.join("proxy-state.json"))?,
-            root,
-            daemon: net_manager_core::helper_client::HelperClient::new(daemon),
-            active: HashMap::new(),
-            proxy_lock: None,
-            proxy_cleanup_failed: false,
-            observe_daemon: false,
-            daemon_unreachable: false,
-        };
         // SAFETY: handlers only set an atomic; teardown happens in this loop.
         unsafe {
             libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);
@@ -583,47 +644,10 @@ pub fn serve(root: PathBuf, daemon: PathBuf) -> Result<(), String> {
                 Err(cause) => return Err(cause),
             }
             if health_check.elapsed() >= Duration::from_secs(1) {
-                if runtime.observe_daemon {
-                    let owned = runtime
-                        .daemon
-                        .call::<_, net_manager_core::daemon_protocol::OwnedListResult>(
-                            net_manager_core::daemon_protocol::method::OWNED_LIST,
-                            serde_json::Value::Null,
-                        );
-                    match owned {
-                        Ok(owned) => {
-                            runtime.observe_daemon = !owned.owners.is_empty();
-                            runtime.daemon_unreachable = false;
-                        }
-                        Err(_) => {
-                            if !runtime.daemon_unreachable {
-                                eprintln!(
-                                    "netorch: daemon unavailable; keeping the session for recovery"
-                                );
-                            }
-                            runtime.daemon_unreachable = true;
-                        }
-                    }
-                }
-                let mut restore_proxy = false;
-                for (id, profile) in &runtime.active {
-                    let live = runtime.tunnels.status(profile).state == TunnelState::Running;
-                    restore_proxy |= !live
-                        && runtime
-                            .proxy
-                            .ownership()
-                            .is_some_and(|owner| owner.profile_id == *id);
-                }
-                if restore_proxy
-                    && !runtime.proxy_cleanup_failed
-                    && runtime.restore_proxy().is_err()
-                {
-                    runtime.proxy_cleanup_failed = true;
-                    eprintln!("netorch: system proxy cleanup failed; ownership kept for recovery");
-                }
+                runtime.check_child_health();
                 // Retain failed status until explicit disconnect, just like a
                 // live profile; only an empty runtime expires.
-                if !runtime.active.is_empty() || runtime.observe_daemon {
+                if !runtime.active.is_empty() {
                     idle_since = Instant::now();
                 }
                 health_check = Instant::now();
@@ -645,4 +669,194 @@ pub fn serve(root: PathBuf, daemon: PathBuf) -> Result<(), String> {
             "Local Xray runtime failed".into()
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use net_manager_core::system_proxy::{ProxyAdapter, ProxySnapshot};
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn proxy_ownership_path_uses_persistent_user_state() {
+        assert_eq!(
+            proxy_state_root(
+                Some(Path::new("/custom/state")),
+                Some(Path::new("/home/user"))
+            )
+            .unwrap(),
+            PathBuf::from("/custom/state/netorch")
+        );
+        assert_eq!(
+            proxy_state_root(Some(Path::new("relative")), Some(Path::new("/home/user"))).unwrap(),
+            PathBuf::from("/home/user/.local/state/netorch")
+        );
+        assert!(proxy_state_root(None, Some(Path::new("relative"))).is_err());
+        assert!(proxy_state_root(None, None).is_err());
+    }
+
+    #[derive(Default)]
+    struct FakeProxy {
+        restored: Vec<ProxySnapshot>,
+        fail_restore: bool,
+    }
+
+    struct Adapter(Arc<Mutex<FakeProxy>>);
+    impl ProxyAdapter for Adapter {
+        fn snapshot(&mut self) -> io::Result<ProxySnapshot> {
+            Ok(ProxySnapshot {
+                proxy_server: Some("original".into()),
+                ..Default::default()
+            })
+        }
+        fn apply(&mut self, _: &str, _: &str) -> io::Result<()> {
+            Ok(())
+        }
+        fn restore(&mut self, snapshot: &ProxySnapshot) -> io::Result<()> {
+            let mut state = self.0.lock().unwrap();
+            if state.fail_restore {
+                return Err(error("restore failed"));
+            }
+            state.restored.push(snapshot.clone());
+            Ok(())
+        }
+    }
+
+    fn manager(root: &Path, state: &Arc<Mutex<FakeProxy>>) -> SystemProxyManager {
+        SystemProxyManager::with_adapter(
+            root.join("proxy-state.json"),
+            Box::new(Adapter(state.clone())),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn startup_recovers_persisted_proxy_before_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("data");
+        let locks = dir.path().join("runtime");
+        let state = Arc::new(Mutex::new(FakeProxy::default()));
+        let mut previous = manager(&root, &state);
+        previous.apply("stale", 10808, &[]).unwrap();
+        drop(previous);
+
+        let runtime = Runtime::new(root.clone(), manager(&root, &state), locks).unwrap();
+        assert!(runtime.proxy.ownership().is_none());
+        assert_eq!(
+            state.lock().unwrap().restored[0].proxy_server.as_deref(),
+            Some("original")
+        );
+        assert!(
+            net_manager_core::system_proxy::load_ownership(&root.join("proxy-state.json"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn startup_restore_failure_preserves_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("data");
+        let state = Arc::new(Mutex::new(FakeProxy::default()));
+        let mut previous = manager(&root, &state);
+        previous.apply("stale", 10808, &[]).unwrap();
+        drop(previous);
+        state.lock().unwrap().fail_restore = true;
+        assert!(Runtime::new(
+            root.clone(),
+            manager(&root, &state),
+            dir.path().join("runtime")
+        )
+        .is_err());
+        assert!(
+            net_manager_core::system_proxy::load_ownership(&root.join("proxy-state.json"))
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn failed_proxy_restore_retains_live_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("data");
+        let locks = dir.path().join("runtime");
+        let state = Arc::new(Mutex::new(FakeProxy::default()));
+        let mut runtime =
+            Runtime::new(root.clone(), manager(&root, &state), locks.clone()).unwrap();
+        runtime.proxy_guard().unwrap();
+        runtime.proxy.apply("live", 10808, &[]).unwrap();
+        state.lock().unwrap().fail_restore = true;
+        assert!(runtime.restore_proxy().is_err());
+        assert!(runtime.proxy.ownership().is_some());
+        assert!(lock_file(&locks.join("system-proxy.lock"))
+            .unwrap()
+            .try_lock()
+            .is_err());
+    }
+
+    #[test]
+    fn failed_child_restores_proxy_and_keeps_failed_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("data");
+        let state = Arc::new(Mutex::new(FakeProxy::default()));
+        let mut runtime = Runtime::new(
+            root.clone(),
+            manager(&root, &state),
+            dir.path().join("runtime"),
+        )
+        .unwrap();
+        runtime.proxy_guard().unwrap();
+        runtime.proxy.apply("failed", 10808, &[]).unwrap();
+        let profile = Profile {
+            id: "failed".into(),
+            backend: TunnelBackend::Xray,
+            ..Default::default()
+        };
+        runtime.active.insert(profile.id.clone(), profile);
+        runtime.check_child_health();
+        assert!(runtime.proxy.ownership().is_none());
+        assert_eq!(state.lock().unwrap().restored.len(), 1);
+        assert!(runtime.active.contains_key("failed"));
+    }
+
+    #[test]
+    fn live_proxy_owner_cannot_be_recovered_by_another_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("data");
+        let locks = dir.path().join("runtime");
+        let state = Arc::new(Mutex::new(FakeProxy::default()));
+        let mut runtime =
+            Runtime::new(root.clone(), manager(&root, &state), locks.clone()).unwrap();
+        runtime.proxy_guard().unwrap();
+        runtime.proxy.apply("live", 10808, &[]).unwrap();
+        assert!(Runtime::new(root.clone(), manager(&root, &state), locks).is_err());
+        assert!(state.lock().unwrap().restored.is_empty());
+    }
+
+    #[test]
+    fn crashed_other_data_directory_cannot_become_proxy_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let locks = dir.path().join("runtime");
+        let state = Arc::new(Mutex::new(FakeProxy::default()));
+        let first = dir.path().join("first");
+        let mut runtime =
+            Runtime::new(first.clone(), manager(&first, &state), locks.clone()).unwrap();
+        runtime.proxy_guard().unwrap();
+        runtime.proxy.apply("live", 10808, &[]).unwrap();
+        drop(runtime);
+
+        let second = dir.path().join("second");
+        let mut other =
+            Runtime::new(second.clone(), manager(&second, &state), locks.clone()).unwrap();
+        assert!(other.proxy_guard().is_err());
+        assert!(
+            net_manager_core::system_proxy::load_ownership(&first.join("proxy-state.json"))
+                .unwrap()
+                .is_some()
+        );
+        let recovered = Runtime::new(first.clone(), manager(&first, &state), locks).unwrap();
+        assert!(recovered.proxy.ownership().is_none());
+        assert_eq!(state.lock().unwrap().restored.len(), 1);
+        other.proxy_guard().unwrap();
+    }
 }

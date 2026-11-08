@@ -1478,8 +1478,7 @@ const WIREGUARD_UNANSWERED_SECS: u64 = 20;
 
 /// Journal owner accumulating manual `net.*` overrides (added routes and
 /// rules plus suppressed foreign objects). Torn down by the generic
-/// resource loop and exempt from session cleanup, so overrides survive an
-/// app restart until the user reverts them or the daemon stops.
+/// resource loop when the user reverts them or the daemon stops.
 pub(crate) const MANUAL_OWNER: &str = "manual";
 
 /// Journal owner prefix for user routing intents (`net.intent.*`). Each
@@ -6295,24 +6294,6 @@ impl DaemonCore {
         self.teardown(|entry| entry.uid == uid)
     }
 
-    /// Session cleanup after the uid's last client died: tear down its owners
-    /// except those registered as always-on (`keep` holds `(uid, owner)`
-    /// pairs from `always_on::replayable_owners`) and daemon-managed
-    /// `cond:` owners, which the reconcile loops re-apply on their own.
-    pub fn cleanup_session_uid(
-        &mut self,
-        uid: u32,
-        keep: &std::collections::HashSet<(u32, String)>,
-    ) -> io::Result<CleanupResult> {
-        self.teardown(|entry| {
-            entry.uid == uid
-                && !keep.contains(&(uid, entry.owner.clone()))
-                && !entry.owner.starts_with("cond:")
-                && !entry.owner.starts_with(INTENT_OWNER_PREFIX)
-                && entry.owner != MANUAL_OWNER
-        })
-    }
-
     /// Tear down every owner of every uid, newest first (SIGTERM path).
     pub fn shutdown(&mut self) -> io::Result<CleanupResult> {
         self.teardown(|_| true)
@@ -10346,40 +10327,6 @@ mod tests {
     }
 
     #[test]
-    fn session_cleanup_keeps_always_on_and_conditional_owners() {
-        let dir = unique_dir("session-cleanup");
-        let recorder = Recorder::default();
-        let mut core = open_core(&dir, &recorder);
-        core.apply_routes(1000, "a", vec![route("10.1.0.0/16")])
-            .unwrap();
-        core.apply_routes(1000, "pinned", vec![route("10.2.0.0/16")])
-            .unwrap();
-        // Conditional owners are daemon-managed, not client-owned; only the
-        // reconciler may create them, so seed the journal directly.
-        core.journal.entries.push(JournalEntry {
-            uid: 1000,
-            owner: "cond:office".into(),
-            state: OwnedState::Applied,
-            resources: vec![OwnedResource::Route(AppliedRoute::on_link(
-                "10.3.0.0/16".parse().unwrap(),
-                42,
-                5,
-            ))],
-        });
-        core.apply_routes(1001, "other", vec![route("10.4.0.0/16")])
-            .unwrap();
-        let keep = std::collections::HashSet::from([(1000_u32, "pinned".to_string())]);
-        let result = core.cleanup_session_uid(1000, &keep).unwrap();
-        assert_eq!(result.removed_owners, vec!["a".to_string()]);
-        assert!(result.failed.is_empty());
-        let mut remaining: Vec<_> = core.owned(1000).into_iter().map(|o| o.owner).collect();
-        remaining.sort();
-        assert_eq!(remaining, ["cond:office", "pinned"]);
-        assert_eq!(core.owned(1001).len(), 1);
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
     fn shutdown_removes_all_uids_in_reverse_order() {
         let dir = unique_dir("shutdown");
         let recorder = Recorder::default();
@@ -11843,33 +11790,6 @@ mod tests {
         kernel.routes.lock().unwrap().clear();
         let changed = core.reconcile_network(&[]);
         assert_eq!(changed, vec![(1000, MANUAL_OWNER.to_string())]);
-        assert_eq!(kernel.routes().len(), 1);
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn manual_owner_survives_session_cleanup() {
-        let dir = unique_dir("manual-session");
-        let kernel = KernelTables::default();
-        let mut core = open_tables(&dir, &kernel);
-        core.net_route_add(
-            1000,
-            NetRouteAddParams {
-                destination: "203.0.113.0/24".parse().unwrap(),
-                table: None,
-                gateway: None,
-                interface_name: None,
-                interface_index: Some(7),
-                metric: None,
-                pref_source: None,
-            },
-        )
-        .unwrap();
-        // The last client of the uid disconnects — manual overrides stay.
-        let result = core
-            .cleanup_session_uid(1000, &std::collections::HashSet::new())
-            .unwrap();
-        assert!(result.removed_owners.is_empty());
         assert_eq!(kernel.routes().len(), 1);
         fs::remove_dir_all(&dir).unwrap();
     }

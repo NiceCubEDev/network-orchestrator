@@ -1,5 +1,4 @@
-//! Foreground connection lifetime and signal handling. Detached connections
-//! belong to the shared `netorch serve` user service.
+//! Foreground connection lifetime and signal handling.
 use super::auth;
 use super::ctx::Ctx;
 use net_manager_core::models::{Profile, TunnelState};

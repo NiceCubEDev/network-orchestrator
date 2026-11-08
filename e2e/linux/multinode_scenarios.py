@@ -599,7 +599,6 @@ def inside():
                 user_profile["subscription"]["probeUrl"] = "https://198.51.100.50:9443/"
                 document_path.write_text(json.dumps(document))
                 cli("up", "country-proof")
-                assert (runtime_dir / "netorch" / f'{user_profile["id"]}.pid').is_file(), "CLI keeper did not start"
                 first_id = user_profile["xrayServiceChecks"][0]["id"]
                 pin_key = user_profile["pinnedPolicies"][0]["endpointKey"]
                 heads_before = len(records["serviceRequests"])

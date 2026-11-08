@@ -20,6 +20,8 @@ pub mod linux_compat;
 pub mod linux_credentials;
 #[cfg(any(target_os = "linux", feature = "linux-engine"))]
 pub mod linux_engine;
+#[cfg(any(target_os = "linux", feature = "linux-engine"))]
+pub mod linux_events;
 #[cfg(target_os = "linux")]
 pub mod linux_geo_assets;
 #[cfg(any(target_os = "linux", feature = "linux-engine"))]

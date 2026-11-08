@@ -1,0 +1,6 @@
+FROM netorch-e2e-client
+RUN apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+    xvfb openbox scrot xdotool python3-websockets libwebkit2gtk-4.1-0 libgtk-3-0 \
+    libayatana-appindicator3-1 librsvg2-common gsettings-desktop-schemas \
+    libglib2.0-bin dconf-gsettings-backend dconf-service dbus-x11 dbus-user-session \
+    && rm -rf /var/lib/apt/lists/*

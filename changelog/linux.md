@@ -10,6 +10,37 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+### Added
+
+- Headless `netorch watch` JSONL snapshots, `diagnose` findings and explicit
+  `recover` reporting/`recover --cleanup` for current-user resource teardown.
+- Disposable CLI-first acceptance covering the native GUI, daemon lifetime,
+  foreground signals, real local Xray and user-proxy crash recovery.
+
+### Changed
+
+- System daemon connections now outlive all CLI/GUI clients without a
+  `netorch serve` keeper. Explicit disconnect, backend shutdown and recovery
+  still clean owned resources. The user runtime is needed only for local
+  Xray SOCKS/HTTP and user proxy supervision.
+- GUI and CLI share bounded daemon event subscriptions; reconnect and event gaps
+  refresh snapshots, while unavailable status is never cached as running.
+- JSON-mode usage and operation failures have structured stderr and stable
+  exit codes (2 and 1 respectively).
+
+### Fixed
+
+- Restore saved proxy settings when the user runtime restarts after failure;
+  persist global ownership outside the session directory so another data root
+  cannot adopt an unrestored proxy after logout or reboot.
+- Roll back daemon-owned routes as well as local Xray when a mixed connection's
+  route-apply reply is lost or malformed; preserve both cleanup errors.
+- Reject stale GUI profile/config-form saves after CLI edits instead of
+  overwriting newer names, routes or subscription settings.
+- Allow explicit disconnect after local Xray dies and proxy rollback completes,
+  rather than leaving a failed session that cannot be cleared.
+
+
 ## [0.14.0] - 2026-11-07
 
 Core 0.14.0.

@@ -39,8 +39,13 @@ SERVER=netorch-e2e-server-$$
 NETWORK=netorch-e2e-net-$$
 KEEP=${1:-}
 
-echo "==> Building daemon (release)"
-(cd "$REPO_ROOT" && cargo build --release -p network-orchestrator-daemon)
+# An explicit binary supports externally built toolchains without rebuilding it.
+DAEMON_BINARY="${NETORCH_E2E_DAEMON:-$REPO_ROOT/target/release/network-orchestrator-daemon}"
+if [ -z "${NETORCH_E2E_DAEMON:-}" ]; then
+    echo "==> Building daemon (release)"
+    (cd "$REPO_ROOT" && cargo build --release -p network-orchestrator-daemon)
+fi
+[ -x "$DAEMON_BINARY" ] || { echo "missing executable daemon: $DAEMON_BINARY" >&2; exit 1; }
 
 echo "==> Building images $SERVER_IMAGE, $IMAGE"
 "$ENGINE" build -q -t "$SERVER_IMAGE" "$REPO_ROOT/e2e/linux" >/dev/null
@@ -73,7 +78,7 @@ echo "==> Starting $NAME"
     --cap-add NET_ADMIN --cap-add SYS_ADMIN --cap-add NET_RAW --security-opt apparmor=unconfined \
     --security-opt label=disable $SYSTEMD_FLAG \
     --device /dev/net/tun --tmpfs /run --tmpfs /run/lock $CGROUP_NS \
-    -v "$REPO_ROOT/target/release/network-orchestrator-daemon:/opt/netorch/bin/network-orchestrator-daemon:ro" \
+    -v "$DAEMON_BINARY:/opt/netorch/bin/network-orchestrator-daemon:ro" \
     -v "$REPO_ROOT/packaging/linux:/opt/netorch/packaging:ro" \
     -v "$REPO_ROOT/e2e/linux:/opt/netorch/e2e:ro" \
     "$IMAGE" >/dev/null

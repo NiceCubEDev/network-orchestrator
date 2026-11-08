@@ -1,5 +1,61 @@
 # E2E testing
 
+## Linux CLI-first architecture acceptance
+
+```bash
+npm run build
+cargo build -p net-manager-app -p network-orchestrator-daemon -p net-manager-cli --features tauri/custom-protocol
+e2e/linux/run_cli_first.sh
+e2e/linux/run.sh
+```
+
+Requires Docker, `/dev/net/tun`, the pinned Xray assets under
+`target/release/xray-package/v26.10.31`, and containerized systemd permissions.
+The CLI-first runner builds its disposable image from `Dockerfile.cli-first`;
+its actual scenarios run with `--network none`. Never execute
+`cli_first_scenarios.py` on the host. The GUI must embed the current frontend,
+not load a development URL.
+
+Verified on 2026-11-08 in disposable Ubuntu 26.04 containers:
+
+- A real CLI-only static connection, with no user manager, invalid runtime
+  directory and no sibling `netorch`, retained its kernel route and daemon owner
+  for 36 seconds after CLI exit; a new CLI disconnected both.
+- The native Tauri Profiles surface showed the CLI connection as running.
+  Light/dark views at 1200px and the 960px minimum had no horizontal overflow;
+  native screenshots were inspected. GUI exit preserved the connection, and GUI
+  disconnect removed it. Foreground SIGHUP and SIGTERM removed resources explicitly.
+- Real `watch` observed initial/change/disconnected/reconnected snapshots;
+  `diagnose` produced a report. Daemon restart cleaned ordinary ownership
+  without autoconnect. `recover` was read-only, while `recover --cleanup` removed
+  current-user ownership and paused always-on.
+- Real loopback VLESS traffic crossed both SOCKS and HTTP CONNECT as the user.
+  CLI and GUI shared the runtime; traffic survived GUI exit. Killing Xray
+  restored the complete real dconf proxy snapshot, and subsequent `down` cleared
+  failed state. Killing the runtime triggered systemd restart and proxy recovery
+  without either frontend.
+- A stale GUI edit revision was rejected after a real CLI rename, preserving
+  the newer stored profile.
+- The existing backend suite passed real WireGuard and OpenVPN split/full
+  traffic, per-link DNS, Xray TUN/proxy traffic, UID/polkit isolation, daemon
+  crash recovery and always-on pause/replay scenarios.
+
+Artifacts: `target/e2e-cli-first/scenarios.log`, `watch.jsonl`, native PNGs and
+`journal.log`. They contain synthetic fixtures only. Missing subscription
+capabilities, incompatible/malformed frames, stalled services, partial-frame
+timeouts and closed stdout consumers are covered by real-CLI subprocess and
+transport regressions, not an old native daemon installation.
+
+For an externally built daemon, the backend suite accepts
+`NETORCH_E2E_DAEMON=/absolute/path/to/binary`; it skips the default release build.
+The CLI-first smoke uses debug binaries and is not a production package build.
+The installer unit/container suites separately verify CLI-only installation and
+shared-daemon upgrade/removal semantics.
+
+Workspace fmt/check/strict Clippy/tests (excluding native macOS crates), version
+checks/tests, `npm run build` and frontend tests passed. This verifies Linux, not
+macOS/Windows integration or physical logout/reboot behavior.
+
 ## Linux multinode routing and recovery
 
 ```bash
@@ -143,10 +199,34 @@ Tauri GUI package build.
 
 ## Shared Linux CLI/GUI runtime
 
-Both frontends use `LinuxEngine`, the same protected profile store and one
+Both frontends use `LinuxEngine` and the same protected profile store.
+System connections belong to the daemon and must survive the last client
+exiting without a user-runtime keeper. Local Xray SOCKS/HTTP uses one
 unprivileged `netorch serve` process per data directory/daemon socket.
 The systemd user manager starts it on demand; a manually started `netorch serve`
-supports isolated environments without that manager. Do not run GUI as root.
+supports local proxies in isolated environments without that manager.
+Do not run GUI as root. See the root `ARCHITECTURE_CONTRACT.md` for the target
+cross-platform lifecycle and the native-platform verification boundary.
+
+### Daemon-owned lifetime verification — 2026-11-08
+
+- RED: the engine regression attempted user-runtime retention and rolled back;
+  the daemon regression removed the connection after its client process died.
+- GREEN: protocol coverage kills and reaps a real client child, closes IPC, waits
+  36 seconds beyond the former grace/scan window, rejects another UID's
+  disconnect and verifies that same-UID explicit disconnect releases the link.
+  Network executors are fake; no host routes or interfaces are changed.
+- A built `netorch`, run as UID 1000 in a disposable toolchain container, imported
+  a synthetic WireGuard profile, connected through a fake Unix-socket daemon,
+  observed Running from a new invocation, disconnected, and observed Stopped.
+  `XDG_RUNTIME_DIR` pointed at a nonexistent directory; no user runtime started.
+- Version checks/tests, workspace fmt/check/strict Clippy/tests (excluding native
+  macOS crates on Linux) and `npm run build` passed.
+
+This initial unit/smoke run did not verify real VPN traffic, native GUI interaction,
+logout behavior or macOS/Windows service integration; the CLI-first acceptance
+above adds real Linux backend/GUI evidence. The following package evidence
+predates this lifetime cutover.
 
 Verified on 2026-11-07 with the built Arch `0.14.0-1` package, installed only
 inside disposable containers:

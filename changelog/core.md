@@ -10,6 +10,23 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+### Added
+
+- Bounded Linux daemon event subscriptions shared by CLI and GUI, preserving
+  partial frames across read timeouts and handling events during subscription.
+
+### Fixed
+
+- Keep in-memory system-proxy ownership when persisting the restored state fails,
+  allowing a safe retry without losing the saved snapshot.
+- Recover Linux user-proxy ownership under a persistent per-user lock and restore
+  it before accepting new runtime commands.
+- Compare whole-profile GUI replacements against an opaque canonical revision
+  under the store lock; reject stale edits without losing concurrent narrow
+  changes or hidden subscription metadata.
+- Disconnect already-exited or health-reaped Xray/OpenVPN children cleanly,
+  clearing their failure state; retain live child ownership if kill/reap fails.
+
 ## [0.14.0] - 2026-11-07
 
 ### Added

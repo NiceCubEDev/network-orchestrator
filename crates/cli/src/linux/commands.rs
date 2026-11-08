@@ -189,10 +189,7 @@ pub fn connect(
 
 pub fn up(ctx: &Ctx, args: &UpArgs) -> Result<Output, String> {
     if ctx.root_user && !args.foreground {
-        return Err(
-            "Use --foreground when connecting as root; the shared user service is unprivileged"
-                .into(),
-        );
+        return Err("Use --foreground when connecting as root".into());
     }
     let mut profile = resolve_or_add(ctx, args)?;
     if let Some(server) = &args.endpoint {

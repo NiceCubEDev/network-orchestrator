@@ -32,8 +32,6 @@ use net_manager_core::daemon_protocol::{
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;
-#[cfg(target_os = "linux")]
-use std::collections::HashMap;
 use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -42,138 +40,11 @@ use tokio::sync::{broadcast, mpsc, Semaphore};
 
 const EVENT_CAPACITY: usize = 256;
 
-/// Grace window between the last client process dying and its non-persistent
-/// tunnels being torn down: a restarting or crashed-and-relaunched app
-/// reconnects within it and keeps the session alive.
-#[cfg(target_os = "linux")]
-pub const CLIENT_DEATH_GRACE: Duration = Duration::from_secs(30);
-
 /// "Something `owner` of `uid` owns changed"; delivered to that uid only.
 #[derive(Debug, Clone)]
 pub struct OwnerEvent {
     pub uid: u32,
     pub owner: String,
-}
-
-/// Kernel handles of connected client processes, keyed by uid. pidfds are
-/// race-free process handles: `pidfd_send_signal(fd, 0)` reports whether the
-/// exact peer (not a recycled pid) is still alive.
-#[cfg(target_os = "linux")]
-#[derive(Default)]
-pub struct ClientTracker {
-    inner: Mutex<HashMap<u32, TrackedClient>>,
-}
-
-#[cfg(target_os = "linux")]
-#[derive(Default)]
-struct TrackedClient {
-    pidfds: Vec<(u32, Arc<std::os::fd::OwnedFd>)>,
-    /// Armed when the last live pidfd died; cleared by any new connection
-    /// of the uid.
-    dead_since: Option<Instant>,
-}
-
-#[cfg(target_os = "linux")]
-impl ClientTracker {
-    /// Register a freshly accepted client; returns true when this cancelled
-    /// an armed death-grace window.
-    pub fn track(&self, peer: &PeerIdentity) -> bool {
-        let Some(pidfd) = &peer.pidfd else {
-            return false;
-        };
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let entry = inner.entry(peer.uid).or_default();
-        if !entry.pidfds.iter().any(|(pid, _)| *pid == peer.pid) {
-            entry.pidfds.push((peer.pid, pidfd.0.clone()));
-        }
-        entry.dead_since.take().is_some()
-    }
-
-    /// Reap exited processes; returns uids whose grace deadline has passed
-    /// without a new connection. Each uid is reported once.
-    pub fn expired(&self, grace: Duration) -> Vec<u32> {
-        let now = Instant::now();
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let mut fired = Vec::new();
-        inner.retain(|uid, entry| {
-            entry.pidfds.retain(|(_, fd)| pidfd_alive(fd));
-            if entry.pidfds.is_empty()
-                && now.duration_since(*entry.dead_since.get_or_insert(now)) >= grace
-            {
-                fired.push(*uid);
-                return false;
-            }
-            true
-        });
-        fired
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn pidfd_alive(fd: &std::os::fd::OwnedFd) -> bool {
-    use std::os::fd::AsRawFd;
-    // SAFETY: signal 0 performs no delivery; siginfo may be null.
-    let rc = unsafe {
-        libc::syscall(
-            libc::SYS_pidfd_send_signal,
-            fd.as_raw_fd(),
-            0,
-            std::ptr::null_mut::<libc::siginfo_t>(),
-            0,
-        )
-    };
-    rc == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
-/// Periodically reap client pidfds; when a uid's last client has been dead
-/// for the full grace window, tear down the owners that are not registered
-/// as always-on (those survive intentionally and are replayed on connect).
-#[cfg(target_os = "linux")]
-pub async fn watch_client_sessions<A: Authorizer + Send + Sync + 'static>(
-    ctx: Arc<ServerContext<A>>,
-) {
-    let mut interval = tokio::time::interval(Duration::from_secs(5));
-    loop {
-        interval.tick().await;
-        let expired = ctx.clients.expired(CLIENT_DEATH_GRACE);
-        if expired.is_empty() {
-            continue;
-        }
-        let keep = ctx
-            .always_on
-            .as_ref()
-            .and_then(|store| {
-                let store = store.lock().unwrap_or_else(|e| e.into_inner());
-                crate::always_on::replayable_owners(&store).ok()
-            })
-            .unwrap_or_default();
-        let core = ctx.core.clone();
-        let events = ctx.events.clone();
-        let _ = tokio::task::spawn_blocking(move || {
-            let mut core = core.lock().unwrap_or_else(|e| e.into_inner());
-            for uid in expired {
-                match core.cleanup_session_uid(uid, &keep) {
-                    Ok(result) => {
-                        if !result.removed_owners.is_empty() {
-                            eprintln!(
-                                "network-orchestrator-daemon: client of uid {uid} is gone; removed {} session owner(s)",
-                                result.removed_owners.len()
-                            );
-                        }
-                        for owner in result.removed_owners {
-                            let _ = events.send(OwnerEvent { uid, owner });
-                        }
-                    }
-                    Err(err) => {
-                        eprintln!(
-                            "network-orchestrator-daemon: session cleanup of uid {uid} failed: {err}"
-                        );
-                    }
-                }
-            }
-        })
-        .await;
-    }
 }
 
 pub struct ServerContext<A> {
@@ -200,9 +71,6 @@ pub struct ServerContext<A> {
     /// protocol) is usable right now; tests substitute a stub.
     #[cfg(target_os = "linux")]
     pub tools_probe: fn() -> std::collections::BTreeMap<String, bool>,
-    /// Live client processes per uid; drives the death-grace cleanup.
-    #[cfg(target_os = "linux")]
-    pub clients: Arc<ClientTracker>,
 }
 
 impl<A: Authorizer> ServerContext<A> {
@@ -224,8 +92,6 @@ impl<A: Authorizer> ServerContext<A> {
             xray_package_root: Self::default_xray_package_root(),
             #[cfg(target_os = "linux")]
             tools_probe: default_tool_presence,
-            #[cfg(target_os = "linux")]
-            clients: Arc::new(ClientTracker::default()),
         }
     }
 
@@ -288,8 +154,6 @@ where
         return;
     };
     let uid = peer.uid;
-    #[cfg(target_os = "linux")]
-    ctx.clients.track(&peer);
     if let Err(err) = serve_connection(stream, peer, ctx).await {
         eprintln!("network-orchestrator-daemon: connection of uid {uid} failed: {err}");
     }
@@ -1490,7 +1354,7 @@ mod tests {
 
     static DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-    struct FakeWireGuard;
+    struct FakeWireGuard(Arc<AtomicUsize>);
 
     impl WgSystem for FakeWireGuard {
         fn create_link(&mut self, _name: &str, _owner_marker: &str) -> io::Result<u32> {
@@ -1505,6 +1369,7 @@ mod tests {
             Ok(true)
         }
         fn delete_link(&mut self, _name: &str, _index: u32, _owner_marker: &str) -> io::Result<()> {
+            self.0.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
         fn add_address(&mut self, _index: u32, _address: ipnet::IpNet) -> io::Result<()> {
@@ -1594,6 +1459,7 @@ mod tests {
     struct Harness {
         ctx: Arc<ServerContext<FakeAuthorizer>>,
         recorder: Recorder,
+        wireguard_deletions: Arc<AtomicUsize>,
         dir: PathBuf,
     }
 
@@ -1613,11 +1479,12 @@ mod tests {
             ));
             std::fs::create_dir_all(&dir).unwrap();
             let recorder = Recorder::default();
+            let wireguard_deletions = Arc::new(AtomicUsize::new(0));
             let core = DaemonCore::open_with_wireguard(
                 JournalStore::new(dir.join(JOURNAL_FILE)),
                 Box::new(FakeRoutes::new(&recorder)),
                 Box::new(FakeLinks(recorder.clone())),
-                Box::new(FakeWireGuard),
+                Box::new(FakeWireGuard(wireguard_deletions.clone())),
                 Box::new(FakeWireGuardConfig),
             )
             .unwrap();
@@ -1633,6 +1500,7 @@ mod tests {
             Self {
                 ctx: Arc::new(ctx),
                 recorder,
+                wireguard_deletions,
                 dir,
             }
         }
@@ -3047,66 +2915,74 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    mod client_tracker_tests {
-        use super::*;
+    #[tokio::test]
+    async fn connection_survives_client_exit_until_explicit_disconnect() {
         use crate::auth::Pidfd;
         use std::os::fd::{FromRawFd, OwnedFd};
-        use std::time::Duration;
 
-        fn child_pidfd() -> (std::process::Child, PeerIdentity) {
-            let child = std::process::Command::new("sleep")
-                .arg("60")
-                .spawn()
-                .unwrap();
-            let pid = child.id();
-            // SAFETY: a freshly spawned child is a valid live pid.
-            let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
-            assert!(raw >= 0, "pidfd_open: {}", io::Error::last_os_error());
-            // SAFETY: the kernel just handed us this descriptor.
-            let fd = unsafe { OwnedFd::from_raw_fd(raw as _) };
-            let peer = PeerIdentity {
-                uid: 1000,
-                pid,
-                start_time: Some(1),
-                pidfd: Some(Pidfd(Arc::new(fd))),
-            };
-            (child, peer)
-        }
-
-        #[test]
-        fn fires_only_after_every_client_died_past_grace() {
-            let tracker = ClientTracker::default();
-            let (mut first, peer_a) = child_pidfd();
-            let (mut second, peer_b) = child_pidfd();
-            tracker.track(&peer_a);
-            tracker.track(&peer_b);
-            // Alive clients never expire.
-            assert!(tracker.expired(Duration::ZERO).is_empty());
-            // One dead client out of two still does not expire the uid.
-            first.kill().unwrap();
-            first.wait().unwrap();
-            assert!(tracker.expired(Duration::ZERO).is_empty());
-            second.kill().unwrap();
-            second.wait().unwrap();
-            // Reap visible to pidfd_send_signal on the next tick.
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while !tracker.expired(Duration::from_secs(60)).is_empty() && Instant::now() < deadline
-            {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            // pidfds now reaped and grace armed; a new connection cancels it.
-            let (mut third, peer_c) = child_pidfd();
-            tracker.track(&peer_c);
-            assert!(tracker.expired(Duration::ZERO).is_empty());
-            third.kill().unwrap();
-            third.wait().unwrap();
-            for _ in 0..50 {
-                if !tracker.expired(Duration::ZERO).is_empty() {
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            panic!("grace never fired");
-        }
+        let harness = Harness::new(AuthDecision::Authorized);
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        // SAFETY: the child is live and the returned descriptor is owned here.
+        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+        assert!(raw >= 0, "pidfd_open: {}", io::Error::last_os_error());
+        let fd = unsafe { OwnedFd::from_raw_fd(raw as _) };
+        let peer = PeerIdentity {
+            uid: 1000,
+            pid,
+            start_time: Some(1),
+            pidfd: Some(Pidfd(Arc::new(fd))),
+        };
+        let (stream, server) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(serve_accepted(server, peer, harness.ctx.clone()));
+        let (read, write) = tokio::io::split(stream);
+        let mut client = Client {
+            reader: BufReader::new(read),
+            writer: write,
+        };
+        assert_eq!(
+            client
+                .call(1, "hello", json!({"protocol":1,"client":"test"}))
+                .await["ok"],
+            true
+        );
+        let reply = client
+            .call(2, method::WIREGUARD_CONNECT, wg_params(""))
+            .await;
+        assert_eq!(reply["result"]["status"]["state"], "running", "{reply}");
+        drop(client);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        // Exceed the former 30-second grace plus its 5-second watcher interval.
+        tokio::time::sleep(Duration::from_secs(36)).await;
+        assert_eq!(harness.wireguard_deletions.load(Ordering::SeqCst), 0);
+        let mut other = harness.hello(1001).await;
+        let reply = other
+            .call(2, method::WIREGUARD_DISCONNECT, json!({"profileId":"home"}))
+            .await;
+        assert_eq!(error_code(&reply), "notFound", "{reply}");
+        let mut client = harness.hello(1000).await;
+        let owned = client.call(3, method::OWNED_LIST, Value::Null).await;
+        assert!(
+            owned["result"]["owners"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|owner| owner["owner"] == "wg:home"),
+            "{owned}"
+        );
+        let reply = client
+            .call(4, method::WIREGUARD_DISCONNECT, json!({"profileId":"home"}))
+            .await;
+        assert_eq!(reply["result"]["stopped"], true, "{reply}");
+        assert_eq!(harness.wireguard_deletions.load(Ordering::SeqCst), 1);
+        let owned = client.call(5, method::OWNED_LIST, Value::Null).await;
+        assert!(
+            owned["result"]["owners"].as_array().unwrap().is_empty(),
+            "{owned}"
+        );
     }
 }
