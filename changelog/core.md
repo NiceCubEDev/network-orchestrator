@@ -10,6 +10,8 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-11-08
+
 ### Added
 
 - Bounded Linux daemon event subscriptions shared by CLI and GUI, preserving
