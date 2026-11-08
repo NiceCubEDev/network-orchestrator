@@ -1073,12 +1073,17 @@ mod tests {
         let (resume, mut release) = UnixStream::pair().unwrap();
         let notify_fd = notify.as_raw_fd();
         let resume_fd = resume.as_raw_fd();
+        let ready_fd = ready.as_raw_fd();
+        let release_fd = release.as_raw_fd();
         let child = std::thread::spawn(move || {
             let mut command = Command::new("/bin/true");
             // SAFETY: the child only uses async-signal-safe syscalls before exec.
             // The streams stay open in this thread until spawn completes.
             unsafe {
                 command.pre_exec(move || {
+                    // Let parent failure close the channel instead of orphaning this child.
+                    libc::close(ready_fd);
+                    libc::close(release_fd);
                     if libc::write(notify_fd, b"x".as_ptr().cast(), 1) != 1 {
                         return Err(io::Error::last_os_error());
                     }
@@ -1100,10 +1105,9 @@ mod tests {
         let recovered = Runtime::new(root.clone(), manager(&root, &state), locks);
         release.write_all(b"x").unwrap();
         assert!(child.join().unwrap().unwrap().success());
-        assert!(
-            recovered.is_ok(),
-            "an inherited pre-exec descriptor must not retain proxy ownership"
-        );
+        let recovered =
+            recovered.expect("an inherited pre-exec descriptor must not retain proxy ownership");
+        assert!(recovered.proxy.ownership().is_none());
     }
 
     #[test]
