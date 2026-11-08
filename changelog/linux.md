@@ -45,6 +45,8 @@ Core 0.16.0.
   rather than leaving a failed session that cannot be cleared.
 - Release proxy ownership immediately even when another thread has forked a child
   that has not yet executed its program.
+- Avoid repeated full-buffer scans while receiving daemon events, including
+  oversized frames that must be rejected without exposing their contents.
 
 
 ## [0.15.0] - 2026-11-07

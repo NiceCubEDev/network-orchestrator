@@ -30,6 +30,8 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
   clearing their failure state; retain live child ownership if kill/reap fails.
 - Explicitly release Linux proxy locks before descriptor close so concurrent
   fork/exec operations cannot retain ownership after runtime cleanup.
+- Scan fragmented daemon event frames incrementally so large frames cannot cause
+  quadratic processing and spurious observation timeouts.
 
 ## [0.15.0] - 2026-11-07
 

@@ -36,6 +36,7 @@ impl std::error::Error for EventError {}
 pub struct Subscription {
     stream: UnixStream,
     buffer: Vec<u8>,
+    scanned: usize,
     queued: VecDeque<EventFrame>,
     timeout: Duration,
 }
@@ -49,6 +50,7 @@ impl Subscription {
         let mut sub = Self {
             stream,
             buffer: Vec::new(),
+            scanned: 0,
             queued: VecDeque::new(),
             timeout,
         };
@@ -114,16 +116,25 @@ impl Subscription {
     fn read_frame(&mut self, timeout: Duration) -> Result<Option<Value>, EventError> {
         let deadline = Instant::now() + timeout;
         loop {
-            if let Some(end) = self.buffer.iter().position(|b| *b == b'\n') {
+            if let Some(end) = self.buffer[self.scanned..]
+                .iter()
+                .position(|b| *b == b'\n')
+                .map(|end| self.scanned + end)
+            {
+                if end >= MAX_EVENT_FRAME {
+                    return Err(EventError::Protocol);
+                }
                 let frame = serde_json::from_slice(&self.buffer[..=end])
                     .map(Some)
                     .map_err(|_| EventError::Protocol);
                 drop(self.buffer.drain(..=end));
+                self.scanned = 0;
                 return frame;
             }
             if self.buffer.len() >= MAX_EVENT_FRAME {
                 return Err(EventError::Protocol);
             }
+            self.scanned = self.buffer.len();
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                 return Ok(None);
             };
@@ -135,15 +146,6 @@ impl Subscription {
                 Ok(0) => return Err(EventError::Unavailable),
                 Ok(n) => {
                     self.buffer.extend_from_slice(&chunk[..n]);
-                    if self
-                        .buffer
-                        .iter()
-                        .position(|b| *b == b'\n')
-                        .unwrap_or(self.buffer.len())
-                        >= MAX_EVENT_FRAME
-                    {
-                        return Err(EventError::Protocol);
-                    }
                 }
                 Err(error)
                     if matches!(
