@@ -15,7 +15,7 @@
     allowed without a prompt, as NetworkManager allows VPN activation.
   connect-profile-admin: connecting a profile when the administrator-chosen
     VPN password mode (daemon settings.set) requires it: full tunnels and
-    OpenVPN in the default mode, every connect in "always" mode.
+    OpenVPN in "fullTunnelOnly" mode, every connect in "always" mode.
   system-network: changing that mode, applying routes and changing link state. Prompts for an
     administrator once and caches the result (auth_admin_keep).
 -->

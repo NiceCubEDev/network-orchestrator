@@ -111,19 +111,22 @@ processes). The main concerns:
 - Connecting a VPN profile is governed by the administrator-chosen VPN
   password mode, stored by the daemon in
   `/var/lib/network-orchestrator/settings.json` (0600) and changeable only
-  through `system-network`. `noPrompt` authorizes every connect with
-  `connect-profile`. `fullTunnelOnly` (default) additionally requires
+  through `system-network`. `noPrompt` (default) authorizes every connect with
+  `connect-profile`. `fullTunnelOnly` additionally requires
   `com.netmanager.app.connect-profile-admin` (`auth_admin_keep`) for
   connects that capture all traffic of the machine: a WireGuard or Xray TUN
   full tunnel (a default route or its halves, which also installs global DNS)
   and every OpenVPN profile, because its server may push a full tunnel on any
   (re)connect. `always` requires `connect-profile-admin` for every connect.
   The client never decides this. A missing settings file means
-  `fullTunnelOnly`; an unreadable or invalid one fails closed to `always`.
+  `noPrompt`; an unreadable or invalid one fails closed to `always`.
   Route sets whose union covers a whole address family without being the
   canonical default route or its halves are rejected, so a split-looking
   profile cannot skip the full-tunnel prompt. Split tunnels still install their own routes and
   per-link DNS without a prompt in modes other than `always`.
+  Saved administrator-selected modes are preserved on upgrades. For an active
+  local session the default needs no VPN password prompt; inactive and remote
+  sessions still require polkit administrator authorization.
 - Routes are added with a dedicated protocol number and exclusive netlink
   creation so an existing route is not overwritten. The daemon writes its
   ownership journal to `/var/lib/network-orchestrator/state.json` with mode

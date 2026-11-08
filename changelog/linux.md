@@ -10,6 +10,13 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+### Changed
+
+- Default VPN authorization to `noPrompt` for installations without saved
+  daemon settings. Active local sessions can connect full and split tunnels
+  without a password; existing administrator-selected modes and system-network
+  authorization are unchanged. Invalid settings still require a password.
+
 ## [0.16.0] - 2026-11-08
 
 Core 0.16.0.

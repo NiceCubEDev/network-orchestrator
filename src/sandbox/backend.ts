@@ -472,7 +472,7 @@ export class SandboxBackend {
   ];
   private enrollment: AlwaysOnListResult = { profiles: [], paused: false, supportedKinds: ["wireGuard", "staticRoutes"] };
   private loginAutostart = false;
-  private authMode: VpnAuthMode = "fullTunnelOnly";
+  private authMode: VpnAuthMode = "noPrompt";
   private recovered = false;
   private endpoints = [
     "AcmeVPN · ⚡ Нидерланды", "AcmeVPN · 🇩🇪 Германия", "AcmeVPN · 🇫🇮 Финляндия",

@@ -88,21 +88,33 @@ mod tests {
     }
 
     #[test]
-    fn missing_file_uses_full_tunnel_only_default() {
+    fn missing_settings_allow_full_and_split_tunnels_without_admin_prompt() {
         let (store, dir) = store("missing");
-        assert_eq!(store.load().vpn_auth_mode, VpnAuthMode::FullTunnelOnly);
+        let mode = store.load().vpn_auth_mode;
+        for broad in [false, true] {
+            assert_eq!(
+                crate::auth::connect_action(mode, broad),
+                crate::auth::Action::ConnectProfile
+            );
+        }
         fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn save_roundtrips_with_private_mode() {
         let (store, dir) = store("roundtrip");
-        store
-            .save(DaemonSettings {
-                vpn_auth_mode: VpnAuthMode::Always,
-            })
-            .unwrap();
-        assert_eq!(store.load().vpn_auth_mode, VpnAuthMode::Always);
+        for mode in [
+            VpnAuthMode::NoPrompt,
+            VpnAuthMode::FullTunnelOnly,
+            VpnAuthMode::Always,
+        ] {
+            store
+                .save(DaemonSettings {
+                    vpn_auth_mode: mode,
+                })
+                .unwrap();
+            assert_eq!(store.load().vpn_auth_mode, mode);
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

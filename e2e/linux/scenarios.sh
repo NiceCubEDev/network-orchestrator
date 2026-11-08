@@ -136,9 +136,10 @@ as bob python3 "$CLIENT" routes.remove '{"owner":"b"}' >/dev/null && ok "bob rem
 ours -4 | grep -q "^10.77.0.0/16" && fail "bob route still present" || ok "bob route removed"
 
 step "VPN password mode (daemon settings)"
-expect_eq "$(python3 "$CLIENT" settings.get)" '{"vpnAuthMode": "fullTunnelOnly"}' "default mode is fullTunnelOnly"
-out=$(as alice python3 "$CLIENT" settings.set '{"vpnAuthMode":"noPrompt"}' || true)
+initial_mode=$(python3 "$CLIENT" settings.get)
+out=$(as alice python3 "$CLIENT" settings.set '{"vpnAuthMode":"always"}' || true)
 echo "$out" | grep -q '"notAuthorized"' && ok "unauthorized user cannot change mode" || fail "expected notAuthorized, got $out"
+expect_eq "$(python3 "$CLIENT" settings.get)" "$initial_mode" "unauthorized change preserves mode"
 python3 "$CLIENT" settings.set '{"vpnAuthMode":"always"}' >/dev/null && ok "administrator changed mode" || fail "settings.set as root"
 expect_eq "$(stat -c %a /var/lib/network-orchestrator/settings.json)" 600 "settings file mode 0600"
 systemctl restart "$UNIT"; wait_socket
@@ -146,7 +147,7 @@ expect_eq "$(as alice python3 "$CLIENT" settings.get)" '{"vpnAuthMode": "always"
 printf '{ corrupt' > /var/lib/network-orchestrator/settings.json
 systemctl restart "$UNIT"; wait_socket
 expect_eq "$(as alice python3 "$CLIENT" settings.get)" '{"vpnAuthMode": "always"}' "corrupt settings require administrator confirmation"
-python3 "$CLIENT" settings.set '{"vpnAuthMode":"fullTunnelOnly"}' >/dev/null || fail "restore default mode"
+python3 "$CLIENT" settings.set '{"vpnAuthMode":"noPrompt"}' >/dev/null || fail "restore default mode"
 
 step "link.set_state"
 python3 "$CLIENT" link.set_state '{"name":"dum0","up":false}' >/dev/null || fail "link down"

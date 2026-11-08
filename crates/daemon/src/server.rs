@@ -1690,11 +1690,8 @@ mod tests {
         let harness = Harness::new(AuthDecision::Authorized);
         let mut client = harness.hello(1000).await;
         let reply = client.call(2, method::SETTINGS_GET, Value::Null).await;
-        assert_eq!(
-            reply["result"]["vpnAuthMode"],
-            json!("fullTunnelOnly"),
-            "{reply}"
-        );
+        assert_eq!(reply["ok"], json!(true), "{reply}");
+        let initial = reply["result"].clone();
         assert_eq!(harness.auth_calls(), 0);
 
         let reply = client
@@ -1711,11 +1708,11 @@ mod tests {
         let denied = Harness::new(AuthDecision::Denied);
         let mut client = denied.hello(1000).await;
         let reply = client
-            .call(2, method::SETTINGS_SET, json!({"vpnAuthMode": "noPrompt"}))
+            .call(2, method::SETTINGS_SET, json!({"vpnAuthMode": "always"}))
             .await;
         assert_eq!(reply["error"]["code"], json!("notAuthorized"), "{reply}");
         let reply = client.call(3, method::SETTINGS_GET, Value::Null).await;
-        assert_eq!(reply["result"]["vpnAuthMode"], json!("fullTunnelOnly"));
+        assert_eq!(reply["result"], initial);
     }
 
     #[tokio::test]
@@ -1764,7 +1761,9 @@ mod tests {
 
     #[tokio::test]
     async fn wireguard_connect_asks_for_an_administrator_per_mode_and_scope() {
-        let harness = Harness::new(AuthDecision::Denied);
+        let harness = Harness::with(AuthDecision::Denied, |ctx| {
+            ctx.settings.lock().unwrap().vpn_auth_mode = VpnAuthMode::FullTunnelOnly;
+        });
         let mut client = harness.hello(1000).await;
         client
             .call(2, method::WIREGUARD_CONNECT, wg_params(""))

@@ -165,11 +165,11 @@ pub mod tool {
 #[serde(rename_all = "camelCase")]
 pub enum VpnAuthMode {
     /// Any profile connects without a prompt in an active session.
+    #[default]
     NoPrompt,
     /// Split tunnels connect without a prompt; changes that capture all
     /// traffic of the machine (full tunnel, global DNS) and every OpenVPN
     /// profile (its server may push a full tunnel) require an administrator.
-    #[default]
     FullTunnelOnly,
     /// Every connect requires an administrator.
     Always,
@@ -2030,7 +2030,6 @@ mod tests {
         let (_, result): (_, SettingsResult) =
             ok_response(r#"{"id":9,"ok":true,"result":{"vpnAuthMode":"fullTunnelOnly"}}"#);
         assert_eq!(result.vpn_auth_mode, VpnAuthMode::FullTunnelOnly);
-        assert_eq!(VpnAuthMode::default(), VpnAuthMode::FullTunnelOnly);
         let _: SettingsSetParams = serde_json::from_str(r#"{"vpnAuthMode":"noPrompt"}"#).unwrap();
     }
 
