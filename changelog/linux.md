@@ -43,6 +43,8 @@ Core 0.16.0.
   overwriting newer names, routes or subscription settings.
 - Allow explicit disconnect after local Xray dies and proxy rollback completes,
   rather than leaving a failed session that cannot be cleared.
+- Release proxy ownership immediately even when another thread has forked a child
+  that has not yet executed its program.
 
 
 ## [0.15.0] - 2026-11-07

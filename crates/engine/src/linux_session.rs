@@ -490,12 +490,21 @@ fn listener_targets(
         .collect()
 }
 
+struct ProxyLock(File);
+
+impl Drop for ProxyLock {
+    fn drop(&mut self) {
+        // A forked child can retain the descriptor until exec; close alone is not an unlock.
+        let _ = self.0.unlock();
+    }
+}
+
 struct Runtime {
     root: PathBuf,
     tunnels: TunnelManager,
     active: HashMap<String, Profile>,
     proxy: SystemProxyManager,
-    proxy_lock: Option<File>,
+    proxy_lock: Option<ProxyLock>,
     proxy_lock_root: PathBuf,
     proxy_cleanup_failed: bool,
 }
@@ -523,8 +532,8 @@ impl Runtime {
     fn proxy_guard(&mut self) -> io::Result<()> {
         if self.proxy_lock.is_none() {
             private_directory(&self.proxy_lock_root)?;
-            let lock = lock_file(&self.proxy_lock_root.join("system-proxy.lock"))?;
-            lock.try_lock().map_err(|_| {
+            let lock = ProxyLock(lock_file(&self.proxy_lock_root.join("system-proxy.lock"))?);
+            lock.0.try_lock().map_err(|_| {
                 io::Error::new(
                     io::ErrorKind::WouldBlock,
                     "System proxy is owned by another netorch data directory",
@@ -1041,6 +1050,60 @@ mod tests {
         assert!(recovered.proxy.ownership().is_none());
         assert_eq!(state.lock().unwrap().restored.len(), 1);
         other.proxy_guard().unwrap();
+    }
+
+    #[test]
+    fn proxy_lock_is_released_while_a_forked_child_waits_to_exec() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::process::CommandExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("data");
+        let locks = dir.path().join("runtime");
+        let state = Arc::new(Mutex::new(FakeProxy::default()));
+        let mut runtime =
+            Runtime::new(root.clone(), manager(&root, &state), locks.clone()).unwrap();
+        runtime.proxy_guard().unwrap();
+        runtime.proxy.apply("live", 10808, &[]).unwrap();
+
+        let (mut ready, notify) = UnixStream::pair().unwrap();
+        ready
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let (resume, mut release) = UnixStream::pair().unwrap();
+        let notify_fd = notify.as_raw_fd();
+        let resume_fd = resume.as_raw_fd();
+        let child = std::thread::spawn(move || {
+            let mut command = Command::new("/bin/true");
+            // SAFETY: the child only uses async-signal-safe syscalls before exec.
+            // The streams stay open in this thread until spawn completes.
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::write(notify_fd, b"x".as_ptr().cast(), 1) != 1 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    let mut byte = 0u8;
+                    if libc::read(resume_fd, (&mut byte as *mut u8).cast(), 1) != 1 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let spawned = command.spawn();
+            drop(notify);
+            drop(resume);
+            spawned?.wait()
+        });
+
+        ready.read_exact(&mut [0]).unwrap();
+        drop(runtime);
+        let recovered = Runtime::new(root.clone(), manager(&root, &state), locks);
+        release.write_all(b"x").unwrap();
+        assert!(child.join().unwrap().unwrap().success());
+        assert!(
+            recovered.is_ok(),
+            "an inherited pre-exec descriptor must not retain proxy ownership"
+        );
     }
 
     #[test]
