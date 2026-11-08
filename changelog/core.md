@@ -10,6 +10,13 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+## [0.16.1] - 2026-11-08
+
+### Fixed
+
+- Default the daemon VPN authorization mode to `noPrompt` when no settings
+  have been saved; explicit administrator-selected modes remain unchanged.
+
 ## [0.16.0] - 2026-11-08
 
 ### Added
