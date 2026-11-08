@@ -2845,7 +2845,6 @@ dependencies = [
  "libc",
  "net-manager-core",
  "net-manager-engine",
- "net-manager-macos-bridge",
  "network-orchestrator-macos-helper",
  "plist",
  "serde",
@@ -2880,11 +2879,14 @@ name = "net-manager-engine"
 version = "0.15.0"
 dependencies = [
  "base64 0.22.1",
+ "core-foundation 0.10.1",
  "dbus-secret-service",
  "ipnet",
  "libc",
  "net-manager-core",
+ "plist",
  "reqwest",
+ "security-framework-sys",
  "serde",
  "serde_json",
  "sha2",
@@ -2896,15 +2898,11 @@ dependencies = [
 name = "net-manager-macos-bridge"
 version = "0.10.2"
 dependencies = [
- "base64 0.22.1",
- "ipnet",
  "net-manager-core",
  "net-manager-engine",
- "plist",
  "serde",
  "serde_json",
  "tempfile",
- "tokio",
 ]
 
 [[package]]

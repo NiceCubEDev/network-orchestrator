@@ -5,28 +5,13 @@
 use net_manager_core::daemon_protocol::{OpenVpnCredentials, OpenVpnUserPass};
 use net_manager_core::models::Profile;
 use net_manager_core::profiles::ProfileStore;
-use net_manager_engine::{find_profile, DiagnosticsContext, Engine};
+use net_manager_engine::{
+    find_profile,
+    macos_services::{ConnectProfileOutcome, MacosServices},
+    Engine,
+};
 use serde_json::{json, Value};
-use std::path::{Path, PathBuf};
-
-pub(crate) fn managed_executable(root: &Path) -> Option<PathBuf> {
-    Engine::new(root).managed_executable()
-}
-
-pub(crate) fn is_running(root: &Path, profile: &Profile) -> Result<bool, String> {
-    Engine::new(root).is_running(profile)
-}
-
-/// Run a change to a profile's configuration (endpoint switch, refresh) and,
-/// when the connection was running, restart it on the new configuration.
-pub(crate) fn restart_around(
-    root: &Path,
-    store: &ProfileStore,
-    id: &str,
-    change: impl FnOnce() -> Result<Value, String>,
-) -> Result<Value, String> {
-    Engine::new(root).restart_around(store, id, change)
-}
+use std::path::Path;
 
 fn find(profiles: &[Profile], args: &Value) -> Result<Profile, String> {
     find_profile(profiles, args["id"].as_str().unwrap_or_default())
@@ -53,15 +38,6 @@ pub(crate) fn credentials_from_args(args: &Value) -> Option<OpenVpnCredentials> 
         auth_user_pass: user_pass,
         private_key_passphrase: passphrase,
     })
-}
-
-/// Every check for one profile; the caller read the system tables.
-pub(crate) fn diagnose(
-    root: &Path,
-    profile: &Profile,
-    context: DiagnosticsContext<'_>,
-) -> Result<Value, String> {
-    encode(Engine::new(root).diagnose(profile, context)?)
 }
 
 /// A `net.intent.set` request from the client's string arguments:
@@ -167,11 +143,21 @@ pub(crate) fn handle(
             let needs = engine.credential_requirements(&profile)?;
             Ok(json!({"userPass": needs.user_pass, "keyPassphrase": needs.key_passphrase}))
         }),
-        "connect" => load().and_then(|profiles| {
-            let profile = find(&profiles, args)?;
-            engine.connect(store, &profile, credentials_from_args(args))?;
-            encode(engine.snapshot(&load()?)?)
-        }),
+        "connect" => (|| {
+            let service = MacosServices::new(root)?;
+            let outcome = service.connect_profile(
+                args["id"].as_str().unwrap_or_default(),
+                credentials_from_args(args),
+                args["remember"].as_str() == Some("true"),
+                &service.native_credential_store()?,
+            )?;
+            match outcome {
+                ConnectProfileOutcome::Connected { .. } => encode(engine.snapshot(&load()?)?),
+                ConnectProfileOutcome::CredentialsRequired { .. } => {
+                    Err("OpenVPN credentials required".into())
+                }
+            }
+        })(),
         "disconnect" => load().and_then(|profiles| {
             let profile = find(&profiles, args)?;
             encode(engine.disconnect(&profile, &profiles)?)
@@ -214,7 +200,7 @@ pub(crate) fn handle(
         "delete_cond_rule" => engine
             .remove_cond_rule(args["id"].as_str().unwrap_or_default())
             .map(|removed| json!({ "removed": removed })),
-        "helper_log" => Ok(json!(engine.helper_log())),
+        "helper_log" => Ok(json!(net_manager_engine::macos_services::helper_log())),
         "log" => load().and_then(|profiles| {
             let profile = find(&profiles, args)?;
             Ok(json!(engine.log(&profile)?))

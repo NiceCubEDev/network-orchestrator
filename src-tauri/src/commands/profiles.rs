@@ -564,6 +564,7 @@ pub(crate) async fn import_share_link(
         &generate_import_id(0),
         &name,
         &link,
+        net_manager_core::models::XrayMode::platform_default(),
         loopback_port_available,
     )
     .map_err(|error| match error.kind() {
@@ -595,6 +596,7 @@ pub(crate) async fn import_configs_batch(
         &state.profiles,
         &paths,
         default_backend,
+        net_manager_core::models::XrayMode::platform_default(),
     )
     .map(redact_batch_import_for_ipc)
     .map_err(|e| e.to_string())
@@ -694,6 +696,7 @@ fn import_subscription_body_into_with_metadata(
         &request,
         body,
         meta,
+        net_manager_core::models::XrayMode::platform_default(),
         loopback_port_available,
     )
     .map_err(|error| {
@@ -2645,7 +2648,14 @@ mod native_tests {
             xray.to_string_lossy().to_string(),
             bad.to_string_lossy().to_string(),
         ];
-        let result = import_configs_into(&vault, &store, &paths, None).unwrap();
+        let result = import_configs_into(
+            &vault,
+            &store,
+            &paths,
+            None,
+            net_manager_core::models::XrayMode::platform_default(),
+        )
+        .unwrap();
 
         assert_eq!(result.profiles.len(), 3);
         assert_eq!(result.errors.len(), 1);
@@ -2694,6 +2704,7 @@ mod native_tests {
             &store,
             &[source.to_string_lossy().to_string()],
             None,
+            net_manager_core::models::XrayMode::platform_default(),
         )
         .unwrap();
         assert!(result.errors.is_empty());
@@ -2713,9 +2724,14 @@ mod native_tests {
         let txt = dir.join("readme.txt");
         fs::write(&txt, b"hello").unwrap();
 
-        let result =
-            import_configs_into(&vault, &store, &[txt.to_string_lossy().to_string()], None)
-                .unwrap();
+        let result = import_configs_into(
+            &vault,
+            &store,
+            &[txt.to_string_lossy().to_string()],
+            None,
+            net_manager_core::models::XrayMode::platform_default(),
+        )
+        .unwrap();
         assert!(result.profiles.is_empty());
         assert_eq!(result.errors.len(), 1);
         assert!(result.errors[0].error.contains("default backend"));

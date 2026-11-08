@@ -466,7 +466,7 @@ kernel route table. It does not verify a visible polkit prompt or Wayland.
 
 The native SwiftUI client is built with `npm run build:macos` (or
 `bash scripts/build-macos-native.sh`). It uses the Rust core directly rather
-than the Tauri IPC/browser sandbox. Build and test commands, the independent
+than the Tauri IPC/browser sandbox. Build and test commands, the shared GUI/CLI
 data directory and current feature boundaries are documented in
 [`../macos/README.md`](../macos/README.md).
 
@@ -486,6 +486,45 @@ managed imports, failed-import cleanup, bounded C ABI buffers and refusal of
 network mutations. Swift tests cover actual FFI decoding, persisted profiles,
 imported-config analysis and read-only Darwin loopback inventory/route lookup.
 Ordinary macOS tests never start real VPNs or apply routes, DNS or proxies.
+
+### CLI-first runtime verification
+
+Portable checks run as an unprivileged user on Linux:
+
+```bash
+cargo test -p net-manager-core -p net-manager-engine
+cargo clippy -p net-manager-engine -p net-manager-macos-bridge -p net-manager-cli \
+  --features net-manager-cli/macos-cli --all-targets -- -D warnings
+cargo test -p net-manager-macos-bridge --lib
+cargo test -p net-manager-cli --features macos-cli --all-targets
+```
+
+The `macos-cli` feature selects the real native command dispatcher, not a mock
+CLI. Its subprocess scenarios exercise import/edit, advanced routing, static
+profiles, shared sets/mode, input redaction, protected credential input and
+policy rejection before backend startup. Engine tests use authenticated Unix
+clients and synthetic local children to exercise detach, generation-scoped
+release, serialized operations and owned-process recovery. They never create a
+tunnel or alter host routes, DNS or proxies.
+
+These checks and an actual CLI smoke passed on Linux. Swift source/test syntax
+parsing and SwiftPM manifest loading also passed. **This is not native macOS
+typechecking, linking, launchd, Keychain, GUI or tunnel acceptance.** Earlier
+dated native results above do not validate the CLI-first cutover.
+
+Before shipping the macOS build, use a macOS 27/Xcode 27 test host:
+
+1. Run the native workspace quality gate, `scripts/macos-dev.sh test` and
+   `scripts/macos-dev.sh build`; verify the real bundle and Swift/FFI boundary.
+2. Give GUI and CLI the same isolated data root. Connect a local SOCKS fixture,
+   check both clients, close/reopen the GUI and verify the same connection
+   survives without a second owner or Xray child.
+3. Verify explicit `down`, foreground-client exit and generation isolation
+   when another client replaces an activation; test owner restart/recovery.
+4. Check launchd startup/logout, login-Keychain remember/forget and the native
+   policy/settings UI. Run privileged helper/tunnel/proxy scenarios only on a
+   disposable host: a data-root override does not isolate system networking.
+
 
 ### Shared dark/light design verification
 

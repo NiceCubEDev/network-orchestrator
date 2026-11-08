@@ -800,6 +800,7 @@ mod tests {
             },
             body,
             Default::default(),
+            net_manager_core::models::XrayMode::platform_default(),
             |_| true,
         )
         .unwrap();
@@ -843,6 +844,27 @@ mod tests {
         assert!(ls(&ctx).unwrap().1.contains("Gamma DE"));
         assert!(endpoints::use_endpoint(&ctx, "sub1", Some("de")).is_err());
         assert_eq!(server_of(&ctx), "Gamma DE");
+    }
+
+    #[test]
+    fn endpoint_switch_checks_listener_ports_only_in_socks_mode() {
+        let (_dir, ctx, _) = subscription_setup(FakeDaemon {
+            replies: HashMap::from([(method::XRAY_STATUS, xray_status("stopped"))]),
+            ..Default::default()
+        });
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let mut profile = ctx.find("sub1").unwrap();
+        profile.xray_socks_port = Some(listener.local_addr().unwrap().port());
+        ctx.store().upsert(profile).unwrap();
+
+        endpoints::use_endpoint(&ctx, "sub1", Some("beta")).unwrap();
+        assert_eq!(server_of(&ctx), "Beta NL");
+
+        let mut profile = ctx.find("sub1").unwrap();
+        profile.xray_mode = net_manager_core::models::XrayMode::Socks;
+        ctx.store().upsert(profile).unwrap();
+        assert!(endpoints::use_endpoint(&ctx, "sub1", Some("gamma")).is_err());
+        assert_eq!(server_of(&ctx), "Beta NL");
     }
 
     #[test]

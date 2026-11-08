@@ -345,8 +345,16 @@ impl ProfileService {
             (fetched.body.as_str(), fetched.meta.clone())
         };
         let _lock = self.mutation()?;
-        subscription::import_body(&self.vault(), &self.store(), request, body, meta, available)
-            .map_err(failed)
+        subscription::import_body(
+            &self.vault(),
+            &self.store(),
+            request,
+            body,
+            meta,
+            net_manager_core::models::XrayMode::platform_default(),
+            available,
+        )
+        .map_err(failed)
     }
 
     pub fn import_subscription_body(
@@ -357,8 +365,16 @@ impl ProfileService {
     ) -> Result<BatchImportResult, String> {
         let _lock = self.mutation()?;
         validate_interval(request.refresh_interval_minutes)?;
-        subscription::import_body(&self.vault(), &self.store(), request, body, meta, available)
-            .map_err(failed)
+        subscription::import_body(
+            &self.vault(),
+            &self.store(),
+            request,
+            body,
+            meta,
+            net_manager_core::models::XrayMode::platform_default(),
+            available,
+        )
+        .map_err(failed)
     }
 
     pub async fn refresh_subscription(
@@ -612,21 +628,36 @@ impl ProfileService {
         backend: Option<TunnelBackend>,
     ) -> Result<BatchImportResult, String> {
         let _lock = self.mutation()?;
-        profile_import::import_configs_into(&self.vault(), &self.store(), paths, backend)
-            .map(|mut result| {
-                for (index, error) in result.errors.iter_mut().enumerate() {
-                    error.path = format!("Input {}", index + 1);
-                    error.error = "The configuration could not be imported".into();
-                }
-                result
-            })
-            .map_err(failed)
+        // Arbitrary imported JSON is not a daemon-validated generated TUN config.
+        profile_import::import_configs_into(
+            &self.vault(),
+            &self.store(),
+            paths,
+            backend,
+            XrayMode::Socks,
+        )
+        .map(|mut result| {
+            for (index, error) in result.errors.iter_mut().enumerate() {
+                error.path = format!("Input {}", index + 1);
+                error.error = "The configuration could not be imported".into();
+            }
+            result
+        })
+        .map_err(failed)
     }
 
     pub fn import_link(&self, id: &str, name: &str, link: &str) -> Result<ProfileDocument, String> {
         let _lock = self.mutation()?;
-        profile_import::import_share_link(&self.vault(), &self.store(), id, name, link, available)
-            .map_err(failed)
+        profile_import::import_share_link(
+            &self.vault(),
+            &self.store(),
+            id,
+            name,
+            link,
+            net_manager_core::models::XrayMode::platform_default(),
+            available,
+        )
+        .map_err(failed)
     }
 
     pub fn subscription_profile(&self, id: &str) -> Result<Profile, String> {

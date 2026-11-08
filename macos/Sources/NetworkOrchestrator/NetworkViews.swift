@@ -670,7 +670,11 @@ struct SettingsView: View {
           AppSelect(
             label: "settings.appMode",
             selection: Binding(
-              get: { model.appMode.rawValue }, set: { model.appMode = AppMode(stored: $0) }),
+              get: { model.appMode.rawValue },
+              set: { value in
+                guard let mode = AppMode(rawValue: value) else { return }
+                Task { await model.setAppMode(mode) }
+              }),
             options: AppMode.allCases.map { (value: $0.rawValue, title: $0.titleKey) }
           ).frame(width: 150)
         }.padding(.horizontal, 14).padding(.vertical, 10.5)

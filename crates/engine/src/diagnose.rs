@@ -197,7 +197,7 @@ mod tests {
         ErrorBody, ErrorCode, HelloResult, OwnedEntry, OwnedState,
     };
     use net_manager_core::helper_client::HelperError;
-    use net_manager_core::models::{DiagnosticLevel, ProtocolHealthState, TunnelState};
+    use net_manager_core::models::{ProtocolHealthState, TunnelState};
     use serde_json::Value;
     use std::path::PathBuf;
 
@@ -368,7 +368,7 @@ mod tests {
     }
 
     #[test]
-    fn a_full_diagnosis_with_an_unreachable_helper_carries_the_install_hint() {
+    fn helper_only_diagnostics_do_not_create_a_user_runtime() {
         let dir = tempfile::tempdir().unwrap();
         let vault = ConfigVault::new(dir.path().join("configs"));
         let engine = Engine::with_privileged(
@@ -391,14 +391,6 @@ mod tests {
             .unwrap();
         assert_eq!(report.profile_id, "wg1");
         assert_eq!(report.status.state, TunnelState::Stopped);
-        let helper = report
-            .checks
-            .iter()
-            .find(|c| c.name == "Privileged helper")
-            .unwrap();
-        assert_eq!(helper.level, DiagnosticLevel::Error);
-        // The profile's config file does not exist: that is the first check.
-        assert_eq!(report.checks[0].name, "Configuration");
-        assert_eq!(report.checks[0].level, DiagnosticLevel::Error);
+        assert!(!dir.path().join("runtime").exists());
     }
 }

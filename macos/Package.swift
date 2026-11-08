@@ -14,7 +14,9 @@ let package = Package(
         .unsafeFlags(["-L", "../target/macos-bridge"]),
         .linkedLibrary("net_manager_macos_bridge"),
         .linkedFramework("Security"), .linkedFramework("SystemConfiguration"),
+        .linkedFramework("CoreFoundation"),
         .linkedLibrary("resolv"),
+        .linkedLibrary("proc"),
       ]
     ),
     .testTarget(name: "NativeTests", dependencies: ["NetworkOrchestrator"]),

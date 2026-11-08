@@ -2,10 +2,7 @@
 use crate::args::{BackendCommand, ServiceCommand};
 use crate::ctx::Ctx;
 use crate::render::table;
-use crate::runstate;
 use crate::service;
-use net_manager_core::helper_client::{is_denied, HelperError};
-use net_manager_core::system_proxy::SystemProxyManager;
 use serde::Serialize;
 use serde_json::json;
 
@@ -32,37 +29,49 @@ fn check(name: &'static str, level: Level, detail: impl Into<String>) -> Check {
     }
 }
 
-/// How the helper answers; shared by `doctor` and `service status`.
-pub fn helper_check(ctx: &Ctx) -> Check {
-    match ctx.engine().privileged().hello() {
-        Ok(hello) => check(
+/// Shared typed helper observation, without starting a runtime owner.
+pub fn helper_check() -> Check {
+    let status = net_manager_engine::macos_services::helper_status();
+    if status.reachable {
+        check(
             "helper",
             Level::Ok,
             format!(
                 "version {}, {} methods",
-                hello.daemon_version,
-                hello.capabilities.len()
+                status.version,
+                status.capabilities.len()
             ),
-        ),
-        Err(error) if is_denied(&error) => check(
+        )
+    } else if status.denied {
+        check(
             "helper",
             Level::Fail,
             "the helper refuses this program; reinstall it from the app's Settings",
-        ),
-        Err(HelperError::Unreachable(_)) => check(
+        )
+    } else if status.protocol_error {
+        check(
+            "helper",
+            Level::Fail,
+            "the helper protocol is incompatible; reinstall the matching helper",
+        )
+    } else {
+        check(
             "helper",
             Level::Warn,
-            "not running: tunnels (TUN, WireGuard, OpenVPN) are unavailable, the local proxy works",
-        ),
-        Err(error) => check("helper", Level::Fail, error.to_string()),
+            "not running: helper-backed tunnels are unavailable",
+        )
     }
 }
 
 pub fn checks(ctx: &Ctx) -> Vec<Check> {
     let mut out = Vec::new();
-    out.push(match std::fs::create_dir_all(&ctx.root) {
-        Ok(()) => check("data", Level::Ok, "the data directory is writable"),
-        Err(_) => check("data", Level::Fail, "the data directory is not writable"),
+    out.push(match std::fs::metadata(&ctx.root) {
+        Ok(metadata) if metadata.is_dir() => check("data", Level::Ok, "the data directory exists"),
+        Ok(_) => check("data", Level::Fail, "the data location is not a directory"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            check("data", Level::Warn, "no saved data yet")
+        }
+        Err(_) => check("data", Level::Fail, "the data directory could not be read"),
     });
     out.push(match ctx.profiles() {
         Ok(profiles) => check("profiles", Level::Ok, format!("{} saved", profiles.len())),
@@ -83,34 +92,16 @@ pub fn checks(ctx: &Ctx) -> Vec<Check> {
             "not installed: `netorch backend install` (or `netorch up` does it)",
         ),
     });
-    out.push(helper_check(ctx));
+    out.push(helper_check());
     // SAFETY: geteuid never fails.
     if unsafe { libc::geteuid() } == 0 {
         out.push(check("privileges", Level::Ok, "running as root"));
     }
-    match SystemProxyManager::new(ctx.root.join("runtime").join("system-proxy.json")) {
-        Ok(proxy) => out.push(match proxy.ownership() {
-            None => check("proxy", Level::Ok, "the system proxy is not ours"),
-            Some(owner) => {
-                let live = runstate::read(&ctx.root, &owner.profile_id).is_some();
-                if live {
-                    check("proxy", Level::Ok, format!("held by {}", owner.profile_id))
-                } else {
-                    check(
-                        "proxy",
-                        Level::Warn,
-                        "the system proxy still points at a connection that is gone; \
-                         Network Orchestrator or the next `netorch up` gives it back",
-                    )
-                }
-            }
-        }),
-        Err(_) => out.push(check(
-            "proxy",
-            Level::Fail,
-            "the proxy state could not be read",
-        )),
-    }
+    out.push(match ctx.engine().system_proxy_owner() {
+        Ok(Some(owner)) => check("proxy", Level::Ok, format!("held by {owner}")),
+        Ok(None) => check("proxy", Level::Ok, "the system proxy is not ours"),
+        Err(_) => check("proxy", Level::Warn, "the proxy owner could not be read"),
+    });
     out
 }
 
@@ -176,23 +167,29 @@ fn need_root() -> Result<(), String> {
 }
 
 /// Alive means it answered, even if it refused us (root is refused).
-fn helper_alive(ctx: &Ctx) -> bool {
-    !matches!(
-        ctx.engine().privileged().hello(),
-        Err(HelperError::Unreachable(_))
-    )
+fn helper_alive() -> bool {
+    let status = net_manager_engine::macos_services::helper_status();
+    status.reachable || status.denied || status.protocol_error
 }
 
-pub fn service(ctx: &Ctx, command: ServiceCommand) -> Result<(), String> {
+pub fn service(json: bool, command: ServiceCommand) -> Result<(), String> {
     match command {
+        ServiceCommand::Log => {
+            let log = net_manager_engine::macos_services::helper_log();
+            crate::ctx::emit(json, json!({"log": log}), || log);
+            Ok(())
+        }
         ServiceCommand::Install => {
+            if !cfg!(target_os = "macos") {
+                return Err("Standalone helper installation requires macOS".into());
+            }
             need_root()?;
             let exe = std::env::current_exe()
                 .and_then(std::fs::canonicalize)
                 .map_err(|_| "netorch could not locate itself".to_string())?;
             let layout = service::layout_of(&exe)?;
             let installer = installer();
-            if helper_alive(ctx) {
+            if helper_alive() {
                 return Err(if installer.is_installed() {
                     "The helper is already installed and running".into()
                 } else {
@@ -203,8 +200,8 @@ pub fn service(ctx: &Ctx, command: ServiceCommand) -> Result<(), String> {
             }
             installer.install(&layout, true)?;
             for _ in 0..25 {
-                if helper_alive(ctx) {
-                    ctx.emit(json!({"installed": true}), || {
+                if helper_alive() {
+                    crate::ctx::emit(json, json!({"installed": true}), || {
                         "The helper is installed and running.".into()
                     });
                     return Ok(());
@@ -214,9 +211,12 @@ pub fn service(ctx: &Ctx, command: ServiceCommand) -> Result<(), String> {
             Err("The helper was registered but did not start; see /var/log/network-orchestrator-helper.log".into())
         }
         ServiceCommand::Remove => {
+            if !cfg!(target_os = "macos") {
+                return Err("Standalone helper removal requires macOS".into());
+            }
             need_root()?;
             let removed = installer().remove()?;
-            ctx.emit(json!({"removed": removed}), || {
+            crate::ctx::emit(json, json!({"removed": removed}), || {
                 if removed {
                     "The helper is removed.".into()
                 } else {
@@ -226,9 +226,10 @@ pub fn service(ctx: &Ctx, command: ServiceCommand) -> Result<(), String> {
             Ok(())
         }
         ServiceCommand::Status => {
-            let result = helper_check(ctx);
+            let result = helper_check();
             let failed = result.level == Level::Fail;
-            ctx.emit(
+            crate::ctx::emit(
+                json,
                 serde_json::to_value(&result).map_err(|_| "Could not encode the result")?,
                 || format!("{}: {}", result.name, result.detail),
             );

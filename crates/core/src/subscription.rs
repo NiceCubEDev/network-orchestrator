@@ -540,6 +540,7 @@ pub fn import_body(
     request: &SubscriptionImport<'_>,
     body: &str,
     meta: ResponseMeta,
+    xray_mode: XrayMode,
     available: impl Fn(u16) -> bool,
 ) -> io::Result<BatchImportResult> {
     crate::config_vault::sanitize_profile_id(request.id)?;
@@ -608,7 +609,7 @@ pub fn import_body(
             config_path: imported.config_path,
             xray_socks_port: Some(socks),
             xray_http_port: Some(http),
-            xray_mode: XrayMode::platform_default(),
+            xray_mode,
             subscription: Some(SubscriptionMeta {
                 url: request.url.trim().into(),
                 hwid: request.hwid.into(),
@@ -732,7 +733,7 @@ pub fn prepare_endpoint_switch(
         profile.xray_socks_port,
         profile.xray_http_port,
         &used,
-        available,
+        |port| profile.xray_mode == XrayMode::Tun || available(port),
     )?;
     let config = xray::generate_share_link_config_with_http(&endpoint.url, socks, http)
         .map_err(|_| invalid("Invalid or unsupported share link"))?;
@@ -1531,6 +1532,7 @@ mod tests {
             &request,
             &panel_body(&["NL", "DE"]),
             meta,
+            XrayMode::Socks,
             |_| true,
         )
         .unwrap();
@@ -1589,6 +1591,7 @@ mod tests {
             &request,
             &panel_body(names),
             ResponseMeta::default(),
+            XrayMode::Socks,
             |_| true,
         )
         .unwrap();
@@ -1651,6 +1654,7 @@ mod tests {
             },
             &links.join("\n"),
             ResponseMeta::default(),
+            XrayMode::Socks,
             |_| true,
         )
         .unwrap();
@@ -1845,6 +1849,7 @@ mod tests {
             &request,
             &panel_json_body(),
             ResponseMeta::default(),
+            XrayMode::Socks,
             |_| true,
         )
         .unwrap();
@@ -1941,6 +1946,7 @@ mod tests {
             &request,
             body,
             ResponseMeta::default(),
+            XrayMode::Socks,
             |_| true,
         )
         .unwrap_err();
@@ -1975,12 +1981,13 @@ mod tests {
                 &request,
                 &body,
                 ResponseMeta::default(),
+                XrayMode::Socks,
                 |_| true,
             )
             .unwrap();
             let profile = &result.profiles[0];
             assert_eq!(profile.name, "Custom name");
-            assert_eq!(profile.xray_mode, XrayMode::platform_default());
+            assert_eq!(profile.xray_mode, XrayMode::Socks);
             assert_eq!(profile.subscription.as_ref().unwrap().endpoint_count, 2);
             assert_eq!(profile.subscription.as_ref().unwrap().url, request.url);
             assert_eq!(
@@ -2040,6 +2047,7 @@ mod tests {
                 &request,
                 body,
                 ResponseMeta::default(),
+                XrayMode::Socks,
                 |_| true
             )
             .is_err());
@@ -2052,6 +2060,7 @@ mod tests {
             &request,
             BODY,
             ResponseMeta::default(),
+            XrayMode::Socks,
             |_| true
         )
         .is_err());
@@ -2135,5 +2144,37 @@ mod tests {
         );
         source.await.unwrap();
         target.await.unwrap();
+    }
+    #[test]
+    fn subscription_import_persists_the_explicit_mode_and_refresh_keeps_it() {
+        for mode in [XrayMode::Socks, XrayMode::Tun] {
+            let dir = tempfile::tempdir().unwrap();
+            let vault = ConfigVault::new(dir.path().join("configs"));
+            let store = ProfileStore::new(dir.path().join("profiles.json"));
+            let request = SubscriptionImport {
+                id: "sub",
+                url: "https://example.test/sub",
+                hwid: "",
+                name: "Sub",
+                refresh_interval_minutes: None,
+            };
+            let imported = import_body(
+                &vault,
+                &store,
+                &request,
+                BODY,
+                ResponseMeta::default(),
+                mode,
+                |_| true,
+            )
+            .unwrap();
+            assert_eq!(imported.profiles[0].xray_mode, mode);
+            assert_eq!(store.load().unwrap().profiles[0].xray_mode, mode);
+            refresh_body(&vault, &store, "sub", BODY, ResponseMeta::default(), |_| {
+                true
+            })
+            .unwrap();
+            assert_eq!(store.load().unwrap().profiles[0].xray_mode, mode);
+        }
     }
 }

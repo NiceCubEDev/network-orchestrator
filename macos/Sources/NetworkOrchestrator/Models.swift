@@ -70,6 +70,58 @@ struct RuntimeState: Decodable, Sendable {
   let systemProxyOwner: String?
 }
 
+struct AppSettings: Decodable, Sendable {
+  let appMode: AppMode
+}
+
+struct LegacyStateImport: Decodable, Sendable {
+  let settings: AppSettings
+  let sets: [ConnectionSet]
+  let imported: Bool
+}
+
+struct ProfileStartEligibility: Decodable, Sendable {
+  let profileId: String
+  let canStart: Bool
+  let canTryStart: Bool
+  let modeBlocked: Bool
+}
+
+struct BatchOutcome: Decodable, Sendable {
+  let items: [BatchItem]
+}
+
+struct BatchItem: Decodable, Sendable {
+  let profileId: String
+  let action: String
+  let outcome: BatchItemOutcome
+  let error: String?
+  let credentialPrompt: CredentialPrompt?
+}
+
+enum BatchItemOutcome: String, Decodable, Sendable {
+  case succeeded, skippedRunning, unavailable, credentialsRequired, failed
+}
+
+struct ProxyExports: Decodable, Sendable {
+  let httpProxy: String
+  let httpsProxy: String
+  let allProxy: String
+  let noProxy: String
+  let shell: String
+}
+
+struct ProxyOverrideStatus: Decodable, Sendable {
+  let primaryInterface: String?
+  let overridden: Bool
+  let reason: String?
+}
+
+struct IntentFixOutcome: Decodable, Sendable {
+  let applied: Int
+  let error: String?
+}
+
 struct Profile: Decodable, Identifiable, Sendable {
   let id: String
   let name: String
@@ -463,7 +515,7 @@ enum IntentStatus: String, Decodable, Sendable {
 }
 /// "These networks go this way", kept and enforced by the helper.
 struct RouteIntent: Decodable, Identifiable, Sendable {
-  struct Path: Decodable, Sendable {
+  struct Path: Codable, Sendable {
     let kind: String
     let interface: String?
   }
@@ -501,21 +553,12 @@ enum SuggestionKind: String, Decodable, Sendable {
   }
 }
 /// A ready-made intent the doctor proposes.
-struct IntentFix: Decodable, Sendable {
+struct IntentFix: Codable, Sendable {
   let id: String
   let destinations: [String]
   let path: RouteIntent.Path
   let metric: UInt32?
-  /// The arguments of `set_intent`.
-  var arguments: [String: String] {
-    [
-      "id": id,
-      "destinations": destinations.joined(separator: "\n"),
-      "kind": path.kind,
-      "interface": path.interface ?? "",
-      "metric": metric.map(String.init) ?? "",
-    ]
-  }
+  let enabled: Bool?
 }
 struct IntentSuggestion: Decodable, Identifiable, Sendable {
   let key: String
@@ -721,9 +764,8 @@ struct Inspection: Decodable, Sendable {
   let routeKnowledgeComplete: Bool
 }
 
-/// What this client may start. A UI-level filter, as on Linux: `orchestrator`
-/// never starts a managed backend (only static routes), the others start all.
-enum AppMode: String, CaseIterable, Identifiable, Sendable {
+/// Presentation of the shared Engine start policy.
+enum AppMode: String, Decodable, CaseIterable, Identifiable, Sendable {
   case combined, orchestrator, manager
   var id: Self { self }
   var titleKey: String {
@@ -733,10 +775,6 @@ enum AppMode: String, CaseIterable, Identifiable, Sendable {
     case .manager: "settings.modeManager"
     }
   }
-  /// Whether starting `profile` is blocked by this mode.
-  func locks(_ profile: Profile) -> Bool { self == .orchestrator && !profile.isStatic }
-  /// Unknown stored values fall back to `combined`.
-  init(stored: String?) { self = stored.flatMap(AppMode.init(rawValue:)) ?? .combined }
 }
 
 enum Section: String, CaseIterable, Identifiable {
@@ -788,8 +826,7 @@ struct ExternalVpn: Decodable, Identifiable, Sendable {
   let enabled: Bool
 }
 
-/// A saved combination of connections restored in one click (kept in
-/// UserDefaults, like the web client's localStorage sets).
+/// A combination of connections kept in the shared per-data-directory store.
 struct ConnectionSet: Codable, Identifiable, Sendable, Equatable {
   var id: String
   var name: String

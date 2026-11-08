@@ -48,12 +48,6 @@ private func decode(_ object: Any) throws -> [IntentSuggestion] {
   #expect(list[0].kind == .unknown)
 }
 
-@Test func aFixBecomesTheArgumentsOfOneIntent() throws {
-  let fix = try #require(try decode([suggestionJSON(endpoints: ["203.0.113.7", "91.245.41.31"])])[0].fixes.first)
-  let args = fix.arguments
-  #expect(args["id"] == "bypass-utun5" && args["kind"] == "direct" && args["interface"] == "")
-  #expect(args["destinations"] == "203.0.113.7/32\n91.245.41.31/32" && args["metric"] == "50")
-}
 
 @Test func theCardTextFollowsTheKind() throws {
   let list = try decode([

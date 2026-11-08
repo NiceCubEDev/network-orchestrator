@@ -1,7 +1,8 @@
 //! Connection-set commands use the same store and lifecycle as the GUI.
 use super::{auth, commands::Output, ctx::Ctx};
 use clap::Subcommand;
-use net_manager_engine::linux_sets::{self, ConnectionSet};
+use net_manager_core::connection_sets::{self, ConnectionSet};
+use net_manager_engine::linux_sets;
 use serde::Serialize;
 use std::path::PathBuf;
 
@@ -52,7 +53,7 @@ fn describe(ctx: &Ctx, sets: &[ConnectionSet]) -> Result<String, String> {
     Ok(sets
         .iter()
         .map(|set| {
-            let missing = linux_sets::missing_members(set, &profiles);
+            let missing = connection_sets::missing_members(set, &profiles);
             let suffix = if missing.is_empty() {
                 String::new()
             } else {
@@ -75,22 +76,22 @@ pub fn run(ctx: &Ctx, command: Command) -> Result<Output, String> {
     }
     match command {
         Command::List => {
-            let sets = linux_sets::list(&ctx.root)?;
+            let sets = connection_sets::list(&ctx.root)?;
             output(&sets, describe(ctx, &sets)?)
         }
         Command::Get { id } => {
-            let set = linux_sets::get(&ctx.root, &id)?;
+            let set = connection_sets::get(&ctx.root, &id)?;
             let text = describe(ctx, std::slice::from_ref(&set))?;
             output(&set, text)
         }
         Command::Put { file } => {
-            let set = serde_json::from_slice(&linux_sets::read_input(&file)?)
+            let set = serde_json::from_slice(&connection_sets::read_input(&file)?)
                 .map_err(|_| "Invalid connection-set JSON")?;
-            let set = linux_sets::put(&ctx.root, &ctx.store(), set)?;
+            let set = connection_sets::put(&ctx.root, &ctx.store(), set)?;
             output(&set, format!("Saved connection set {}", set.id))
         }
         Command::Remove { id } => {
-            linux_sets::delete(&ctx.root, &id)?;
+            connection_sets::delete(&ctx.root, &id)?;
             output(
                 &serde_json::json!({"removed": id}),
                 format!("Removed connection set {id}"),
@@ -98,9 +99,9 @@ pub fn run(ctx: &Ctx, command: Command) -> Result<Output, String> {
         }
         Command::Import { file } => {
             let incoming: Vec<ConnectionSet> =
-                serde_json::from_slice(&linux_sets::read_input(&file)?)
+                serde_json::from_slice(&connection_sets::read_input(&file)?)
                     .map_err(|_| "Invalid legacy connection-set JSON")?;
-            let sets = linux_sets::import(&ctx.root, incoming)?;
+            let sets = connection_sets::import(&ctx.root, incoming)?;
             output(&sets, describe(ctx, &sets)?)
         }
         Command::Capture { id, name } => {
@@ -112,9 +113,9 @@ pub fn run(ctx: &Ctx, command: Command) -> Result<Output, String> {
             credentials_file,
         } => {
             let inputs = if let Some(path) = credentials_file {
-                linux_sets::read_credentials_file(&path)?
+                connection_sets::read_credentials_file(&path)?
             } else {
-                linux_sets::CredentialInputs::new()
+                connection_sets::CredentialInputs::new()
             };
             lifecycle(auth::run(ctx.root_user, || {
                 linux_sets::apply(

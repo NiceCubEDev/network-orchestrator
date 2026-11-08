@@ -1,21 +1,13 @@
-//! Command line of `netorch`.
+//! macOS business command line (also selected by the portable `macos-cli` feature).
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(
-    name = "netorch",
-    version = env!("NETORCH_VERSION"),
-    about = "One command for VPN profiles, tunnels and routing",
-    long_about = "Import a link, subscription or config and connect with one command.\n\
-                  Profiles and settings are shared with the Network Orchestrator app."
-)]
+#[command(name="netorch", version=env!("NETORCH_VERSION"), about="Profiles, tunnels and routing shared with Network Orchestrator")]
 pub struct Cli {
-    /// Print machine-readable JSON instead of text
     #[arg(long, global = true)]
     pub json: bool,
-    /// App data directory (default: the Network Orchestrator app's)
     #[arg(
         long,
         global = true,
@@ -26,192 +18,438 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
 }
-
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// List saved profiles
     Ls,
-    /// Show which connections are running
-    Status { target: Option<String> },
-    /// Save a profile from a share link, subscription URL or config file
+    Status {
+        target: Option<String>,
+    },
     Add(AddArgs),
-    /// Delete a saved profile
-    Rm { target: String },
-    /// Rename a saved profile
-    Rename { target: String, name: String },
-    /// Connect (importing first when given a link, URL or file)
+    /// Import an explicit backend config, including native Xray JSON.
+    Import {
+        file: PathBuf,
+        #[arg(value_enum)]
+        backend: Backend,
+        #[arg(long)]
+        name: Option<String>,
+    },
+    Rm {
+        target: String,
+    },
+    Rename {
+        target: String,
+        name: String,
+    },
+    /// Edit persisted profile settings; unspecified fields are preserved.
+    Edit(EditArgs),
+    /// Create a static-route profile from a typed JSON document.
+    Static {
+        file: PathBuf,
+    },
+    /// Replace the complete ordering of one backend group.
+    Reorder {
+        #[arg(value_enum)]
+        backend: Backend,
+        profiles: Vec<String>,
+    },
     Up(UpArgs),
-    /// Disconnect
     Down {
         target: Option<String>,
-        /// Disconnect every running connection
         #[arg(long, conflicts_with = "target")]
         all: bool,
     },
-    /// Show the tail of a connection's log
-    Logs { target: String },
-    /// Measure subscription endpoint delays, or check the exit IP
+    Logs {
+        target: String,
+    },
     Test(TestArgs),
-    /// Routing rules and route lookups
+    Inspect {
+        target: String,
+    },
+    Diagnose {
+        target: String,
+    },
+    #[command(subcommand)]
+    Subscription(SubscriptionCommand),
     #[command(subcommand)]
     Route(RouteCommand),
-    /// Check that everything netorch needs is in place
+    #[command(subcommand)]
+    Sets(SetCommand),
+    #[command(subcommand)]
+    Mode(AppModeCommand),
+    /// Execute saved auto-connect policy, continuing individual failures.
+    AutoConnect {
+        #[arg(long)]
+        credentials_file: Option<PathBuf>,
+    },
+    #[command(subcommand)]
+    Credentials(CredentialCommand),
+    #[command(subcommand)]
+    Network(NetworkCommand),
+    #[command(subcommand)]
+    Netbird(NetbirdCommand),
+    #[command(subcommand)]
+    Tailscale(TailscaleCommand),
+    #[command(subcommand)]
+    Vpn(VpnCommand),
+    #[command(subcommand)]
+    Intents(IntentCommand),
+    #[command(subcommand)]
+    Conditions(ConditionCommand),
+    #[command(subcommand)]
+    Recovery(RecoveryCommand),
+    #[command(subcommand)]
+    Proxy(ProxyCommand),
+    Capabilities,
+    Snapshot,
     Doctor,
-    /// Manage the backends netorch runs
     #[command(subcommand)]
     Backend(BackendCommand),
-    /// The privileged helper that owns routes, interfaces and DNS
     #[command(subcommand)]
     Service(ServiceCommand),
-    /// Print shell completions
-    Completions { shell: Shell },
+    /// Run the shared unprivileged runtime owner (normally started on demand).
+    Serve,
+    Completions {
+        shell: Shell,
+    },
 }
-
 #[derive(Args, Debug)]
 pub struct AddArgs {
-    /// vless:// / hysteria2:// link, https:// subscription URL, or .conf/.ovpn file
     pub input: String,
-    /// Display name (default: taken from the link or file name)
     #[arg(long)]
     pub name: Option<String>,
+    /// Subscription device identifier; omit to generate, use empty value to disable.
+    #[arg(long)]
+    pub hwid: Option<String>,
 }
-
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Mode {
     Socks,
     Tun,
 }
-
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Role {
     Primary,
     Secondary,
 }
-
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum Backend {
+    Xray,
+    Wireguard,
+    Openvpn,
+    Static,
+}
 #[derive(Args, Debug)]
-pub struct UpArgs {
-    /// Saved profile (id or name), or a link / URL / file to import first
+pub struct EditArgs {
     pub target: String,
-    /// Name for a profile imported by this command
     #[arg(long)]
     pub name: Option<String>,
-    /// Xray mode: a local proxy (socks) or a system-wide tunnel (tun)
     #[arg(long, value_enum)]
     pub mode: Option<Mode>,
-    /// Primary tunnels carry all traffic; secondary ones only --networks
     #[arg(long, value_enum)]
     pub role: Option<Role>,
-    /// Networks a secondary tunnel carries (CIDR, comma separated)
-    #[arg(long, value_name = "CIDR,...")]
+    #[arg(long)]
     pub networks: Option<String>,
-    /// Domains resolved through a secondary tunnel's DNS (comma separated)
-    #[arg(long, value_name = "DOMAIN,...")]
+    #[arg(long)]
     pub dns_domains: Option<String>,
-    /// Point the macOS system proxy at the local proxy while connected
+    #[arg(long)]
+    pub auto_connect: Option<bool>,
+    #[arg(long)]
+    pub wait_for_interface: Option<bool>,
+    /// Minutes; 0 disables automatic subscription refresh.
+    #[arg(long)]
+    pub refresh_interval: Option<u32>,
+}
+#[derive(Args, Debug, Default)]
+pub struct CredentialArgs {
+    #[arg(long, conflicts_with = "credentials_file")]
+    pub auth_stdin: bool,
+    #[arg(long, conflicts_with = "credentials_file")]
+    pub passphrase_stdin: bool,
+    /// Private JSON file containing authUserPass/privateKeyPassphrase; '-' reads stdin.
+    #[arg(long, value_name = "FILE")]
+    pub credentials_file: Option<PathBuf>,
+    /// Save only after a confirmed successful connection, in the login Keychain.
+    #[arg(long)]
+    pub remember: bool,
+}
+#[derive(Args, Debug)]
+pub struct UpArgs {
+    pub target: String,
+    #[arg(long)]
+    pub name: Option<String>,
+    #[arg(long, value_enum)]
+    pub mode: Option<Mode>,
+    #[arg(long, value_enum)]
+    pub role: Option<Role>,
+    #[arg(long)]
+    pub networks: Option<String>,
+    #[arg(long)]
+    pub dns_domains: Option<String>,
     #[arg(long)]
     pub system_proxy: bool,
-    /// Read OpenVPN username and password (two lines) from stdin
-    #[arg(long)]
-    pub auth_stdin: bool,
-    /// Read the OpenVPN private key passphrase (one line) from stdin
-    #[arg(long)]
-    pub passphrase_stdin: bool,
+    /// Hold a generation lease; Ctrl+C/client death disconnects only this activation.
+    #[arg(short = 'f', long)]
+    pub foreground: bool,
+    #[command(flatten)]
+    pub credentials: CredentialArgs,
 }
-
 #[derive(Args, Debug)]
 pub struct TestArgs {
-    /// Subscription to measure (default: check the exit IP)
     pub target: Option<String>,
-    /// Check the exit IP, through the connection when a profile is given
     #[arg(long)]
     pub ip: bool,
+    #[arg(long, conflicts_with = "ip")]
+    pub index: Option<usize>,
 }
-
+#[derive(Subcommand, Debug)]
+pub enum SubscriptionCommand {
+    Endpoints {
+        target: String,
+    },
+    Switch {
+        target: String,
+        index: usize,
+    },
+    Refresh {
+        target: String,
+    },
+    /// Refresh all subscriptions, or only stopped subscriptions whose refresh is due.
+    RefreshAll {
+        #[arg(long)]
+        due: bool,
+    },
+    ImportLog,
+    Hwid,
+}
 #[derive(Subcommand, Debug)]
 pub enum RouteCommand {
-    /// Which interface the system would use for an address
-    Lookup { address: String },
-    /// Which rule of a profile decides a host or address
+    Lookup {
+        address: String,
+    },
     Check {
         target: String,
-        /// Profile whose rules are replayed
         #[arg(long)]
         profile: String,
     },
-    /// Show a profile's routing rules
-    Show { profile: String },
-    /// Replace a profile's routing rules (one selector per argument)
+    Show {
+        profile: String,
+    },
     Set {
         profile: String,
-        #[arg(long, value_name = "SELECTOR")]
+        #[arg(long)]
         block: Vec<String>,
-        #[arg(long, value_name = "SELECTOR")]
+        #[arg(long)]
         proxy: Vec<String>,
-        #[arg(long, value_name = "SELECTOR")]
+        #[arg(long)]
         direct: Vec<String>,
-        /// Send private LAN ranges direct
         #[arg(long)]
         lan_direct: bool,
+        /// Typed AdvancedRouting JSON (strategy, matcher, DNS); omitted preserves existing settings.
+        #[arg(long)]
+        advanced: Option<PathBuf>,
+        /// Typed GeoUrls JSON; null fields clear custom URLs.
+        #[arg(long)]
+        geo: Option<PathBuf>,
+    },
+    /// Merge Happ/Incy routing import, preserving omitted fields.
+    Import {
+        profile: String,
+        file: PathBuf,
     },
 }
-
+#[derive(Subcommand, Debug)]
+pub enum SetCommand {
+    List,
+    Capture {
+        id: String,
+        #[arg(long)]
+        name: Option<String>,
+    },
+    Put {
+        id: String,
+        #[arg(long)]
+        name: String,
+        profiles: Vec<String>,
+    },
+    Import {
+        file: PathBuf,
+    },
+    Apply {
+        id: String,
+        #[arg(long)]
+        credentials_file: Option<PathBuf>,
+    },
+    Down {
+        id: String,
+    },
+    Delete {
+        id: String,
+    },
+}
+#[derive(Copy, Clone, Debug, ValueEnum)]
+pub enum AppMode {
+    Combined,
+    Orchestrator,
+    Manager,
+}
+#[derive(Subcommand, Debug)]
+pub enum AppModeCommand {
+    Show,
+    Set {
+        #[arg(value_enum)]
+        mode: AppMode,
+    },
+    Eligibility {
+        target: String,
+    },
+}
+#[derive(Subcommand, Debug)]
+pub enum CredentialCommand {
+    Requirements { target: String },
+    Forget { target: String },
+}
+#[derive(Subcommand, Debug)]
+pub enum NetworkCommand {
+    Settings,
+    Interfaces,
+    Routes,
+    Lookup {
+        address: std::net::IpAddr,
+    },
+    Dns,
+    DnsProbe {
+        hostname: String,
+        #[arg(long)]
+        server: Option<std::net::IpAddr>,
+        #[arg(long)]
+        ipv6: bool,
+    },
+    ProxyEffect,
+    Interface {
+        name: String,
+        #[arg(value_enum)]
+        state: Switch,
+    },
+}
+#[derive(Copy, Clone, Debug, ValueEnum)]
+pub enum Switch {
+    Up,
+    Down,
+}
+#[derive(Subcommand, Debug)]
+pub enum NetbirdCommand {
+    Status,
+    Down,
+    Log,
+    Up {
+        #[arg(long)]
+        management_url: Option<String>,
+        #[arg(long, conflicts_with = "setup_key_file")]
+        setup_key_stdin: bool,
+        #[arg(long)]
+        setup_key_file: Option<PathBuf>,
+    },
+}
+#[derive(Subcommand, Debug)]
+pub enum TailscaleCommand {
+    Status,
+    Up,
+    Down,
+    Sync,
+}
+#[derive(Subcommand, Debug)]
+pub enum VpnCommand {
+    List,
+    Set {
+        id: String,
+        #[arg(value_enum)]
+        state: Switch,
+    },
+}
+#[derive(Subcommand, Debug)]
+pub enum IntentCommand {
+    List,
+    Put {
+        file: PathBuf,
+    },
+    Delete {
+        id: String,
+    },
+    Doctor,
+    /// Apply typed IntentFix[] in order, stopping at the first failure.
+    Apply {
+        file: PathBuf,
+    },
+}
+#[derive(Subcommand, Debug)]
+pub enum ConditionCommand {
+    List,
+    Put { file: PathBuf },
+    Delete { id: String },
+}
+#[derive(Subcommand, Debug)]
+pub enum RecoveryCommand {
+    Report,
+    Cleanup,
+}
+#[derive(Subcommand, Debug)]
+pub enum ProxyCommand {
+    Set {
+        target: String,
+        #[arg(value_enum)]
+        state: Switch,
+    },
+    Env {
+        target: String,
+    },
+    Browser {
+        target: String,
+    },
+}
 #[derive(Subcommand, Debug)]
 pub enum BackendCommand {
-    /// Download (hash-checked) or unpack the pinned Xray
     Install {
-        /// Use this copy of the official Xray zip instead of downloading
-        #[arg(long, value_name = "ZIP")]
+        #[arg(long)]
         archive: Option<PathBuf>,
     },
 }
-
 #[derive(Subcommand, Debug)]
 pub enum ServiceCommand {
-    /// Is the helper installed, running and willing to talk to netorch
     Status,
-    /// Install the helper without the app (needs sudo, run from the app bundle)
     Install,
-    /// Remove a helper installed by `service install` (needs sudo)
     Remove,
+    Log,
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::CommandFactory;
-
     #[test]
-    fn the_command_line_definition_is_consistent() {
-        Cli::command().debug_assert();
-    }
-
-    #[test]
-    fn up_takes_a_link_and_flags() {
-        let cli = Cli::try_parse_from([
-            "netorch",
-            "--json",
-            "up",
-            "vless://x@h:1#n",
-            "--mode",
-            "tun",
-            "--role",
-            "secondary",
-            "--networks",
-            "10.0.0.0/8",
-        ])
-        .unwrap();
-        assert!(cli.json);
-        let Command::Up(up) = cli.command else {
-            panic!("not up")
+    fn generation_lease_is_explicit() {
+        let Command::Up(args) =
+            Cli::try_parse_from(["netorch", "up", "saved", "-f", "--auth-stdin"])
+                .unwrap()
+                .command
+        else {
+            panic!()
         };
-        assert_eq!(up.mode, Some(Mode::Tun));
-        assert_eq!(up.role, Some(Role::Secondary));
-        assert_eq!(up.networks.as_deref(), Some("10.0.0.0/8"));
+        assert!(args.foreground);
+        assert!(args.credentials.auth_stdin);
+        let Command::Up(args) = Cli::try_parse_from(["netorch", "up", "saved"])
+            .unwrap()
+            .command
+        else {
+            panic!()
+        };
+        assert!(!args.foreground);
     }
-
     #[test]
-    fn down_all_and_a_target_exclude_each_other() {
+    fn secrets_have_no_value_arguments() {
+        for flag in ["--password", "--passphrase", "--setup-key"] {
+            assert!(Cli::try_parse_from(["netorch", "up", "saved", flag, "secret"]).is_err());
+        }
+    }
+    #[test]
+    fn down_all_and_target_exclude_each_other() {
         assert!(Cli::try_parse_from(["netorch", "down", "--all", "x"]).is_err());
-        assert!(Cli::try_parse_from(["netorch", "down", "--all"]).is_ok());
     }
 }

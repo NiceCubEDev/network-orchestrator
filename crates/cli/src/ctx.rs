@@ -19,8 +19,7 @@ pub fn is_root() -> bool {
 /// Home of the user at the console: where the app keeps its data even when
 /// `sudo` has changed `$HOME`.
 fn console_home() -> Option<PathBuf> {
-    use std::os::unix::fs::MetadataExt;
-    let uid = std::fs::metadata("/dev/console").ok()?.uid();
+    let uid = net_manager_engine::macos_session::console_user_uid().ok()?;
     // SAFETY: getpwuid returns null or a pointer valid until the next call;
     // the directory is copied out immediately.
     unsafe {
@@ -50,9 +49,13 @@ pub fn default_root() -> Result<PathBuf, String> {
 
 impl Ctx {
     pub fn new(root: PathBuf, json: bool) -> Result<Self, String> {
-        if !root.is_absolute() {
-            return Err("The data directory must be an absolute path".into());
-        }
+        let expected_uid = if is_root() {
+            Some(net_manager_engine::macos_session::console_user_uid()?)
+        } else {
+            None
+        };
+        let root =
+            net_manager_engine::macos_transaction::normalized_root_path(&root, expected_uid)?;
         Ok(Self { root, json })
     }
 
@@ -74,9 +77,20 @@ impl Ctx {
         Engine::new(&self.root)
     }
 
-    /// A call to the same services the native app uses (import, rules, ...).
-    pub fn app(&self, method: &str, args: Value) -> Result<Value, String> {
-        net_manager_macos_bridge::call(&self.root, method, &args)
+    pub fn services(&self) -> Result<net_manager_engine::macos_services::MacosServices, String> {
+        net_manager_engine::macos_services::MacosServices::new(&self.root)
+    }
+
+    pub fn network(&self) -> net_manager_engine::macos_network::MacNetwork {
+        net_manager_engine::macos_network::MacNetwork::new(&self.root)
+    }
+
+    /// Only safe DTOs may be passed here; executable profiles/credentials are not output.
+    pub fn output(&self, value: &impl serde::Serialize) -> Result<(), String> {
+        let encoded =
+            serde_json::to_string_pretty(value).map_err(|_| "Could not encode the result")?;
+        println!("{encoded}");
+        Ok(())
     }
 
     /// Profiles as stored, for running them. Never printed as they are.
@@ -91,42 +105,32 @@ impl Ctx {
         let profiles = self.profiles()?;
         match target::resolve(&profiles, query) {
             Lookup::Found(profile) => Ok(profile.clone()),
-            Lookup::Missing => Err(format!(
-                "No saved profile matches \"{query}\". `netorch ls` lists them."
-            )),
-            Lookup::Ambiguous(found) => Err(format!(
-                "\"{query}\" matches several profiles: {}",
-                found
-                    .iter()
-                    .map(|profile| profile.id.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )),
+            Lookup::Missing => Err("No saved profile matches. `netorch ls` lists them.".into()),
+            Lookup::Ambiguous(_) => Err(
+                "Several saved profiles match. Use an exact profile ID from `netorch ls`.".into(),
+            ),
         }
-    }
-
-    pub fn print_json(&self, value: &Value) {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(value).unwrap_or_else(|_| "null".into())
-        );
     }
 
     /// `--json` prints the value, otherwise the text.
     pub fn emit(&self, value: Value, text: impl FnOnce() -> String) {
-        if self.json {
-            self.print_json(&value);
-        } else {
-            let text = text();
-            if !text.is_empty() {
-                println!("{text}");
-            }
-        }
+        emit(self.json, value, text);
     }
 
     pub fn note(&self, message: &str) {
         if !self.json {
             eprintln!("{message}");
+        }
+    }
+}
+
+pub fn emit(json: bool, value: Value, text: impl FnOnce() -> String) {
+    if json {
+        println!("{value:#}");
+    } else {
+        let text = text();
+        if !text.is_empty() {
+            println!("{text}");
         }
     }
 }

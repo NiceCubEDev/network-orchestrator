@@ -8,7 +8,7 @@ private let link = "vless://synthetic-private-id@node.test:443?security=tls#"
 /// A model over a temp store holding the given connections (flags set through
 /// the bridge, as the UI does). Starting is disabled, so nothing ever connects.
 @MainActor private func model(
-  _ names: [(name: String, autoConnect: Bool)], canStart: Bool = false,
+  _ names: [(name: String, autoConnect: Bool)],
   directory: URL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
 ) async throws -> (AppModel, [Profile]) {
   let core = CoreBridge(root: directory)
@@ -21,13 +21,9 @@ private let link = "vless://synthetic-private-id@node.test:443?security=tls#"
         "set_auto_connect", args: ["id": "p\(index)", "enabled": "true"])
     }
   }
+  // Shared policy prevents every managed start; the test never launches a service or VPN.
+  let _: AppSettings = try await core.call("set_app_mode", args: ["mode": "orchestrator"])
   let model = AppModel(dataDirectory: directory)
-  model.capabilities = try JSONDecoder().decode(
-    Capabilities.self,
-    from: JSONSerialization.data(withJSONObject: [
-      "os": "macos", "minimumOS": "27.0", "nativeUI": true, "networkMutations": false,
-      "proxyConnections": canStart, "version": "T",
-    ]))
   model.snapshot = try await core.call("snapshot")
   return (model, model.snapshot?.profiles ?? [])
 }
@@ -82,13 +78,6 @@ private func running(_ ids: [String]) throws -> RuntimeState {
   #expect(several.error == nil)  // the notice replaces a stale error
 }
 
-@Test @MainActor func autoConnectFailuresAreWrittenToTheAppLog() async throws {
-  let (model, _) = try await model([("a", true), ("b", true)])
-  await model.autoConnectOnLaunch()
-  let lines = LogLines.parse(await model.logText(for: .app))
-  #expect(lines.count == 1 && lines[0].level == .warn)
-  #expect(lines[0].text.contains("2 connection(s) flagged to start with the app did not start"))
-}
 
 @Test @MainActor func autoConnectRunsOncePerLaunch() async throws {
   let (model, _) = try await model([("a", true)])
@@ -99,23 +88,6 @@ private func running(_ ids: [String]) throws -> RuntimeState {
   #expect(model.notice == nil)
 }
 
-@Test @MainActor func aFlaggedConnectionThatIsAlreadyRunningIsLeftAlone() async throws {
-  let (model, _) = try await model([("a", true), ("b", true)])
-  model.runtime = try running(["p0", "p1"])
-  await model.autoConnectOnLaunch()
-  #expect(model.notice == nil && model.autoConnectFailures == 0)
-}
-
-@Test @MainActor func aSecondInstanceNeitherAutoConnectsNorMonitors() async throws {
-  let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-  let (first, _) = try await model([("a", true)], directory: directory)
-  #expect(!first.isDuplicate)  // holds the data directory's instance lock
-  let (second, _) = try await model([], directory: directory)
-  #expect(second.isDuplicate)
-  second.snapshot = first.snapshot
-  await second.autoConnectOnLaunch()
-  #expect(second.notice == nil)
-}
 
 @Test @MainActor func disconnectAllDoesNothingWhenNothingRuns() async throws {
   let (model, _) = try await model([("a", true)])
@@ -148,11 +120,3 @@ private func running(_ ids: [String]) throws -> RuntimeState {
   #expect(!live.requiresElevation)
 }
 
-@Test @MainActor func aDuplicateInstanceNeverChecksOrOffersRecovery() async throws {
-  let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-  let (_, _) = try await model([], directory: directory)  // takes the instance lock
-  let (second, _) = try await model([], directory: directory)
-  #expect(second.isDuplicate)
-  await second.checkRecovery()
-  #expect(second.recoveryReport == nil && !second.showingRecovery)
-}

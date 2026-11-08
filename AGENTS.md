@@ -14,21 +14,22 @@ Guidance for agents/contributors working in this repository.
   Hard-learned netlink quirks live in `MEMORY.md`.
 - `crates/engine` — typed connection engine (`Engine`): connect/disconnect/
   status/system proxy/Xray install and the requests to the privileged helper.
-  macOS (aarch64) `Engine` is shared by the bridge and the `netorch` CLI
+  macOS (aarch64): `macos_services` owns the business operations used directly
+  by CLI and bridge; `macos_session` owns their shared unprivileged runtime
   (`docs/plans/2026-10-15-19-netorch-cli.md`). On Linux, `linux` holds pure
   daemon request builders and `linux_engine::LinuxEngine` serves both CLI and GUI.
   `linux_session` hosts their unprivileged `netorch serve` runtime: local Xray
   children and detached daemon client lifetime. No UI, no FFI.
 - `crates/cli` — the `netorch` command line tool. macOS: clap commands over
-  `crates/engine` and the bridge's profile/import/routing services; ships in
-  the app bundle next to the helper. Linux (`src/linux/`): a client of the
+  typed `crates/engine` services, with no bridge dependency; ships in the app
+  bundle next to the helper. Linux (`src/linux/`): a client of the
   network daemon built on `LinuxEngine` and the import/subscription code of
   `crates/core`, no GUI needed. `serve` is started on demand as one systemd user
   unit per data directory/daemon socket; no per-profile keepers. The user runtime
   must stay unprivileged; routes/interfaces/DNS remain system-daemon-only.
 - `crates/macos-bridge` — unprivileged JSON C ABI staticlib the Swift client
-  links; every macOS core operation goes through it. A thin JSON wrapper over
-  `crates/engine` for runtime operations.
+  links. A thin adapter over the same typed business and runtime services in
+  `crates/engine` that the macOS CLI calls directly.
 - `crates/macos-helper` — privileged launchd helper daemon for root macOS
   network mutations; design in
   `docs/plans/2026-09-30-14-macos-privileged-helper.md`.
@@ -103,7 +104,7 @@ mirrors this gate on Windows.
 - `scripts/macos-dev.sh build|run|test|preview|check|du|clean` — native
   macOS loop: `release-fast` bridge (no LTO, incremental) + Swift debug,
   isolated QA data for `run` (`NETORCH_MACOS_DATA_DIR`), offscreen renders
-  for `preview`; `check` covers only core + macos-bridge, not the workspace.
+  for `preview`; `check` covers core + engine + macos-bridge + CLI, not the workspace.
   `npm run build:macos` builds the distributable release bundle (LTO +
   Swift release, ad-hoc signed).
 - `npm run dev:app` — Linux dev run against the dev daemon
@@ -145,8 +146,10 @@ mirrors this gate on Windows.
   hooks) and refuses when the helper is running; as root it must never write
   into the user's data directory (root-owned files would lock the app out),
   execute a binary from a user-writable directory, or run local Xray.
-  Loopback Xray runs only in a foreground `netorch up` holding the data
-  directory's `.instance.lock`, which the app takes too.
+  On macOS, the unprivileged per-data-directory `netorch serve` owner runs
+  loopback Xray and holds `.instance.lock` to exclude legacy independent owners.
+  GUI and CLI share it. Normal `up` detaches, closing the GUI does not disconnect,
+  and `up --foreground` releases only its own activation generation on exit.
 - `crates/macos-bridge` stays unprivileged: never add `daemon_protocol`
   methods or network mutations to it. macOS mutations go through a launchd
   helper speaking `daemon_protocol` over a Unix socket

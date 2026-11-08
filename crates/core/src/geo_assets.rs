@@ -252,6 +252,74 @@ pub fn protocol_geo_assets(dir: &Path) -> Result<crate::daemon_protocol::XrayGeo
     })
 }
 
+/// Read already prepared overrides without downloading, writing an overlay, or
+/// following user-controlled links. The privileged in-process CLI supplies the
+/// console user's non-root UID; it must never copy root-owned files as geo data.
+#[cfg(unix)]
+pub fn cached_protocol_geo_assets(
+    root: &Path,
+    profile: &Profile,
+    expected_uid: u32,
+) -> Result<Option<crate::daemon_protocol::XrayGeoAssets>, String> {
+    use base64::Engine;
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    const UNAVAILABLE: &str =
+        "Custom geo data is not safely cached; prepare it as your own user without sudo";
+    let geoip_url = normalized_url(profile.xray_geoip_url.as_deref());
+    let geosite_url = normalized_url(profile.xray_geosite_url.as_deref());
+    if geoip_url.is_none() && geosite_url.is_none() {
+        return Ok(None);
+    }
+    if expected_uid == 0 {
+        return Err(UNAVAILABLE.into());
+    }
+    for url in [geoip_url, geosite_url].into_iter().flatten() {
+        validate_geo_asset_url(url)?;
+    }
+    let directory = profile_asset_dir(root, geoip_url, geosite_url);
+    for path in [root, directory.as_path()] {
+        let metadata = std::fs::symlink_metadata(path).map_err(|_| UNAVAILABLE)?;
+        if !metadata.is_dir() || metadata.uid() != expected_uid {
+            return Err(UNAVAILABLE.into());
+        }
+    }
+    let read = |name: &str, requested: bool| -> Result<Option<String>, String> {
+        if !requested {
+            return Ok(None);
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(directory.join(name))
+            .map_err(|_| UNAVAILABLE)?;
+        let metadata = file.metadata().map_err(|_| UNAVAILABLE)?;
+        if !metadata.is_file()
+            || metadata.uid() != expected_uid
+            || metadata.nlink() != 1
+            || metadata.len() == 0
+            || metadata.len() > MAX_GEO_ASSET_BYTES as u64
+        {
+            return Err(UNAVAILABLE.into());
+        }
+        let mut bytes = Vec::with_capacity(metadata.len() as usize + 1);
+        file.take(MAX_GEO_ASSET_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| UNAVAILABLE)?;
+        if bytes.is_empty() || bytes.len() > MAX_GEO_ASSET_BYTES {
+            return Err(UNAVAILABLE.into());
+        }
+        Ok(Some(
+            base64::engine::general_purpose::STANDARD.encode(bytes),
+        ))
+    };
+    Ok(Some(crate::daemon_protocol::XrayGeoAssets {
+        geoip_dat_b64: read("geoip.dat", geoip_url.is_some())?,
+        geosite_dat_b64: read("geosite.dat", geosite_url.is_some())?,
+    }))
+}
+
 /// Builds `target` for an Xray that runs as the user: each file of `cache`
 /// is laid over the managed copy in `managed` (providers ship minimal
 /// overlays), and a file the cache lacks is the managed copy as it is.

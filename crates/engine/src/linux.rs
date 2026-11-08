@@ -766,6 +766,7 @@ mod tests {
             "ipv6-tun",
             "IPv6 TUN fixture",
             "vless://synthetic-id@node.test:443?security=tls#IPv6",
+            net_manager_core::models::XrayMode::platform_default(),
             |_| true,
         )
         .unwrap();

@@ -16,7 +16,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 APP_BIN="$REPO_ROOT/target/macos/Network Orchestrator.app/Contents/MacOS/NetworkOrchestrator"
 QA_DATA="$REPO_ROOT/target/macos-qa-data"
-CRATES=(-p net-manager-core -p net-manager-engine -p net-manager-macos-bridge)
+CRATES=(-p net-manager-core -p net-manager-engine -p net-manager-macos-bridge -p net-manager-cli)
 cd "$REPO_ROOT"
 
 case "${1:-}" in

@@ -7,9 +7,13 @@ use plist::Value as Plist;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(target_os = "macos")]
+use std::path::PathBuf;
 
+#[cfg(target_os = "macos")]
 const PREFERENCES: &str = "/Library/Preferences/SystemConfiguration/preferences.plist";
+#[cfg(target_os = "macos")]
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
 const NETWORK_TOOLS: [&str; 6] = [
     "route",
@@ -23,7 +27,7 @@ const TUNNEL_PREFIXES: [&str; 4] = ["utun", "ipsec", "ppp", "tun"];
 
 #[derive(Debug, Default, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct UserNetworkSettings {
+pub struct UserNetworkSettings {
     pub persistent_routes: Vec<PersistentRoute>,
     pub static_routes: Vec<StaticRoute>,
     pub startup_jobs: Vec<StartupJob>,
@@ -38,7 +42,7 @@ pub(crate) struct UserNetworkSettings {
 /// `networksetup -setadditionalroutes`, survives reboots.
 #[derive(Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct PersistentRoute {
+pub struct PersistentRoute {
     pub service: String,
     pub interface: Option<String>,
     pub destination: String,
@@ -50,7 +54,7 @@ pub(crate) struct PersistentRoute {
 /// something re-creates it.
 #[derive(Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct StaticRoute {
+pub struct StaticRoute {
     pub destination: String,
     pub gateway: String,
     pub interface: String,
@@ -61,7 +65,7 @@ pub(crate) struct StaticRoute {
 
 #[derive(Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct StartupJob {
+pub struct StartupJob {
     pub label: String,
     pub path: String,
     /// `daemon`, `agent` or `userAgent`.
@@ -75,7 +79,7 @@ pub(crate) struct StartupJob {
 
 #[derive(Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct Resolver {
+pub struct Resolver {
     pub domain: String,
     pub nameservers: Vec<String>,
     pub port: Option<u16>,
@@ -84,14 +88,14 @@ pub(crate) struct Resolver {
 
 #[derive(Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct HostEntry {
+pub struct HostEntry {
     pub address: String,
     pub names: Vec<String>,
 }
 
 #[derive(Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ServiceSettings {
+pub struct ServiceSettings {
     pub service: String,
     pub interface: Option<String>,
     pub enabled: bool,
@@ -100,7 +104,7 @@ pub(crate) struct ServiceSettings {
 
 #[derive(Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ServiceSetting {
+pub struct ServiceSetting {
     /// `ipv4Address`, `ipv4Router`, `ipv6Address`, `ipv6Router`,
     /// `dnsServers`, `searchDomains`, `httpProxy`, `httpsProxy`,
     /// `socksProxy`, `pacUrl` or `proxyAutoDiscovery`.
@@ -110,7 +114,7 @@ pub(crate) struct ServiceSetting {
 
 /// Raw inputs, split from the reader so parsing is testable offline.
 #[derive(Default)]
-pub(crate) struct Sources {
+pub struct Sources {
     pub preferences: Option<Plist>,
     pub netstat: Option<String>,
     /// `(domain, file text)` from `/etc/resolver`.
@@ -121,7 +125,7 @@ pub(crate) struct Sources {
     pub unreadable: Vec<String>,
 }
 
-pub(crate) fn collect(sources: Sources) -> UserNetworkSettings {
+pub fn collect(sources: Sources) -> UserNetworkSettings {
     let kernel: Vec<KernelRoute> = sources
         .netstat
         .as_deref()
@@ -202,21 +206,16 @@ pub(crate) fn collect(sources: Sources) -> UserNetworkSettings {
     }
 }
 
-pub(crate) fn read() -> UserNetworkSettings {
+#[cfg(target_os = "macos")]
+pub(super) fn read() -> UserNetworkSettings {
     let mut sources = Sources::default();
     let mut unreadable = Vec::new();
     match read_plist(Path::new(PREFERENCES)) {
         Ok(value) => sources.preferences = Some(value),
         Err(error) => note(&mut unreadable, "System network preferences", &error),
     }
-    match std::process::Command::new("/usr/sbin/netstat")
-        .arg("-rn")
-        .output()
-    {
-        Ok(output) if output.status.success() => {
-            sources.netstat = Some(String::from_utf8_lossy(&output.stdout).into_owned())
-        }
-        Ok(_) => unreadable.push("Kernel routing table".into()),
+    match super::native::read_command("/usr/sbin/netstat", &["-rn"], None) {
+        Ok(text) => sources.netstat = Some(text),
         Err(error) => note(&mut unreadable, "Kernel routing table", &error),
     }
     match std::fs::read_dir("/etc/resolver") {
@@ -270,12 +269,14 @@ pub(crate) fn read() -> UserNetworkSettings {
 }
 
 /// Missing sources are simply empty; anything else is reported by name.
+#[cfg(target_os = "macos")]
 fn note(unreadable: &mut Vec<String>, name: &str, error: &std::io::Error) {
     if error.kind() != std::io::ErrorKind::NotFound {
         unreadable.push(name.to_string());
     }
 }
 
+#[cfg(target_os = "macos")]
 fn read_bounded(path: &Path) -> std::io::Result<Vec<u8>> {
     use std::io::Read;
     let file = std::fs::File::open(path)?;
@@ -283,14 +284,19 @@ fn read_bounded(path: &Path) -> std::io::Result<Vec<u8>> {
         return Err(std::io::Error::other("file is too large"));
     }
     let mut bytes = Vec::new();
-    file.take(MAX_FILE_BYTES).read_to_end(&mut bytes)?;
+    file.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_FILE_BYTES {
+        return Err(std::io::Error::other("file is too large"));
+    }
     Ok(bytes)
 }
 
+#[cfg(target_os = "macos")]
 fn read_text(path: &Path) -> std::io::Result<String> {
     read_bounded(path).map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
 }
 
+#[cfg(target_os = "macos")]
 fn read_plist(path: &Path) -> std::io::Result<Plist> {
     Plist::from_reader(std::io::Cursor::new(read_bounded(path)?)).map_err(std::io::Error::other)
 }
@@ -586,7 +592,7 @@ fn service_settings(service: &Plist) -> Option<ServiceSettings> {
 }
 
 /// Drops credentials, query and fragment, which may carry tokens.
-fn public_url(url: &str) -> String {
+pub(super) fn public_url(url: &str) -> String {
     let url = url.split(['?', '#']).next().unwrap_or_default();
     match url.split_once("://") {
         Some((scheme, rest)) => {
@@ -626,24 +632,27 @@ fn startup_job(path: &str, scope: &'static str, job: &Plist) -> Option<StartupJo
     if !direct && !mentions_route {
         return None;
     }
-    // Arguments of arbitrary scripts may hold tokens: keep only paths and flags.
-    let shown: Vec<&String> = argv
+    // Only route accepts public network operands. Other tools can take proxy
+    // passwords, and arbitrary scripts may embed tokens in flag assignments.
+    let shown: Vec<String> = argv
         .iter()
         .enumerate()
-        .filter(|(index, arg)| direct || *index == 0 || arg.starts_with(['/', '-']))
-        .map(|(_, arg)| arg)
-        .collect();
-    let command = shown
-        .iter()
-        .map(|arg| {
+        .filter(|(index, arg)| tool == "route" || *index == 0 || arg.starts_with(['/', '-']))
+        .map(|(_, arg)| {
+            let arg = if arg.starts_with('-') {
+                arg.split_once('=').map(|(flag, _)| flag).unwrap_or(arg)
+            } else {
+                arg
+            };
+            let arg = public_url(arg);
             if arg.contains(' ') {
                 format!("\"{arg}\"")
             } else {
-                arg.to_string()
+                arg
             }
         })
-        .collect::<Vec<_>>()
-        .join(" ");
+        .collect();
+    let command = shown.join(" ");
     Some(StartupJob {
         label,
         path: path.to_string(),
@@ -1111,5 +1120,40 @@ fe80::%en7/64                           link#13                                 
         );
         assert_eq!(normalize_destination("10.300/16", ""), None);
         assert_eq!(mask_prefix("255.255.240.0"), Some(20));
+    }
+
+    #[test]
+    fn startup_commands_never_expose_proxy_passwords_or_script_flag_values() {
+        let proxy = startup_job(
+            "/local/proxy.plist",
+            "agent",
+            &job(
+                "local.proxy.route",
+                &[
+                    "/usr/sbin/networksetup",
+                    "-setsocksfirewallproxy",
+                    "Wi-Fi",
+                    "localhost",
+                    "1080",
+                    "on",
+                    "alice",
+                    "PRIVATE",
+                ],
+            ),
+        )
+        .unwrap();
+        assert!(!proxy.command.contains("PRIVATE"));
+        assert!(!proxy.command.contains("alice"));
+        let script = startup_job(
+            "/local/route.plist",
+            "agent",
+            &job(
+                "local.route",
+                &["/bin/sh", "/local/route.sh", "--token=PRIVATE", "--apply"],
+            ),
+        )
+        .unwrap();
+        assert!(!script.command.contains("PRIVATE"));
+        assert!(script.command.contains("--apply"));
     }
 }
