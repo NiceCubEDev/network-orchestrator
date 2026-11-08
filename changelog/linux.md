@@ -10,6 +10,10 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+## [0.16.1] - 2026-11-08
+
+Core 0.16.1.
+
 ### Changed
 
 - Default VPN authorization to `noPrompt` for installations without saved
