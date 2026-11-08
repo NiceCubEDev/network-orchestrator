@@ -23,6 +23,9 @@ const DBUS_PROPS: &str = "org.freedesktop.DBus.Properties";
 const NM_ACTIVE_ACTIVATING: u32 = 1;
 const NM_ACTIVE_ACTIVATED: u32 = 2;
 
+// NMSettingsConnectionFlags: profile represents an external device configuration.
+const NM_SETTINGS_CONNECTION_FLAG_EXTERNAL: u32 = 0x08;
+
 type SettingsMap = HashMap<String, HashMap<String, OwnedValue>>;
 
 fn unavailable(err: impl std::fmt::Display) -> io::Error {
@@ -158,6 +161,13 @@ fn classify(settings: &SettingsMap) -> (NmConnectionKind, Option<String>) {
     (kind, interface)
 }
 
+fn inventory_kind(settings: &SettingsMap, flags: u32) -> (NmConnectionKind, Option<String>) {
+    if flags & NM_SETTINGS_CONNECTION_FLAG_EXTERNAL != 0 {
+        return (NmConnectionKind::Other, None);
+    }
+    classify(settings)
+}
+
 /// VPN and WireGuard connection profiles known to NM, with live state.
 /// Plain ethernet/wifi entries are noise for routing orchestration and are
 /// filtered out here.
@@ -197,7 +207,11 @@ pub async fn list_connections() -> io::Result<Vec<NmConnection>> {
         let id = connection
             .and_then(|s| text(s.get("id")))
             .unwrap_or_else(|| uuid.clone());
-        let (kind, mut interface) = classify(&settings);
+        let Some(flags) = get::<u32>(conn, path.as_str(), NM_SETTINGS_CONNECTION, "Flags").await
+        else {
+            continue;
+        };
+        let (kind, mut interface) = inventory_kind(&settings, flags);
         if kind == NmConnectionKind::Other {
             continue;
         }
@@ -300,6 +314,28 @@ mod tests {
             map.insert("vpn".to_string(), section(vpn));
         }
         map
+    }
+
+    #[test]
+    fn external_generated_wireguard_is_not_controllable() {
+        let profile = settings(&[("type", "wireguard"), ("interface-name", "wt0")], None);
+        assert_eq!(inventory_kind(&profile, 15).0, NmConnectionKind::Other);
+    }
+
+    #[test]
+    fn managed_wireguard_and_vpn_remain_controllable() {
+        let wireguard = settings(&[("type", "wireguard"), ("interface-name", "wt0")], None);
+        let vpn = settings(
+            &[("type", "vpn")],
+            Some(&[("service-type", "org.freedesktop.NetworkManager.openvpn")]),
+        );
+        for flags in [0, 1] {
+            assert_eq!(
+                inventory_kind(&wireguard, flags).0,
+                NmConnectionKind::WireGuard
+            );
+            assert_eq!(inventory_kind(&vpn, flags).0, NmConnectionKind::OpenVpn);
+        }
     }
 
     #[test]
