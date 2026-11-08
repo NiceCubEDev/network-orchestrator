@@ -819,6 +819,7 @@ mod tests {
             "xray1",
             "Xray capability fixture",
             "vless://synthetic-id@node.test:443?security=tls#Capability",
+            net_manager_core::models::XrayMode::platform_default(),
             |_| true,
         )
         .unwrap();

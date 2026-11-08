@@ -1,5 +1,5 @@
 //! Real Linux CLI consumers against a temporary vault and a stopped fake daemon.
-#![cfg(target_os = "linux")]
+#![cfg(all(target_os = "linux", not(feature = "macos-cli")))]
 
 use net_manager_core::config_vault::ConfigVault;
 use net_manager_core::daemon_protocol::{
@@ -178,6 +178,7 @@ impl Sandbox {
             },
             &format!("{FIRST}\n{SECOND}\n"),
             ResponseMeta::default(),
+            net_manager_core::models::XrayMode::platform_default(),
             |_| true,
         )
         .unwrap();

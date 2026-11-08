@@ -1,9 +1,11 @@
 # Native macOS client
 
-SwiftUI/AppKit application for macOS 27.0 or later. Rust core operations run
-through an owned JSON C ABI (`crates/macos-bridge`) on a Swift actor, away from
-the main UI actor. There is no HTTP server, child daemon or WebView in this
-client. The existing Windows/Linux Tauri shell remains separate.
+SwiftUI/AppKit application for macOS 27.0 or later. Its owned JSON C ABI
+(`crates/macos-bridge`) adapts the same typed Engine services called directly by
+`netorch`; Swift calls run on an actor away from the main UI actor. Both clients
+share one unprivileged Unix-socket runtime owner per data directory, started on
+demand through the user's launchd domain. There is no HTTP server or WebView.
+The privileged helper remains separate from this user runtime.
 
 ## Build and run
 
@@ -15,7 +17,7 @@ open "target/macos/Network Orchestrator.app"
 Requires Xcode 27, Rust and Python 3 on macOS 27. The build uses the host
 architecture; the first verified bundle is Apple Silicon (arm64). Intel and
 universal builds are not yet verified. Bundle version is generated from the
-Cargo workspace version. The local ad-hoc signature supports local development;
+macOS release line in `versions.toml`. The local ad-hoc signature supports local development;
 it is not a Developer ID signature or notarization for distribution.
 
 ## Available in this stage
@@ -53,19 +55,21 @@ it is not a Developer ID signature or notarization for distribution.
   profile through the connection (`--proxy-server=socks5://…`, remote DNS),
   or copy `HTTP(S)_PROXY`/`ALL_PROXY` exports for a terminal.
 - The system proxy is written only to enabled hardware services (Wi-Fi,
-  Ethernet) via `networksetup`, after a snapshot persisted in
-  `runtime/system-proxy.json`. Disconnect, quit, or the next launch after a
-  crash restores the snapshot and stops stale managed Xray processes.
+  Ethernet) via `networksetup`, with ownership snapshots in protected runtime
+  storage. Explicit disconnect restores owned settings; closing GUI/CLI does
+  not clear the shared proxy. Owner recovery verifies recorded process
+  identities before cleanup.
 
 When a packet-tunnel VPN such as incy is connected, it owns the primary
 service and macOS takes proxy settings from it, so the system proxy toggle has
 no effect; the status bar and a notice say so. Use "Open browser via
 connection" or the terminal exports in that case.
 
-WireGuard, OpenVPN, Xray TUN mode, static routes, DNS and interface changes
-still need the privileged launchd helper
-(`docs/plans/2026-09-30-14-macos-privileged-helper.md`); the bridge refuses
-them instead of simulating success.
+WireGuard, OpenVPN, Xray TUN, static routes, DNS and interface changes go through
+the privileged launchd helper
+(`docs/plans/2026-09-30-14-macos-privileged-helper.md`). The unprivileged bridge
+and CLI delegate these operations; a missing helper is an error, not simulated
+success. The explicit root foreground mode uses the helper's own executors.
 
 ## Command line (`netorch`)
 
@@ -73,43 +77,71 @@ The bundle contains `Contents/MacOS/netorch`; link it into PATH with
 `ln -s "/Applications/Network Orchestrator.app/Contents/MacOS/netorch" /usr/local/bin/netorch`.
 
 ```bash
-netorch up 'vless://…'            # import + connect a local proxy; Ctrl+C disconnects
-netorch up https://sub.example/s  # subscription, then pick with `netorch test <name>`
+netorch up 'vless://…'            # import + connect a background local proxy
+netorch up https://sub.example/s  # subscription; probe with `netorch test <name>`
 netorch up office.ovpn --auth-stdin < creds.txt
 netorch up home --mode tun        # needs the helper (installed from the app)
-sudo netorch up home              # same tunnel without the helper, for this process
+sudo netorch up home -f           # in-process tunnel; helper must not be running
 netorch route set home --direct geosite:ru --block domain:ads.example
+netorch up home -f                # Ctrl+C stops only this activation
+netorch down home                 # explicit disconnect from either client
+netorch sets capture work --name Work
+netorch mode show
 netorch doctor                    # what is missing
 sudo netorch service install      # the helper without the app (run from the bundle)
 ```
 
-Loopback Xray (`--mode socks`, the default for links) runs inside the
-foreground `netorch up`; `netorch down` / `status` from another terminal find it
-through a state file. It holds the data directory's `.instance.lock`, so the app
-and a second `netorch` cannot also run connections there. Tunnels (TUN,
-WireGuard, OpenVPN) live in the helper and outlive the terminal. Secrets are
-never accepted as arguments (`--auth-stdin`, `--passphrase-stdin` or a hidden
-prompt) and never printed.
+Loopback Xray (`--mode socks`, the default for links) belongs to the shared
+unprivileged `netorch serve` owner, not the CLI or GUI process. Normal `up`
+returns after connecting. Closing the terminal or GUI leaves the connection
+running; `down` is explicit. `up --foreground` (`-f`) holds a generation lease:
+client exit stops that activation, never a later replacement. Root connections
+require `-f`, use the helper's in-process executors and never start this user owner.
+
+The CLI covers existing native GUI business operations through shared services:
+
+| Area | Commands |
+|---|---|
+| Profiles and subscriptions | `ls`, `add`, `import`, `static`, `edit`, `rename`, `reorder`, `rm`, `subscription` |
+| Connections and diagnostics | `up`, `down`, `status`, `logs`, `test`, `inspect`, `diagnose`, `snapshot`, `doctor` |
+| Routing and network | `route`, `network`, `proxy`, `capabilities` |
+| Saved policy | `sets`, `mode`, `auto-connect`, `intents`, `conditions` |
+| Credentials and providers | `credentials`, `netbird`, `tailscale`, `vpn` |
+| Installation and recovery | `backend`, `service`, `recovery` |
+
+Use `netorch COMMAND --help` for exact arguments. Presentation-only operations
+(windows, clipboard, native dialogs and appearance) remain in the GUI.
+Linux-only named process exits and service-availability monitoring are not
+macOS commands.
+
+OpenVPN credentials, passphrases and NetBird setup keys are never value arguments.
+Use hidden prompts, protected input files or pipes. `--credentials-file FILE`
+accepts a private JSON document with `authUserPass` and/or
+`privateKeyPassphrase`; `-` reads piped stdin and rejects terminal stdin before
+reading a secret. `--auth-stdin` / `--passphrase-stdin` support line-based input.
+`--remember` saves credentials in the login Keychain only after a successful
+connection; `credentials forget PROFILE` removes them.
 
 ## Storage and isolation
 
 Default data: `~/Library/Application Support/com.netmanager.app.macos`.
-To test without touching saved native profiles, run the binary with a dedicated
-absolute directory:
+Both clients also accept `NETORCH_MACOS_DATA_DIR`; the CLI's `--data-dir`
+overrides it. Use a dedicated absolute directory for tests:
 
 ```bash
 NETORCH_MACOS_DATA_DIR="$PWD/target/macos-qa-data" \
   "target/macos/Network Orchestrator.app/Contents/MacOS/NetworkOrchestrator"
 ```
 
-The override changes only profile storage. All system-network operations in
-this stage are read-only; imported default routes are analyzed, never applied.
-The override should not point to another running client's data directory.
+The override selects shared profiles, settings, sets and user-runtime identity,
+not a network sandbox. CLI and GUI using the same root intentionally control
+the same connections. QA must use a separate root and fake adapters/runners;
+real helper, interface, route, DNS and system-proxy operations can affect the host.
 
 ## Tests
 
 ```bash
-scripts/macos-dev.sh test      # core + bridge Rust tests, then Swift tests
+scripts/macos-dev.sh test      # core + engine + bridge + CLI Rust tests, then Swift tests
 scripts/macos-dev.sh preview   # offscreen renders: target/macos/preview/<lang>/<theme>
 scripts/macos-dev.sh run       # dev bundle in the foreground, isolated QA data
 scripts/macos-dev.sh du        # what occupies target/

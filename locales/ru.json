@@ -1533,6 +1533,12 @@
     "Choose a pinned node": "Выберите закреплённый узел",
     "Enable background service checks": "Включить фоновые проверки сервиса",
     "Checking saved services": "Проверка сохранённых сервисов",
-    "Updating service checks": "Обновление проверок сервисов"
+    "Updating service checks": "Обновление проверок сервисов",
+    "Saved connection sets could not be migrated.": "Не удалось перенести сохранённые наборы подключений.",
+    "The operation could not be completed": "Не удалось выполнить операцию",
+    "Cannot read OpenVPN credentials from Keychain. Unlock the login Keychain or enter credentials for this connection.": "Не удалось прочитать учётные данные OpenVPN из Связки ключей. Разблокируйте Связку ключей входа или введите данные для этого подключения.",
+    "Remembered OpenVPN credentials are invalid. Enter credentials again or explicitly forget the saved item.": "Сохранённые учётные данные OpenVPN некорректны. Введите их заново или удалите сохранённые данные.",
+    "Connected, but credentials were not remembered. Unlock the login Keychain and choose Remember on the next successful connection.": "Подключение установлено, но учётные данные не сохранены. Разблокируйте Связку ключей входа и выберите сохранение при следующем успешном подключении.",
+    "Cannot remove remembered OpenVPN credentials. Unlock the login Keychain and explicitly forget them again; rejected saved credentials will not be used for this attempt.": "Не удалось удалить сохранённые учётные данные OpenVPN. Разблокируйте Связку ключей входа и повторите удаление. Отклонённые данные не будут использованы в этой попытке."
   }
 }

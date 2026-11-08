@@ -3,7 +3,6 @@ import CryptoKit
 import Foundation
 import Observation
 import OSLog
-import SystemConfiguration
 
 @MainActor @Observable final class AppModel {
   let core: CoreBridge
@@ -65,6 +64,10 @@ import SystemConfiguration
   var helperRegistration: HelperRegistration = .notRegistered
   var helperStatus: HelperStatus?
 
+  private let usesProductionDefaults: Bool
+  private var legacyStateLoaded = false
+  private(set) var startEligibilities: [String: ProfileStartEligibility] = [:]
+  private(set) var systemProxyOverridden = false
   init(dataDirectory: URL? = nil) {
     let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
     // Dedicated native store; does not modify the Tauri app's data.
@@ -75,23 +78,10 @@ import SystemConfiguration
       ?? base.appendingPathComponent("com.netmanager.app.macos", isDirectory: true)
     core = CoreBridge(root: root)
     probeCore = CoreBridge(root: root)
-    isDuplicate = !Self.acquireInstanceLock(root: root)
-    connectionSets = Self.loadSets()
-  }
-  /// Another process already serves this data directory; this one must not
-  /// touch the bridge (startup recovery would stop the other's connections).
-  let isDuplicate: Bool
-  private static var instanceLock: Int32 = -1
-  private static func acquireInstanceLock(root: URL) -> Bool {
-    try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-    let descriptor = open(root.appendingPathComponent(".instance.lock").path, O_CREAT | O_RDWR, 0o600)
-    guard descriptor >= 0 else { return true }
-    if flock(descriptor, LOCK_EX | LOCK_NB) != 0 {
-      close(descriptor)
-      return false
-    }
-    instanceLock = descriptor
-    return true
+    usesProductionDefaults =
+      root.standardizedFileURL.resolvingSymlinksInPath()
+      == base.appendingPathComponent("com.netmanager.app.macos", isDirectory: true)
+        .standardizedFileURL.resolvingSymlinksInPath()
   }
 
   /// The profile last connected from this app, for the Home quick action.
@@ -103,36 +93,87 @@ import SystemConfiguration
     lastProfileID.flatMap { id in snapshot?.profiles.first { $0.id == id } }
   }
 
-  var connectionSets: [ConnectionSet] = []
-  private static let setsKey = "connectionSets"
-  private static func loadSets() -> [ConnectionSet] {
-    guard let data = UserDefaults.standard.data(forKey: setsKey) else { return [] }
-    return (try? JSONDecoder().decode([ConnectionSet].self, from: data)) ?? []
-  }
-  private func saveSets() {
-    if let data = try? JSONEncoder().encode(connectionSets) {
-      UserDefaults.standard.set(data, forKey: Self.setsKey)
+  private(set) var connectionSets: [ConnectionSet] = []
+
+  /// Imports the old GUI-only values once, then reads the shared documents.
+  /// A custom data root must never consume or erase production defaults.
+  func reloadSharedState() async throws {
+    if !legacyStateLoaded {
+      if usesProductionDefaults {
+        let defaults = UserDefaults.standard
+        var args: [String: String] = [:]
+        if let mode = defaults.string(forKey: "appMode") { args["appMode"] = mode }
+        if let data = defaults.data(forKey: "connectionSets") {
+          guard let payload = String(data: data, encoding: .utf8) else {
+            throw CoreError(message: L10n.text("Saved connection sets could not be migrated."))
+          }
+          args["connectionSets"] = payload
+        }
+        let result: LegacyStateImport = try await core.call("import_legacy_state", args: args)
+        if result.imported {
+          defaults.removeObject(forKey: "connectionSets")
+          defaults.removeObject(forKey: "appMode")
+        }
+      }
+      legacyStateLoaded = true
     }
+    let settings: AppSettings = try await core.call("settings")
+    appMode = settings.appMode
+    connectionSets = try await core.call("sets")
   }
-  /// Saves the running connections as a set; an identical set is not duplicated.
-  func saveCurrentSet(name: String) {
-    let ids = (snapshot?.profiles ?? []).filter { isRunning($0) }.map(\.id)
-    guard !ids.isEmpty else { return }
+
+  /// Capture is performed against the shared runtime, not this window's cache.
+  func saveCurrentSet(name: String) async {
     let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-    connectionSets.append(
-      ConnectionSet(id: UUID().uuidString, name: trimmed.isEmpty ? L10n.text("sets.label") : trimmed, profileIds: ids))
-    saveSets()
+    do {
+      let _: ConnectionSet = try await core.call(
+        "capture_set",
+        args: ["id": UUID().uuidString, "name": trimmed.isEmpty ? L10n.text("sets.label") : trimmed])
+      connectionSets = try await core.call("sets")
+      error = nil
+    } catch { self.error = error.localizedDescription }
   }
-  func deleteSet(_ set: ConnectionSet) {
-    connectionSets.removeAll { $0.id == set.id }
-    saveSets()
+
+  func deleteSet(_ set: ConnectionSet) async {
+    do {
+      connectionSets = try await core.call("delete_set", args: ["id": set.id])
+      error = nil
+    } catch { self.error = error.localizedDescription }
   }
-  /// Switch to exactly the set's connections among those this client can start.
+
   func applySet(_ set: ConnectionSet) async {
-    for profile in snapshot?.profiles ?? [] where canStart(profile) {
-      let wanted = set.profileIds.contains(profile.id)
-      if wanted != isRunning(profile) { await toggle(profile) }
+    _ = await performBatch("apply_set", args: ["id": set.id], offerCredentials: true)
+    await refreshAfterOperation()
+  }
+
+  @discardableResult
+  private func performBatch(
+    _ method: String, args: [String: String] = [:], offerCredentials: Bool = false
+  ) async -> BatchOutcome? {
+    do {
+      let result: BatchOutcome = try await core.call(method, args: args)
+      let failures = result.items.filter { $0.outcome == .failed }
+      error = failures.isEmpty ? nil : failures.map {
+        $0.error ?? L10n.text("The operation could not be completed")
+      }.joined(separator: "\n")
+      if offerCredentials,
+        let item = result.items.last(where: { $0.credentialPrompt != nil }),
+        let prompt = item.credentialPrompt,
+        let profile = snapshot?.profiles.first(where: { $0.id == item.profileId })
+      {
+        presentCredentialPrompt(profile, prompt: prompt)
+      }
+      return result
+    } catch {
+      self.error = error.localizedDescription
+      return nil
     }
+  }
+
+  private func refreshAfterOperation() async {
+    let operationError = error
+    await refresh()
+    if let operationError { error = operationError }
   }
   /// Moves a profile within its backend group (drag and drop or Move up/down).
   func move(_ profile: Profile, to target: Profile? = nil, by offset: Int = 0) async {
@@ -173,37 +214,35 @@ import SystemConfiguration
   }
   /// Whether this client can start `profile` right now: loopback Xray always,
   /// anything that needs a tunnel device once the privileged helper serves it.
-  private static let appModeKey = "appMode"
-  var appMode = AppMode(stored: UserDefaults.standard.string(forKey: AppModel.appModeKey)) {
-    didSet { UserDefaults.standard.set(appMode.rawValue, forKey: Self.appModeKey) }
+  private(set) var appMode: AppMode = .combined
+
+  func setAppMode(_ mode: AppMode) async {
+    do {
+      let settings: AppSettings = try await core.call("set_app_mode", args: ["mode": mode.rawValue])
+      appMode = settings.appMode
+      try await reloadStartEligibilities()
+      error = nil
+    } catch { self.error = error.localizedDescription }
+  }
+
+  private func reloadStartEligibilities() async throws {
+    let rows: [ProfileStartEligibility] = try await core.call("start_eligibilities")
+    startEligibilities = Dictionary(rows.map { ($0.profileId, $0) }, uniquingKeysWith: { _, last in last })
   }
   /// The mode forbids starting `profile`; a running one can still be stopped.
-  func modeLocks(_ profile: Profile) -> Bool { appMode.locks(profile) && !isRunning(profile) }
-  func canStart(_ profile: Profile) -> Bool {
-    if modeLocks(profile) { return false }
-    if profile.startsWithoutHelper { return canStartConnections }
-    return profile.needsHelper && canStartConnections && helperServes(profile)
+  func modeLocks(_ profile: Profile) -> Bool {
+    !isRunning(profile) && (startEligibilities[profile.id]?.modeBlocked ?? false)
   }
-  /// The switch is usable for a TUN profile even without the helper: pressing
-  /// it then offers to install the helper instead of doing nothing.
+  func canStart(_ profile: Profile) -> Bool { startEligibilities[profile.id]?.canStart ?? false }
   func canTryStart(_ profile: Profile) -> Bool {
-    !modeLocks(profile) && (canStart(profile) || (profile.needsHelper && canStartConnections))
+    isRunning(profile) || (startEligibilities[profile.id]?.canTryStart ?? false)
   }
   /// Interfaces of tunnels this app runs itself.
   var ownTunnelInterfaces: Set<String> {
     Set(runtime?.statuses.compactMap { $0.state == "running" ? $0.interfaceName : nil } ?? [])
   }
-  /// A packet-tunnel VPN (e.g. incy) owns the primary service, so macOS takes
-  /// proxy settings from it and ignores ours on Wi-Fi/Ethernet. Our own
-  /// full tunnel is not "another VPN".
-  var systemProxyOverridden: Bool {
-    guard let primary = primaryInterface, primary.hasPrefix("utun") else { return false }
-    return !ownTunnelInterfaces.contains(primary)
-  }
 
   func refreshRuntime() async {
-    guard !isDuplicate else { return }
-    primaryInterface = Self.currentPrimaryInterface()
     helperStatus = try? await core.callConcurrently("helper_status")
     // A "helper is not running" banner left from before it was (re)enabled.
     if helperStatus?.reachable == true,
@@ -216,6 +255,13 @@ import SystemConfiguration
     if let list: [ExternalVpn] = try? await core.call("external_vpns") { externalVPNs = list }
     netbird = try? await core.callConcurrently("netbird_status")
     tailscale = try? await core.callConcurrently("tailscale_status")
+    do {
+      try await reloadSharedState()
+      try await reloadStartEligibilities()
+      let proxy: ProxyOverrideStatus = try await core.call("proxy_override")
+      primaryInterface = proxy.primaryInterface
+      systemProxyOverridden = proxy.overridden
+    } catch { self.error = error.localizedDescription }
     await syncTailscaleGuard()
   }
   /// Asks the core to keep the tailnet reachable next to whatever tunnel is
@@ -237,10 +283,6 @@ import SystemConfiguration
     guard !tailscaleBusy, let current = tailscale, current.canToggle else { return }
     tailscaleBusy = true
     defer { tailscaleBusy = false }
-    if let service = externalVPNs.first(where: { isTailscaleService($0) }) {
-      await setExternalVPN(service, connect: !current.isOn)
-      return
-    }
     do {
       tailscale = try await core.callConcurrently(current.isOn ? "tailscale_down" : "tailscale_up")
       error = nil
@@ -272,21 +314,13 @@ import SystemConfiguration
         runtime = try await core.call("disconnect", args: ["id": profile.id])
         record(.info, "Disconnected \(profile.name)")
       } else {
-        // OpenVPN may need a login; nil means the sign-in sheet is showing.
-        guard let extra = try await credentialArguments(profile) else { return }
-        runtime = try await core.call("connect", args: ["id": profile.id].merging(extra) { $1 })
-        await rememberAfterConnect(profile)
-        lastProfileID = profile.id
-        record(.info, "Connected \(profile.name)")
+        if await connectProfile(profile) { lastProfileID = profile.id }
+        return
       }
+      try await reloadStartEligibilities()
       error = nil
     } catch {
       self.error = error.localizedDescription
-      // A missing credential is answered by asking, not by an error banner.
-      if self.error == "OpenVPN credentials required" {
-        self.error = nil
-        await askForCredentials(profile, rejected: false)
-      }
       await refreshRuntime()
     }
   }
@@ -324,53 +358,27 @@ import SystemConfiguration
       inspections[profile.id] = result
     }
   }
-  /// Opens a separate Chrome profile that sends everything through this
-  /// connection's SOCKS listener; DNS is resolved remotely by the proxy.
-  func openBrowser(_ profile: Profile) {
-    guard let port = profile.xraySocksPort else { return }
-    let data = core.root.appendingPathComponent("browser", isDirectory: true)
-      .appendingPathComponent(profile.id, isDirectory: true)
-    try? FileManager.default.createDirectory(at: data, withIntermediateDirectories: true)
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-    process.arguments = [
-      "-na", "Google Chrome", "--args", "--user-data-dir=\(data.path)",
-      "--proxy-server=socks5://127.0.0.1:\(port)", "--no-first-run",
-      "https://www.youtube.com/",
-    ]
-    do { try process.run() } catch { self.error = "native.browserFailed" }
+  /// The shared service owns browser arguments and the per-profile directory.
+  func openBrowser(_ profile: Profile) async {
+    do {
+      let _: [String: String] = try await core.call("open_browser", args: ["id": profile.id])
+    } catch { self.error = error.localizedDescription }
   }
-  func terminalProxyCommands(_ profile: Profile) -> String? {
-    guard let socks = profile.xraySocksPort else { return nil }
-    let http = profile.xrayHttpPort.map { "http://127.0.0.1:\($0)" } ?? "socks5h://127.0.0.1:\(socks)"
-    return
-      "export HTTP_PROXY=\(http) HTTPS_PROXY=\(http) ALL_PROXY=socks5h://127.0.0.1:\(socks) NO_PROXY=localhost,127.0.0.1,.local"
-  }
-  func copyTerminalProxy(_ profile: Profile) {
-    guard let text = terminalProxyCommands(profile) else { return }
-    NSPasteboard.general.clearContents()
-    NSPasteboard.general.setString(text, forType: .string)
-    notice = "native.copied"
-  }
-  /// Stops our Xray processes and rolls back the system proxy. Blocking: runs
-  /// from applicationWillTerminate.
-  nonisolated func shutdown() {
-    if !isDuplicate { core.callSync("shutdown") }
-  }
-
-  nonisolated static func currentPrimaryInterface() -> String? {
-    guard let store = SCDynamicStoreCreate(nil, "NetworkOrchestrator" as CFString, nil, nil),
-      let value = SCDynamicStoreCopyValue(store, "State:/Network/Global/IPv4" as CFString)
-        as? [String: Any]
-    else { return nil }
-    return value["PrimaryInterface"] as? String
+  func copyTerminalProxy(_ profile: Profile) async {
+    do {
+      let result: ProxyExports = try await core.call("proxy_exports", args: ["id": profile.id])
+      NSPasteboard.general.clearContents()
+      NSPasteboard.general.setString(result.shell, forType: .string)
+      notice = "native.copied"
+    } catch { self.error = error.localizedDescription }
   }
 
   func refresh() async {
-    guard !busy, !isDuplicate else { return }
+    guard !busy else { return }
     busy = true
     defer { busy = false }
     do {
+      try await reloadSharedState()
       if capabilities == nil { capabilities = try await core.call("capabilities") }
       snapshot = try await core.call("snapshot")
       var endpoints: [String: [SubscriptionEndpoint]] = [:]
@@ -528,23 +536,14 @@ import SystemConfiguration
   /// Refreshes subscriptions whose interval elapsed. Running connections are
   /// left alone so a background refresh never drops traffic.
   func autoRefreshDue() async {
-    let now = UInt64(Date().timeIntervalSince1970)
-    for profile in snapshot?.profiles ?? [] where !isRunning(profile) {
-      guard let subscription = profile.subscription,
-        let minutes = subscription.refreshIntervalMinutes
-      else { continue }
-      let last = subscription.lastRefreshAtUnix ?? 0
-      if now >= last + UInt64(minutes) * 60 {
-        await refreshSubscription(profile, quiet: true)
-      }
-    }
+    _ = await performBatch("refresh_subscriptions", args: ["dueOnly": "true"])
+    await refresh()
   }
   /// Toolbar refresh: re-fetch every subscription, then reload everything.
   func refreshAll() async {
-    for profile in snapshot?.profiles ?? [] where profile.subscription != nil {
-      await refreshSubscription(profile)
-    }
-    await refresh()
+    _ = await performBatch("refresh_subscriptions", args: ["dueOnly": "false"])
+    delays = [:]
+    await refreshAfterOperation()
   }
   /// Checks the exit IP directly and through every running connection at
   /// once; each route's result appears as soon as its checkers finish.
@@ -569,34 +568,33 @@ import SystemConfiguration
   }
   /// OpenVPN is waiting for the user to type credentials.
   var credentialRequest: CredentialRequest?
-  /// Typed credentials the user asked to keep, saved once the connect succeeds.
-  private var pendingRemember: [String: OpenVpnSecrets] = [:]
-  /// Extra connect arguments (credentials) for `profile`; `nil` when the
-  /// sign-in sheet was opened instead of connecting.
-  private func credentialArguments(_ profile: Profile) async throws -> [String: String]? {
-    guard profile.backend == "openVpn" else { return [:] }
-    let needs: CredentialNeeds = try await core.call(
-      "credential_requirements", args: ["id": profile.id])
-    guard needs.any else { return [:] }
-    // A refusal on the last attempt means what is saved is wrong.
-    let rejected = status(profile)?.message == "OpenVPN authentication failed"
-    if rejected { CredentialStore.delete(profile.id) }
-    if !rejected, let saved = CredentialStore.load(profile.id), saved.satisfies(needs) {
-      return saved.arguments(for: needs)
-    }
-    await askForCredentials(profile, rejected: rejected, needs: needs)
-    return nil
-  }
-  private func askForCredentials(
-    _ profile: Profile, rejected: Bool, needs: CredentialNeeds? = nil
-  ) async {
-    let needs =
-      if let needs { needs } else {
-        (try? await core.call("credential_requirements", args: ["id": profile.id]))
-          ?? CredentialNeeds(userPass: true, keyPassphrase: false)
-      }
+  private func presentCredentialPrompt(_ profile: Profile, prompt: CredentialPrompt) {
+    if let message = prompt.notice?.message { notice = message }
     credentialRequest = CredentialRequest(
-      profile: profile.id, name: profile.name, needs: needs, rejected: rejected)
+      profile: profile.id, name: profile.name, needs: prompt.needs, rejected: prompt.rejected)
+  }
+
+  @discardableResult
+  private func connectProfile(
+    _ profile: Profile, arguments: [String: String] = [:], remember: Bool = false
+  ) async -> Bool {
+    var connected = false
+    do {
+      let result: ConnectProfileOutcome = try await core.call(
+        "connect_profile",
+        args: ["id": profile.id, "remember": remember ? "true" : "false"].merging(arguments) { $1 })
+      switch result {
+      case .connected(let outcome):
+        connected = true
+        if let message = outcome.notice?.message { notice = message }
+        record(.info, "Connected \(profile.name)")
+      case .credentialsRequired(let prompt):
+        presentCredentialPrompt(profile, prompt: prompt)
+      }
+      error = nil
+    } catch { self.error = error.localizedDescription }
+    await refreshRuntime()
+    return connected
   }
   /// Connects with what the user typed; keeps it in the Keychain on request.
   func submitCredentials(_ request: CredentialRequest, secrets: OpenVpnSecrets, remember: Bool) async {
@@ -606,26 +604,18 @@ import SystemConfiguration
     else { return }
     pending.insert(profile.id)
     defer { pending.remove(profile.id) }
-    if remember { pendingRemember[profile.id] = secrets }
+    await connectProfile(
+      profile, arguments: secrets.arguments(for: request.needs), remember: remember)
+  }
+  /// Forgetting uses the same scoped Keychain policy as the CLI.
+  func forgetCredentials(_ profile: Profile) async {
     do {
-      runtime = try await core.call(
-        "connect",
-        args: ["id": profile.id].merging(secrets.arguments(for: request.needs)) { $1 })
-      await rememberAfterConnect(profile)
+      let outcome: CredentialOutcome = try await core.call(
+        "forget_credentials", args: ["id": profile.id])
+      if let message = outcome.notice?.message { notice = message }
       error = nil
-    } catch {
-      pendingRemember[profile.id] = nil
-      self.error = error.localizedDescription
-      await refreshRuntime()
-    }
+    } catch { self.error = error.localizedDescription }
   }
-  private func rememberAfterConnect(_ profile: Profile) async {
-    if let secrets = pendingRemember.removeValue(forKey: profile.id) {
-      CredentialStore.save(secrets, for: profile.id)
-    }
-  }
-  /// Forget what Keychain holds for this profile.
-  func forgetCredentials(_ profile: Profile) { CredentialStore.delete(profile.id) }
   /// Connects NetBird (a browser sign-in opens when it is needed) or, when it
   /// is on, disconnects it. A setup key is used once and never stored.
   func toggleNetBird(managementUrl: String? = nil, setupKey: String? = nil) async {
@@ -649,9 +639,7 @@ import SystemConfiguration
   var throughput = ThroughputSampler()
   private var interfaceIDs: [String: UInt32] = [:]
   func pollThroughput() async {
-    guard !isDuplicate,
-      let list: [NetworkInterface] = try? await core.callConcurrently("interfaces")
-    else { return }
+    guard let list: [NetworkInterface] = try? await core.callConcurrently("interfaces") else { return }
     let tracked = Set(
       runtime?.statuses.compactMap { $0.state == "running" ? $0.interfaceName : nil } ?? [])
     interfaceIDs = Dictionary(
@@ -674,7 +662,7 @@ import SystemConfiguration
   var showingRecovery = false
   private var recoveryChecked = false
   func checkRecovery() async {
-    guard !recoveryChecked, !isDuplicate else { return }
+    guard !recoveryChecked else { return }
     recoveryChecked = true
     guard let report: RecoveryReport = try? await core.call("recovery_report"),
       !report.issues.isEmpty
@@ -707,17 +695,12 @@ import SystemConfiguration
   /// privileged helper is skipped when it is not serving, never prompting.
   private var autoConnectDone = false
   func autoConnectOnLaunch() async {
-    guard !autoConnectDone, !isDuplicate else { return }
+    guard !autoConnectDone else { return }
     autoConnectDone = true
-    var failed = 0
-    for profile in snapshot?.profiles ?? [] where profile.connectsOnLaunch && !isRunning(profile) {
-      guard canStart(profile) else {
-        failed += 1
-        continue
-      }
-      await toggle(profile)
-      if !isRunning(profile) { failed += 1 }
-    }
+    guard let result = await performBatch("auto_connect") else { return }
+    let failed = result.items.filter {
+      $0.outcome != .succeeded && $0.outcome != .skippedRunning
+    }.count
     if failed > 0 {
       record(.warn, "\(failed) connection(s) flagged to start with the app did not start")
       error = nil
@@ -731,7 +714,7 @@ import SystemConfiguration
   /// or not: Xray can exit on its own (bad server, port taken), and the menu
   /// bar shows these states. Idempotent.
   func startMonitoring() {
-    guard monitoring == nil, !isDuplicate else { return }
+    guard monitoring == nil else { return }
     monitoring = Task { [weak self] in
       var tick = 0
       while !Task.isCancelled {
@@ -745,7 +728,8 @@ import SystemConfiguration
   }
   /// Disconnects every running connection (the menu bar's "Disconnect all").
   func disconnectAll() async {
-    for profile in snapshot?.profiles ?? [] where isRunning(profile) { await toggle(profile) }
+    _ = await performBatch("disconnect_all")
+    await refreshRuntime()
   }
   func setWaitForInterface(_ profile: Profile, enabled: Bool) async {
     _ = await change(
@@ -912,19 +896,29 @@ import SystemConfiguration
   }
   /// Creates the intents a card proposes, then refreshes both lists.
   func applyFix(_ suggestion: IntentSuggestion) async -> Bool {
-    for fix in suggestion.fixes {
-      do {
-        let _: [String: String] = try await core.call("set_intent", args: fix.arguments)
+    do {
+      let payload = String(decoding: try JSONEncoder().encode(suggestion.fixes), as: UTF8.self)
+      let result: IntentFixOutcome = try await core.call(
+        "apply_intent_fixes", args: ["payload": payload])
+      for fix in suggestion.fixes.prefix(result.applied) {
         record(.info, "Saved routing intent \(fix.id) proposed by the doctor")
-      } catch {
-        self.error = error.localizedDescription
+      }
+      await loadIntents()
+      if let failure = result.error {
+        error = failure
         return false
       }
+      guard result.applied == suggestion.fixes.count else {
+        error = L10n.text("The operation could not be completed")
+        return false
+      }
+      dismissSuggestion(suggestion)
+      await loadSuggestions()
+      return true
+    } catch {
+      self.error = error.localizedDescription
+      return false
     }
-    dismissSuggestion(suggestion)
-    await loadIntents()
-    await loadSuggestions()
-    return true
   }
   /// Adds or replaces an intent; the helper installs its routes at once.
   func saveIntent(_ draft: IntentDraft) async -> Bool {

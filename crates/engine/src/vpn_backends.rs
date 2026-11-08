@@ -58,6 +58,7 @@ fn stopped(profile: &Profile) -> TunnelStatus {
         message: None,
         interface_name: None,
         failover: None,
+        watchdog: None,
     }
 }
 
@@ -92,6 +93,7 @@ pub(crate) fn wireguard_status(client: &dyn Privileged, profile: &Profile) -> Tu
             state: status.state,
             interface_name: status.interface_name,
             failover: None,
+            watchdog: None,
         },
         Err(_) => stopped(profile),
     }
@@ -147,6 +149,7 @@ pub(crate) fn openvpn_status(client: &dyn Privileged, profile: &Profile) -> Tunn
             message: openvpn_notice(&status),
             interface_name: status.interface_name.clone(),
             failover: None,
+            watchdog: None,
         },
         Err(_) => stopped(profile),
     }

@@ -90,20 +90,20 @@ pub const LINUX_REQUIRED_SHA256: [(&str, &str); 3] = [
     ),
 ];
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(unix)]
 pub const MACOS_XRAY_VERSION: &str = MANAGED_XRAY_VERSION;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(unix)]
 pub const MACOS_XRAY_URL: &str =
     "https://github.com/XTLS/Xray-core/releases/download/v26.7.28/Xray-macos-arm64-v8a.zip";
 // Official XTLS release asset Xray-macos-arm64-v8a.zip.dgst, SHA2-256.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(unix)]
 pub const MACOS_XRAY_SHA256: &str =
     "9b99a351febe31b7e0c7f22deeb1577a1da0b98aaa51aec7fd17832e68cf63d6";
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(unix)]
 const MACOS_ALLOWLIST: [&str; 5] = ["xray", "geoip.dat", "geosite.dat", "LICENSE", "README.md"];
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(unix)]
 const MACOS_REQUIRED: [&str; 3] = ["xray", "geoip.dat", "geosite.dat"];
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(unix)]
 const MACOS_LAYOUT: ArchiveLayout = ArchiveLayout {
     version: MACOS_XRAY_VERSION,
     executable_name: "xray",
@@ -112,7 +112,7 @@ const MACOS_LAYOUT: ArchiveLayout = ArchiveLayout {
 };
 // SHA-256 of required files extracted from the archive above; the .dat assets
 // are byte-identical to the Windows package of the same release.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(unix)]
 pub const MACOS_REQUIRED_SHA256: [(&str, &str); 3] = [
     (
         "xray",
@@ -286,14 +286,14 @@ pub fn relax_linux_package_permissions(root: &Path) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(unix)]
 pub fn macos_managed_version_dir(root: &Path) -> PathBuf {
     root.join(MACOS_XRAY_VERSION)
 }
 
 /// Accept only the pinned macOS executable inside the per-user managed root:
 /// no symlinks, owner-only executable, every required file hash-verified.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(unix)]
 pub fn verify_managed_macos_executable(root: &Path, executable: &Path) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     if fs::symlink_metadata(root)?.file_type().is_symlink() {
@@ -327,7 +327,7 @@ pub fn verify_managed_macos_executable(root: &Path, executable: &Path) -> io::Re
     verify_required_hashes(&expected_dir, &MACOS_REQUIRED_SHA256)
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(unix)]
 pub fn install_verified_macos_archive(
     root: &Path,
     archive: &[u8],

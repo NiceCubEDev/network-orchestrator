@@ -1452,6 +1452,12 @@
     "Choose a pinned node": "Choose a pinned node",
     "Enable background service checks": "Enable background service checks",
     "Checking saved services": "Checking saved services",
-    "Updating service checks": "Updating service checks"
+    "Updating service checks": "Updating service checks",
+    "Saved connection sets could not be migrated.": "Saved connection sets could not be migrated.",
+    "The operation could not be completed": "The operation could not be completed",
+    "Cannot read OpenVPN credentials from Keychain. Unlock the login Keychain or enter credentials for this connection.": "Cannot read OpenVPN credentials from Keychain. Unlock the login Keychain or enter credentials for this connection.",
+    "Remembered OpenVPN credentials are invalid. Enter credentials again or explicitly forget the saved item.": "Remembered OpenVPN credentials are invalid. Enter credentials again or explicitly forget the saved item.",
+    "Connected, but credentials were not remembered. Unlock the login Keychain and choose Remember on the next successful connection.": "Connected, but credentials were not remembered. Unlock the login Keychain and choose Remember on the next successful connection.",
+    "Cannot remove remembered OpenVPN credentials. Unlock the login Keychain and explicitly forget them again; rejected saved credentials will not be used for this attempt.": "Cannot remove remembered OpenVPN credentials. Unlock the login Keychain and explicitly forget them again; rejected saved credentials will not be used for this attempt."
   }
 }

@@ -141,13 +141,7 @@ impl SystemProxyManager {
         adapter: Box<dyn ProxyAdapter>,
     ) -> io::Result<Self> {
         let path = path.into();
-        if path.exists() {
-            crate::config_security::protect_path(&path)?;
-        }
         let document = load_document(&path)?;
-        if path.exists() {
-            crate::config_security::protect_path(&path)?;
-        }
         Ok(Self {
             path,
             adapter,
@@ -299,18 +293,56 @@ pub fn load_ownership(path: &Path) -> io::Result<Option<ProxyOwnership>> {
 }
 
 fn load_document(path: &Path) -> io::Result<ProxyStateDocument> {
-    let raw = match fs::read_to_string(path) {
-        Ok(raw) => raw,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+    use std::io::Read;
+
+    const MAX_STATE_BYTES: u64 = 1024 * 1024;
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return Ok(ProxyStateDocument {
                 version: PROXY_STATE_DOCUMENT_VERSION,
                 ownership: None,
             });
         }
-        Err(err) => return Err(err),
+        Err(error) => return Err(error),
     };
-    let document: ProxyStateDocument = serde_json::from_str(&raw)
-        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > MAX_STATE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Invalid proxy state file",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.nlink() != 1
+            || metadata.permissions().mode() & 0o077 != 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Proxy state must be a private regular file owned by this user",
+            ));
+        }
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize + 1);
+    file.take(MAX_STATE_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_STATE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Proxy state file is too large",
+        ));
+    }
+    let document: ProxyStateDocument = serde_json::from_slice(&bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid proxy state document"))?;
     if document.version != PROXY_STATE_DOCUMENT_VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -324,22 +356,68 @@ fn load_document(path: &Path) -> io::Result<ProxyStateDocument> {
 }
 
 fn save_document(path: &Path, document: &ProxyStateDocument) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
+    use std::io::Write;
+
+    #[cfg(unix)]
+    if unsafe { libc::geteuid() } == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Change the system proxy as your own user, without sudo",
+        ));
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    if let Some(parent) = parent {
         fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = fs::symlink_metadata(parent)?;
+            if !metadata.is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "Unsafe proxy state directory",
+                ));
+            }
+        }
     }
-    let json = serde_json::to_string_pretty(document)
-        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-    let mut temp_name = path.as_os_str().to_os_string();
-    temp_name.push(".tmp");
-    let temp_path = PathBuf::from(temp_name);
-    fs::write(&temp_path, json)?;
-    crate::config_security::protect_path(&temp_path)?;
-    if let Err(err) = fs::rename(&temp_path, path) {
+    let json = serde_json::to_vec_pretty(document)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Cannot encode proxy state"))?;
+    if json.len() > 1024 * 1024 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Proxy state file is too large",
+        ));
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(io::Error::other)?
+        .as_nanos();
+    let temp_path = path.with_extension(format!("{}.{}.tmp", std::process::id(), stamp));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temp_path)?;
+    let result = (|| {
+        crate::config_security::protect_path(&temp_path)?;
+        file.write_all(&json)?;
+        file.sync_all()?;
+        fs::rename(&temp_path, path)?;
+        #[cfg(unix)]
+        if let Some(parent) = parent {
+            fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
         let _ = fs::remove_file(&temp_path);
-        return Err(err);
     }
-    crate::config_security::protect_path(path)?;
-    Ok(())
+    result
 }
 
 pub fn snapshot_matches(expected: &ProxySnapshot, actual: &ProxySnapshot) -> bool {
@@ -1637,6 +1715,7 @@ mod tests {
 
         let bad = dir.join("bad.json");
         fs::write(&bad, b"{ not json").unwrap();
+        crate::config_security::protect_path(&bad).unwrap();
         let err = SystemProxyManager::with_adapter(
             &bad,
             Box::new(SharedAdapter(Arc::new(Mutex::new(FakeAdapter::default())))),
@@ -1646,6 +1725,7 @@ mod tests {
 
         let ver = dir.join("ver.json");
         fs::write(&ver, br#"{"version": 99, "ownership": null}"#).unwrap();
+        crate::config_security::protect_path(&ver).unwrap();
         let err = SystemProxyManager::with_adapter(
             &ver,
             Box::new(SharedAdapter(Arc::new(Mutex::new(FakeAdapter::default())))),

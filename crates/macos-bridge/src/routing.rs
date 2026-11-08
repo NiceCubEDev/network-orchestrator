@@ -2,15 +2,12 @@
 //! domain strategy, Happ/Incy imports and the offline route checker. Pure
 //! profile edits and parsing — nothing here touches the network.
 use net_manager_core::happ_routing;
-use net_manager_core::managed_xray;
 use net_manager_core::models::*;
-use net_manager_core::route_check::{check_route, GeoDbs, GeoIpDb, GeoSiteDb};
-use net_manager_core::xray::{self, ProfileRoutingOptions};
+use net_manager_engine::macos_services::{
+    AdvancedRouting, GeoUrls, MacosServices, ProfileRouting, ProfileRoutingUpdate,
+};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
-
-const MAX_GEO_ASSET_BYTES: u64 = 64 * 1024 * 1024;
 
 fn text<'a>(args: &'a Value, key: &str) -> &'a str {
     args[key].as_str().unwrap_or_default()
@@ -29,14 +26,6 @@ pub(crate) fn policies_from_args(args: &Value) -> Result<Vec<DomainPolicy>, Stri
         ("direct", DomainRouteTarget::Direct),
     ] {
         let domains: Vec<String> = lines(text(args, key)).map(str::to_string).collect();
-        for line in &domains {
-            let single = [DomainPolicy {
-                domains: vec![line.clone()],
-                target,
-            }];
-            xray::validate_routing_policy_selectors(&single)
-                .map_err(|_| format!("Invalid routing rule ({line})"))?;
-        }
         if !domains.is_empty() {
             policies.push(DomainPolicy { domains, target });
         }
@@ -189,13 +178,7 @@ fn format_dns_hosts(hosts: &BTreeMap<String, Vec<String>>) -> String {
         .join("\n")
 }
 
-struct Advanced {
-    strategy: Option<XrayDomainStrategy>,
-    matcher: Option<XrayDomainMatcher>,
-    dns: XrayDnsConfig,
-}
-
-fn advanced_from_args(args: &Value) -> Result<Advanced, String> {
+fn advanced_from_args(args: &Value) -> Result<AdvancedRouting, String> {
     let dns = XrayDnsConfig {
         servers: parse_dns_servers(text(args, "dnsServers"))?,
         hosts: parse_dns_hosts(text(args, "dnsHosts"))?,
@@ -203,41 +186,38 @@ fn advanced_from_args(args: &Value) -> Result<Advanced, String> {
         query_strategy: parse_query_strategy(text(args, "queryStrategy"))?,
         ..XrayDnsConfig::default()
     };
-    xray::validate_dns_config(&dns).map_err(|_| "The DNS settings are not valid".to_string())?;
-    Ok(Advanced {
-        strategy: parse_strategy(text(args, "domainStrategy"))?,
-        matcher: parse_matcher(text(args, "domainMatcher"))?,
+    Ok(AdvancedRouting {
+        domain_strategy: parse_strategy(text(args, "domainStrategy"))?,
+        domain_matcher: parse_matcher(text(args, "domainMatcher"))?,
         dns,
     })
 }
 
-/// A custom geo data URL: empty clears it, anything else must be HTTPS.
-fn geo_url(args: &Value, key: &str) -> Result<Option<String>, String> {
+/// Empty editor text clears a custom geo URL; Engine validates nonempty URLs.
+fn geo_url(args: &Value, key: &str) -> Option<String> {
     let url = text(args, key).trim();
-    if url.is_empty() {
-        return Ok(None);
-    }
-    net_manager_core::geo_assets::validate_geo_asset_url(url)
-        .map_err(|_| "A geo data address must start with https://".to_string())?;
-    Ok(Some(url.to_string()))
+    (!url.is_empty()).then(|| url.to_string())
 }
 
-/// Apply the editor's draft to a profile: rule sets, LAN toggle and, when the
-/// editor sent them, the strategy and DNS options.
-pub(crate) fn apply_draft(profile: &mut Profile, args: &Value) -> Result<(), String> {
-    profile.domain_policies = policies_from_args(args)?;
-    profile.private_lan_direct = text(args, "privateLanDirect") == "true";
-    if args.get("geoipUrl").is_some() || args.get("geositeUrl").is_some() {
-        profile.xray_geoip_url = geo_url(args, "geoipUrl")?;
-        profile.xray_geosite_url = geo_url(args, "geositeUrl")?;
-    }
-    if args.get("domainStrategy").is_some() {
-        let advanced = advanced_from_args(args)?;
-        profile.xray_domain_strategy = advanced.strategy;
-        profile.xray_domain_matcher = advanced.matcher;
-        profile.xray_dns = advanced.dns;
-    }
-    Ok(())
+/// Decode native editor text. Omitted option groups remain omitted, rather
+/// than turning an old editor's missing fields into destructive clears.
+pub(crate) fn draft(args: &Value) -> Result<ProfileRoutingUpdate, String> {
+    Ok(ProfileRoutingUpdate {
+        policies: policies_from_args(args)?,
+        private_lan_direct: text(args, "privateLanDirect") == "true",
+        advanced: args
+            .get("domainStrategy")
+            .map(|_| advanced_from_args(args))
+            .transpose()?,
+        geo_urls: if args.get("geoipUrl").is_some() || args.get("geositeUrl").is_some() {
+            Some(GeoUrls {
+                geoip_url: geo_url(args, "geoipUrl"),
+                geosite_url: geo_url(args, "geositeUrl"),
+            })
+        } else {
+            None
+        },
+    })
 }
 
 fn rules_json(policies: &[DomainPolicy]) -> Value {
@@ -264,20 +244,20 @@ fn dns_json(value: &mut Value, dns: &XrayDnsConfig) {
 }
 
 /// The editor's initial state for a profile, as plain text fields.
-pub(crate) fn options_json(profile: &Profile) -> Value {
-    let mut value = rules_json(&profile.domain_policies);
+pub(crate) fn options_json(profile: &ProfileRouting) -> Value {
+    let mut value = rules_json(&profile.policies);
     value["privateLanDirect"] = json!(profile.private_lan_direct);
-    value["domainStrategy"] = json!(strategy_name(profile.xray_domain_strategy));
-    value["domainMatcher"] = json!(matcher_name(profile.xray_domain_matcher));
-    dns_json(&mut value, &profile.xray_dns);
-    value["geoipUrl"] = json!(profile.xray_geoip_url.clone().unwrap_or_default());
-    value["geositeUrl"] = json!(profile.xray_geosite_url.clone().unwrap_or_default());
+    value["domainStrategy"] = json!(strategy_name(profile.domain_strategy));
+    value["domainMatcher"] = json!(matcher_name(profile.domain_matcher));
+    dns_json(&mut value, &profile.dns);
+    value["geoipUrl"] = json!(profile.geoip_url.clone().unwrap_or_default());
+    value["geositeUrl"] = json!(profile.geosite_url.clone().unwrap_or_default());
     value
 }
 
 /// Fields recovered from a pasted Happ/Incy routing export, as editor text.
 /// Fields the export does not mention are omitted so the editor keeps them.
-fn happ_json(import: happ_routing::HappRoutingImport) -> Value {
+pub(crate) fn happ_json(import: happ_routing::HappRoutingImport) -> Value {
     let mut value = rules_json(&import.domain_policies);
     if let Some(lan) = import.private_lan_direct {
         value["privateLanDirect"] = json!(lan);
@@ -302,62 +282,34 @@ fn happ_json(import: happ_routing::HappRoutingImport) -> Value {
     value
 }
 
-fn geo_dirs(root: &Path) -> Vec<PathBuf> {
-    vec![managed_xray::macos_managed_version_dir(
-        &root.join("backends").join("xray"),
-    )]
-}
-
-fn load_asset<T>(
-    dirs: &[PathBuf],
-    name: &str,
-    parse: fn(&[u8]) -> std::io::Result<T>,
-) -> Option<T> {
-    dirs.iter().find_map(|dir| {
-        let path = dir.join(name);
-        let meta = std::fs::metadata(&path).ok()?;
-        if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_GEO_ASSET_BYTES {
-            return None;
-        }
-        parse(&std::fs::read(path).ok()?).ok()
-    })
-}
-
-fn route_check(root: &Path, args: &Value) -> Result<Value, String> {
-    let policies = policies_from_args(args)?;
+fn route_check(root: &std::path::Path, args: &Value) -> Result<Value, String> {
+    let update = draft(args)?;
     let advanced = advanced_from_args(args)?;
-    let dirs = geo_dirs(root);
-    let geo_site = load_asset(&dirs, "geosite.dat", GeoSiteDb::parse);
-    let geo_ip = load_asset(&dirs, "geoip.dat", GeoIpDb::parse);
-    let geo = GeoDbs {
-        geo_site: geo_site.as_ref(),
-        geo_ip: geo_ip.as_ref(),
-    };
-    let options = ProfileRoutingOptions {
-        private_lan_direct: text(args, "privateLanDirect") == "true",
-        domain_strategy: advanced.strategy,
-        domain_matcher: advanced.matcher,
+    let routing = ProfileRouting {
+        policies: update.policies,
+        private_lan_direct: update.private_lan_direct,
+        domain_strategy: advanced.domain_strategy,
+        domain_matcher: advanced.domain_matcher,
         dns: advanced.dns,
         ..Default::default()
     };
-    let result = check_route(&policies, &options, text(args, "target"), &geo)
-        .map_err(|error| error.to_string())?;
-    serde_json::to_value(result).map_err(|_| "The route check failed".to_string())
+    serde_json::to_value(MacosServices::new(root)?.check_routing(text(args, "target"), &routing)?)
+        .map_err(|_| "The route check failed".into())
 }
 
 /// Bridge methods of the routing editor, or `None` for other methods.
 pub(crate) fn handle(
-    root: &Path,
-    profile: impl FnOnce() -> Result<Profile, String>,
+    root: &std::path::Path,
+    profile: impl FnOnce() -> Result<ProfileRouting, String>,
     method: &str,
     args: &Value,
 ) -> Option<Result<Value, String>> {
     match method {
         "routing_options" => Some(profile().map(|profile| options_json(&profile))),
         "parse_happ_routing" => Some(
-            happ_routing::parse_happ_routing(text(args, "payload"))
-                .map(happ_json)
-                .map_err(|_| "This is not a Happ or Incy routing profile".to_string()),
+            MacosServices::new(root)
+                .and_then(|service| service.parse_happ_routing(text(args, "payload")))
+                .map(happ_json),
         ),
         "check_route" => Some(route_check(root, args)),
         _ => None,
@@ -391,67 +343,6 @@ mod tests {
     }
 
     #[test]
-    fn route_check_replays_the_draft_rules() {
-        let dir = tempfile::tempdir().unwrap();
-        let args = json!({
-            "target": "ads.example.com",
-            "block": "domain:example.com",
-            "domainStrategy": "", "domainMatcher": "",
-            "dnsServers": "", "dnsHosts": "", "fakeDns": "false", "queryStrategy": "",
-        });
-        let result = route_check(dir.path(), &args).unwrap();
-        assert_eq!(result["outbound"], "block");
-        assert_eq!(result["source"], "policy");
-    }
-
-    fn draft(extra: Value) -> Value {
-        let mut args = json!({"block": "", "proxy": "", "direct": "", "privateLanDirect": "false"});
-        for (key, value) in extra.as_object().unwrap() {
-            args[key] = value.clone();
-        }
-        args
-    }
-
-    #[test]
-    fn geo_urls_are_saved_cleared_and_shown_back() {
-        let mut profile = Profile::default();
-        apply_draft(
-            &mut profile,
-            &draft(json!({"geoipUrl": " https://cdn.example/geoip.dat ", "geositeUrl": ""})),
-        )
-        .unwrap();
-        assert_eq!(
-            profile.xray_geoip_url.as_deref(),
-            Some("https://cdn.example/geoip.dat")
-        );
-        assert_eq!(profile.xray_geosite_url, None);
-        let shown = options_json(&profile);
-        assert_eq!(shown["geoipUrl"], "https://cdn.example/geoip.dat");
-        assert_eq!(shown["geositeUrl"], "");
-        // An editor that does not mention them leaves them alone.
-        apply_draft(&mut profile, &draft(json!({}))).unwrap();
-        assert!(profile.xray_geoip_url.is_some());
-        apply_draft(
-            &mut profile,
-            &draft(json!({"geoipUrl": "", "geositeUrl": ""})),
-        )
-        .unwrap();
-        assert_eq!(profile.xray_geoip_url, None);
-    }
-
-    #[test]
-    fn a_geo_url_that_is_not_https_is_refused_without_changing_the_profile() {
-        let mut profile = Profile::default();
-        for bad in ["http://cdn.example/geoip.dat", "ftp://x/y", "cdn.example"] {
-            assert!(
-                apply_draft(&mut profile, &draft(json!({"geoipUrl": bad}))).is_err(),
-                "{bad}"
-            );
-        }
-        assert_eq!(profile.xray_geoip_url, None);
-    }
-
-    #[test]
     fn happ_geo_urls_reach_the_editor_instead_of_a_warning() {
         let import = happ_routing::HappRoutingImport {
             geoip_url: Some("https://cdn.example/geoip.dat".into()),
@@ -461,17 +352,5 @@ mod tests {
         assert_eq!(value["geoipUrl"], "https://cdn.example/geoip.dat");
         assert!(value.get("geositeUrl").is_none());
         assert!(!value["warnings"].to_string().contains("geo"));
-    }
-
-    #[test]
-    fn happ_parse_rejects_garbage() {
-        let dir = tempfile::tempdir().unwrap();
-        let result = handle(
-            dir.path(),
-            || Err("unused".into()),
-            "parse_happ_routing",
-            &json!({"payload":"not a profile"}),
-        );
-        assert!(result.unwrap().is_err());
     }
 }

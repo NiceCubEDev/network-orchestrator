@@ -1,13 +1,17 @@
 //! Credentials for OpenVPN: piped in on request, otherwise asked on the
 //! terminal with echo off. Never taken from arguments, where `ps` shows them.
 use net_manager_core::daemon_protocol::{OpenVpnCredentials, OpenVpnUserPass};
-use std::io::{BufRead, IsTerminal, Write};
+use std::io::{BufRead, IsTerminal, Read, Write};
 
 pub fn read_line(input: &mut impl BufRead) -> Result<String, String> {
     let mut line = String::new();
     input
+        .take(65_537)
         .read_line(&mut line)
-        .map_err(|_| "Could not read from stdin".to_string())?;
+        .map_err(|_| "Could not read credential input".to_string())?;
+    if line.len() > 65_536 {
+        return Err("Credential input is too long".into());
+    }
     Ok(line.trim_end_matches(['\n', '\r']).to_string())
 }
 
@@ -18,17 +22,17 @@ fn secret_from_terminal(prompt: &str) -> Result<String, String> {
     let fd = libc::STDIN_FILENO;
     // SAFETY: termios is plain data; tcgetattr fills it for a valid fd.
     let mut original: libc::termios = unsafe { std::mem::zeroed() };
-    let have = unsafe { libc::tcgetattr(fd, &mut original) } == 0;
-    if have {
-        let mut quiet = original;
-        quiet.c_lflag &= !libc::ECHO;
-        unsafe { libc::tcsetattr(fd, libc::TCSANOW, &quiet) };
+    if unsafe { libc::tcgetattr(fd, &mut original) } != 0 {
+        return Err("Could not disable terminal echo; use protected file or stdin input".into());
+    }
+    let mut quiet = original;
+    quiet.c_lflag &= !libc::ECHO;
+    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &quiet) } != 0 {
+        return Err("Could not disable terminal echo; use protected file or stdin input".into());
     }
     let result = read_line(&mut std::io::stdin().lock());
-    if have {
-        unsafe { libc::tcsetattr(fd, libc::TCSANOW, &original) };
-        let _ = writeln!(stderr);
-    }
+    unsafe { libc::tcsetattr(fd, libc::TCSANOW, &original) };
+    let _ = writeln!(stderr);
     result
 }
 
@@ -51,10 +55,7 @@ pub fn collect(
             (read_line(&mut stdin)?, read_line(&mut stdin)?)
         } else if interactive {
             drop(stdin);
-            let mut stderr = std::io::stderr();
-            let _ = write!(stderr, "OpenVPN username: ");
-            let _ = stderr.flush();
-            let username = read_line(&mut std::io::stdin().lock())?;
+            let username = secret_from_terminal("OpenVPN username: ")?;
             let password = secret_from_terminal("OpenVPN password: ")?;
             stdin = std::io::stdin().lock();
             (username, password)
@@ -83,6 +84,14 @@ pub fn collect(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn oversized_input_fails_without_echoing_it() {
+        let mut input = std::io::Cursor::new(vec![b'x'; 65_537]);
+        assert_eq!(
+            read_line(&mut input).unwrap_err(),
+            "Credential input is too long"
+        );
+    }
 
     #[test]
     fn lines_lose_only_their_terminator() {

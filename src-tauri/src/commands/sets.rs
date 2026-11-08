@@ -1,6 +1,8 @@
 //! Thin adapters over the shared connection-set store and Linux runtime.
 use crate::state::AppState;
 #[cfg(target_os = "linux")]
+use net_manager_core::connection_sets;
+#[cfg(target_os = "linux")]
 use net_manager_engine::{linux_engine::LinuxEngine, linux_sets};
 use serde_json::Value;
 use tauri::State;
@@ -20,7 +22,7 @@ pub(crate) async fn list_connection_sets(state: State<'_, AppState>) -> Result<V
     #[cfg(target_os = "linux")]
     {
         let root = root(&state);
-        tauri::async_runtime::spawn_blocking(move || encode(linux_sets::list(&root)?))
+        tauri::async_runtime::spawn_blocking(move || encode(connection_sets::list(&root)?))
             .await
             .map_err(|_| "Connection-set task failed")?
     }
@@ -39,7 +41,7 @@ pub(crate) async fn get_connection_set(
     #[cfg(target_os = "linux")]
     {
         let root = root(&state);
-        tauri::async_runtime::spawn_blocking(move || encode(linux_sets::get(&root, &id)?))
+        tauri::async_runtime::spawn_blocking(move || encode(connection_sets::get(&root, &id)?))
             .await
             .map_err(|_| "Connection-set task failed")?
     }
@@ -61,7 +63,7 @@ pub(crate) async fn put_connection_set(
         tauri::async_runtime::spawn_blocking(move || {
             let set = serde_json::from_value(set).map_err(|_| "Invalid connection set")?;
             let store = net_manager_core::profiles::ProfileStore::new(root.join("profiles.json"));
-            encode(linux_sets::put(&root, &store, set)?)
+            encode(connection_sets::put(&root, &store, set)?)
         })
         .await
         .map_err(|_| "Connection-set task failed")?
@@ -82,7 +84,7 @@ pub(crate) async fn delete_connection_set(
     {
         let root = root(&state);
         tauri::async_runtime::spawn_blocking(move || {
-            linux_sets::delete(&root, &id)?;
+            connection_sets::delete(&root, &id)?;
             Ok(Value::Null)
         })
         .await
@@ -106,7 +108,7 @@ pub(crate) async fn import_connection_sets(
         tauri::async_runtime::spawn_blocking(move || {
             let sets =
                 serde_json::from_value(sets).map_err(|_| "Invalid legacy connection sets")?;
-            encode(linux_sets::import(&root, sets)?)
+            encode(connection_sets::import(&root, sets)?)
         })
         .await
         .map_err(|_| "Connection-set task failed")?
@@ -170,11 +172,11 @@ async fn lifecycle(
         let root = root(&state);
         let credentials = state.openvpn_credentials.clone();
         tauri::async_runtime::spawn_blocking(move || {
-            let inputs: linux_sets::CredentialInputs = if let Some(value) = credential_inputs {
+            let inputs: connection_sets::CredentialInputs = if let Some(value) = credential_inputs {
                 serde_json::from_value(value)
                     .map_err(|_| "Invalid connection-set credential inputs")?
             } else {
-                linux_sets::CredentialInputs::new()
+                connection_sets::CredentialInputs::new()
             };
             let store = net_manager_core::profiles::ProfileStore::new(root.join("profiles.json"));
             let vault = net_manager_core::config_vault::ConfigVault::new(root.join("configs"));

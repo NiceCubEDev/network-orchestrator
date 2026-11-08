@@ -1,4 +1,4 @@
-#![cfg(target_os = "linux")]
+#![cfg(all(target_os = "linux", not(feature = "macos-cli")))]
 use serde_json::Value;
 use std::io::Write;
 use std::io::{BufRead, BufReader};
@@ -459,6 +459,7 @@ fn recover_reports_persisted_proxy_without_revealing_snapshot() {
         "appliedServer":"secret-proxy","appliedOverride":""
     }});
     std::fs::write(data.join("proxy-state.json"), state.to_string()).unwrap();
+    net_manager_core::config_security::protect_path(&data.join("proxy-state.json")).unwrap();
     let output = command(dir.path())
         .args(["--json", "recover"])
         .output()

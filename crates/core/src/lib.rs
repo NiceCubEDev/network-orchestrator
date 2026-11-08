@@ -7,6 +7,8 @@ pub mod cidr_bulk;
 pub mod config_security;
 pub mod config_vault;
 pub mod connect_plan;
+#[cfg(unix)]
+pub mod connection_sets;
 pub mod daemon_protocol;
 pub mod diagnostics;
 pub mod dns_diag;

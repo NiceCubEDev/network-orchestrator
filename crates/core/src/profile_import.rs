@@ -229,6 +229,7 @@ pub fn import_share_link(
     id: &str,
     name: &str,
     link: &str,
+    xray_mode: XrayMode,
     available: impl Fn(u16) -> bool,
 ) -> io::Result<ProfileDocument> {
     crate::config_vault::sanitize_profile_id(id)?;
@@ -267,7 +268,7 @@ pub fn import_share_link(
         config_path: imported.config_path.clone(),
         xray_socks_port: Some(socks),
         xray_http_port: Some(http),
-        xray_mode: XrayMode::platform_default(),
+        xray_mode,
         ..Profile::default()
     };
     let result = analysis::analyze_profile(&profile).and_then(|_| store.upsert(profile));
@@ -342,6 +343,7 @@ pub fn import_configs_into(
     store: &ProfileStore,
     paths: &[String],
     default_backend: Option<TunnelBackend>,
+    xray_mode: XrayMode,
 ) -> std::io::Result<BatchImportResult> {
     let mut errors: Vec<BatchImportError> = Vec::new();
     for (index, raw) in paths.iter().enumerate() {
@@ -381,13 +383,7 @@ pub fn import_configs_into(
             backend,
             config_path,
             routes: import.routes,
-            // Imported JSON is not a daemon-validated generated TUN config.
-            // Keep arbitrary Xray configs in the unprivileged local runtime.
-            xray_mode: if cfg!(target_os = "linux") && backend == TunnelBackend::Xray {
-                XrayMode::Socks
-            } else {
-                XrayMode::platform_default()
-            },
+            xray_mode,
             ..Default::default()
         };
         if let Err(err) = store.upsert(profile) {
@@ -435,19 +431,33 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let vault = ConfigVault::new(dir.path().join("configs"));
         let store = ProfileStore::new(dir.path().join("profiles.json"));
-        let doc = import_share_link(&vault, &store, "one", "  Custom name  ", LINK, |p| {
-            p != 10808
-        })
+        let doc = import_share_link(
+            &vault,
+            &store,
+            "one",
+            "  Custom name  ",
+            LINK,
+            XrayMode::Socks,
+            |p| p != 10808,
+        )
         .unwrap();
         assert_eq!(doc.profiles[0].name, "Custom name");
         assert_eq!(doc.profiles[0].xray_socks_port, Some(10809));
         assert_eq!(doc.profiles[0].xray_http_port, Some(10810));
-        assert_eq!(doc.profiles[0].xray_mode, XrayMode::platform_default());
+        assert_eq!(doc.profiles[0].xray_mode, XrayMode::Socks);
         let path = doc.profiles[0].config_path.clone();
         assert_eq!(
-            import_share_link(&vault, &store, "one", "Replacement", LINK, |_| true)
-                .unwrap_err()
-                .kind(),
+            import_share_link(
+                &vault,
+                &store,
+                "one",
+                "Replacement",
+                LINK,
+                XrayMode::Socks,
+                |_| true
+            )
+            .unwrap_err()
+            .kind(),
             io::ErrorKind::AlreadyExists
         );
         assert_eq!(store.load().unwrap(), doc);
@@ -458,6 +468,7 @@ mod tests {
             "two",
             "",
             "hy2://synthetic-password@node.test:443",
+            XrayMode::Socks,
             |_| true,
         )
         .unwrap();
@@ -479,7 +490,16 @@ mod tests {
         let store = ProfileStore::new(dir.path().join("profiles.json"));
         // The document is absent but its staging path cannot be written.
         std::fs::create_dir(dir.path().join("profiles.json.tmp")).unwrap();
-        assert!(import_share_link(&vault, &store, "failed", "Lab", LINK, |_| true).is_err());
+        assert!(import_share_link(
+            &vault,
+            &store,
+            "failed",
+            "Lab",
+            LINK,
+            XrayMode::Socks,
+            |_| true
+        )
+        .is_err());
         assert!(!dir.path().join("profiles.json").exists());
         assert_eq!(
             std::fs::read_dir(vault.root().join("failed"))
@@ -504,7 +524,10 @@ mod tests {
                 ..Profile::default()
             })
             .unwrap();
-        let doc = import_share_link(&vault, &store, "link", "Lab", LINK, |_| true).unwrap();
+        let doc = import_share_link(&vault, &store, "link", "Lab", LINK, XrayMode::Socks, |_| {
+            true
+        })
+        .unwrap();
         assert_eq!(doc.profiles[1].xray_socks_port, Some(10809));
         assert_eq!(doc.profiles[1].xray_http_port, Some(10810));
     }
@@ -514,16 +537,50 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let vault = ConfigVault::new(dir.path().join("configs"));
         let store = ProfileStore::new(dir.path().join("profiles.json"));
-        assert!(import_share_link(&vault, &store, "none", "", LINK, |_| false).is_err());
+        assert!(
+            import_share_link(&vault, &store, "none", "", LINK, XrayMode::Socks, |_| false)
+                .is_err()
+        );
         assert!(import_share_link(
             &vault,
             &store,
             "many",
             "",
             &format!("{LINK}\n{LINK}"),
+            XrayMode::Socks,
             |_| true
         )
         .is_err());
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+    #[test]
+    fn imports_persist_the_explicit_mode_instead_of_the_build_host_default() {
+        for mode in [XrayMode::Socks, XrayMode::Tun] {
+            let dir = tempfile::tempdir().unwrap();
+            let vault = ConfigVault::new(dir.path().join("configs"));
+            let store = ProfileStore::new(dir.path().join("profiles.json"));
+            let imported =
+                import_share_link(&vault, &store, "link", "Link", LINK, mode, |_| true).unwrap();
+            assert_eq!(imported.profiles[0].xray_mode, mode);
+            assert_eq!(store.load().unwrap().profiles[0].xray_mode, mode);
+            let source = dir.path().join("source.json");
+            std::fs::write(&source, r#"{"outbounds":[{"protocol":"freedom"}]}"#).unwrap();
+            let imported = import_configs_into(
+                &vault,
+                &store,
+                &[source.to_string_lossy().into_owned()],
+                None,
+                mode,
+            )
+            .unwrap();
+            assert!(imported.errors.is_empty());
+            assert!(imported.profiles.iter().all(|p| p.xray_mode == mode));
+            assert!(store
+                .load()
+                .unwrap()
+                .profiles
+                .iter()
+                .all(|p| p.xray_mode == mode));
+        }
     }
 }

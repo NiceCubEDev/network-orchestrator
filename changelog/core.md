@@ -10,6 +10,27 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+### Added
+
+- Typed macOS profile, subscription, routing, network, provider, diagnostic,
+  credential, policy and connection-set services shared by CLI and the Swift bridge.
+- An authenticated per-data-directory macOS user-runtime owner with generation
+  leases, serialized operations, owned-child recovery and durable proxy restoration.
+- Shared connection-set storage with atomic, insert-only native legacy migration
+  that preserves existing sets, missing references and full legacy names.
+
+### Changed
+
+- Import services take an explicit Xray mode: macOS links default to SOCKS
+  without changing the Linux platform default.
+- Persisted system-proxy ownership is bounded, protected against symlinked
+  storage and read-only until an actual state change.
+
+### Fixed
+
+- Switching a stopped Xray TUN subscription node no longer requires its unused
+  SOCKS/HTTP ports to be free. SOCKS mode still rejects an occupied listener.
+
 ## [0.16.1] - 2026-11-08
 
 ### Fixed

@@ -1077,6 +1077,11 @@ impl TunnelManager {
         };
     }
 
+    /// PID of an Xray child this manager owns, for identity-checked recovery.
+    pub fn xray_child_pid(&self, profile_id: &str) -> Option<u32> {
+        self.xray_children.get(profile_id).map(Child::id)
+    }
+
     fn child_log_stdio(&self, profile_id: &str, tag: &str) -> io::Result<(Stdio, Stdio)> {
         let Some(dir) = &self.log_dir else {
             return Ok((Stdio::null(), Stdio::null()));

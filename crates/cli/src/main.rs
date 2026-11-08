@@ -1,62 +1,52 @@
 //! `netorch`: one command for VPN profiles, tunnels and routing.
-//! Plans: docs/plans/2026-10-15-19-netorch-cli.md (macOS),
-//! docs/plans/2026-10-28-linux-netorch-cli.md (Linux).
-
-#[cfg(not(any(all(target_os = "macos", target_arch = "aarch64"), target_os = "linux")))]
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "macos",
+    all(unix, feature = "macos-cli")
+)))]
 fn main() {
-    eprintln!("netorch runs on macOS (Apple Silicon) and Linux only");
+    eprintln!("netorch requires macOS or Linux");
     std::process::exit(1);
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(feature = "macos-cli")))]
 fn main() -> std::process::ExitCode {
     linux::main()
 }
-
-#[cfg(any(target_os = "linux", all(target_os = "macos", test)))]
+#[cfg(any(
+    all(target_os = "linux", not(feature = "macos-cli")),
+    all(target_os = "macos", test)
+))]
 mod linux;
-// Used by both clients.
-#[cfg(any(
-    all(target_os = "macos", target_arch = "aarch64"),
-    target_os = "linux",
-    all(target_os = "macos", test)
-))]
+#[cfg(unix)]
 mod prompt;
-#[cfg(any(
-    all(target_os = "macos", target_arch = "aarch64"),
-    target_os = "linux",
-    all(target_os = "macos", test)
-))]
+#[cfg(unix)]
 mod render;
-#[cfg(any(
-    all(target_os = "macos", target_arch = "aarch64"),
-    target_os = "linux",
-    all(target_os = "macos", test)
-))]
+#[cfg(unix)]
 mod target;
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(target_os = "macos", all(unix, feature = "macos-cli")))]
 mod args;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(target_os = "macos", all(unix, feature = "macos-cli")))]
+mod business;
+#[cfg(any(target_os = "macos", all(unix, feature = "macos-cli")))]
 mod connect;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(target_os = "macos", all(unix, feature = "macos-cli")))]
 mod ctx;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(target_os = "macos")]
 mod inproc;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(target_os = "macos", all(unix, feature = "macos-cli")))]
+mod input;
+#[cfg(any(target_os = "macos", all(unix, feature = "macos-cli")))]
 mod library;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-mod lock;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(target_os = "macos", all(unix, feature = "macos-cli")))]
 mod route;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-mod runstate;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(target_os = "macos", all(unix, feature = "macos-cli")))]
 mod service;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(target_os = "macos", all(unix, feature = "macos-cli")))]
 mod system;
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(target_os = "macos", all(unix, feature = "macos-cli")))]
 fn main() -> std::process::ExitCode {
     use args::{Cli, Command};
     use clap::{CommandFactory, Parser};
@@ -70,23 +60,27 @@ fn main() -> std::process::ExitCode {
         );
         return std::process::ExitCode::SUCCESS;
     }
-    let result = cli
-        .data_dir
-        .clone()
-        .map(Ok)
-        .unwrap_or_else(ctx::default_root)
-        .and_then(|root| ctx::Ctx::new(root, cli.json))
-        .and_then(|ctx| run(&ctx, cli.command));
+    let result = match cli.command {
+        Command::Service(command) => system::service(cli.json, command),
+        command => cli
+            .data_dir
+            .map(Ok)
+            .unwrap_or_else(ctx::default_root)
+            .and_then(|root| ctx::Ctx::new(root, cli.json))
+            .and_then(|ctx| run(&ctx, command)),
+    };
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("netorch: {error}");
+            eprintln!(
+                "netorch: {}",
+                net_manager_core::log_sanitize::sanitize_log_text(&error)
+            );
             std::process::ExitCode::FAILURE
         }
     }
 }
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(target_os = "macos", all(unix, feature = "macos-cli")))]
 fn run(ctx: &ctx::Ctx, command: args::Command) -> Result<(), String> {
     use args::Command;
     match command {
@@ -102,7 +96,9 @@ fn run(ctx: &ctx::Ctx, command: args::Command) -> Result<(), String> {
         Command::Route(command) => route::run(ctx, command),
         Command::Doctor => system::doctor(ctx),
         Command::Backend(command) => system::backend(ctx, command),
-        Command::Service(command) => system::service(ctx, command),
+        Command::Service(command) => system::service(ctx.json, command),
+        Command::Serve => connect::serve(ctx),
         Command::Completions { .. } => Ok(()),
+        other => business::run(ctx, other),
     }
 }

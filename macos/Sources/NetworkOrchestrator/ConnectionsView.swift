@@ -134,7 +134,7 @@ struct ConnectionsView: View {
           .buttonStyle(TauriButtonStyle(kind: active ? .accent : .chip, compact: true))
           .help(L10n.text("sets.applyTitle", ["count": String(set.profileIds.count)]))
           .contextMenu {
-            Button(L10n.text("sets.deleteTitle"), role: .destructive) { model.deleteSet(set) }
+            Button(L10n.text("sets.deleteTitle"), role: .destructive) { Task { await model.deleteSet(set) } }
           }
       }
       Button(L10n.text("sets.saveCurrent")) {
@@ -147,7 +147,7 @@ struct ConnectionsView: View {
     .alert(L10n.text("sets.modalTitle"), isPresented: $savingSet) {
       TextField(L10n.text("sets.namePh"), text: $setName)
       Button(L10n.text("Cancel"), role: .cancel) {}
-      Button(L10n.text("Save")) { model.saveCurrentSet(name: setName) }
+      Button(L10n.text("Save")) { Task { await model.saveCurrentSet(name: setName) } }
     } message: {
       Text(L10n.text("sets.willInclude", ["count": String(running.count)]))
     }
@@ -629,12 +629,12 @@ struct ProfileDetailView: View {
           }
           if profile.backend == "xray" {
             Divider()
-            Button(L10n.text("native.openBrowser")) { model.openBrowser(profile) }.disabled(
+            Button(L10n.text("native.openBrowser")) { Task { await model.openBrowser(profile) } }.disabled(
               !running)
-            Button(L10n.text("native.copyTerminal")) { model.copyTerminalProxy(profile) }
+            Button(L10n.text("native.copyTerminal")) { Task { await model.copyTerminalProxy(profile) } }
           }
           if profile.backend == "openVpn" {
-            Button(L10n.text("native.credentials.forget")) { model.forgetCredentials(profile) }
+            Button(L10n.text("native.credentials.forget")) { Task { await model.forgetCredentials(profile) } }
           }
           Divider()
           Button(L10n.text("Delete"), role: .destructive, action: onDelete)

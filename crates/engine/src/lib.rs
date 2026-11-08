@@ -3,14 +3,13 @@
 //! native client reaches it through `macos-bridge`, the `netorch` CLI directly
 //! (`docs/plans/2026-10-15-19-netorch-cli.md`).
 //!
-//! macOS only for now: Windows and Linux orchestration still lives in
-//! `src-tauri` and is moved here by implementing the platform traits there.
-//! Privileged work stays in the launchd helper; this crate only asks it.
+//! Linux and macOS frontends share typed services and one unprivileged
+//! runtime per data directory; privileged mutations stay in the OS helper.
 use std::path::PathBuf;
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(unix)]
 mod diagnose;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(unix)]
 mod geo;
 #[cfg(any(target_os = "linux", feature = "linux-engine"))]
 pub mod linux;
@@ -43,27 +42,39 @@ pub mod linux_sets;
 #[cfg(target_os = "linux")]
 pub mod linux_system;
 #[cfg(unix)]
+pub mod macos_credentials;
+#[cfg(unix)]
+pub mod macos_network;
+#[cfg(unix)]
+pub mod macos_services;
+#[cfg(unix)]
+pub mod macos_session;
+#[cfg(unix)]
+pub mod macos_state;
+#[cfg(unix)]
+pub mod macos_transaction;
+#[cfg(unix)]
 pub mod privileged;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(unix)]
 mod recovery;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(unix)]
 mod runtime;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(unix)]
 mod static_routes;
 #[cfg(unix)]
 pub mod tailscale;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(unix)]
 mod vpn_backends;
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(unix)]
 pub use diagnose::DiagnosticsContext;
 #[cfg(unix)]
 pub use privileged::Privileged;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub use runtime::{find_profile, Engine, Snapshot};
+#[cfg(unix)]
+pub use runtime::{find_profile, Engine, Snapshot, TailscaleGuard, TailscaleGuardState};
 
 /// Text the client matches to ask the user for OpenVPN credentials.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(unix)]
 pub use vpn_backends::CREDENTIALS_REQUIRED;
 
 /// Socket of the privileged helper; QA runs may point it elsewhere.
@@ -73,7 +84,7 @@ pub fn helper_socket() -> PathBuf {
         .unwrap_or_else(|| net_manager_core::daemon_protocol::MACOS_SOCKET_PATH.into())
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(unix)]
 pub(crate) fn helper_error(error: net_manager_core::helper_client::HelperError) -> String {
     use net_manager_core::helper_client::HelperError;
     match error {

@@ -1,12 +1,12 @@
 # Network Orchestrator
 
-A desktop app for WireGuard, OpenVPN, Xray/VLESS, policy routes, and
+A CLI-first app for WireGuard, OpenVPN, Xray/VLESS, policy routes, and
 network exploration. Windows and Linux use Tauri 2; macOS 27 has a native
 SwiftUI/AppKit client linked directly to the Rust core, without a WebView.
-The macOS client supports managed configuration imports, profile editing,
-static analysis, interface inventory and routing-table inspection. macOS VPN
-activation and network mutations require a separate provider implementation
-and are disabled in this first native stage. Tunnel management works on Windows.
+On macOS, the GUI and `netorch` call the same typed Engine services and share
+one unprivileged connection runtime per data directory. The separate privileged
+helper owns tunnel, route, interface and DNS mutations; the bridge is only the
+Swift client's JSON adapter.
 On Linux, the
 privileged daemon, WireGuard and OpenVPN split/full tunnels with per-link DNS,
 Xray VLESS/Hysteria2 SOCKS5/HTTP proxy and Xray TUN have passed container E2E
@@ -35,14 +35,16 @@ open "target/macos/Network Orchestrator.app"
 ```
 
 The script builds a release `.app` with a local ad-hoc signature and a minimum
-OS version of 27.0. App version comes from the root Cargo workspace. Developer
+OS version of 27.0. App version comes from the macOS line in `versions.toml`. Developer
 ID signing and notarization for distribution remain separate release steps.
 No Node runtime, React or WebKit is included in the native app. npm only invokes
 the build script; `bash scripts/build-macos-native.sh` works without npm.
 
-Native data lives under `~/Library/Application Support/com.netmanager.app.macos`.
-The native client currently uses a separate store from Tauri. See
-[`macos/README.md`](macos/README.md) for supported functions and test isolation.
+The native GUI and CLI share `~/Library/Application Support/com.netmanager.app.macos`.
+`netorch up PROFILE` connects in the background; closing the GUI does not disconnect.
+Use `netorch down PROFILE` to stop it or `netorch up PROFILE --foreground` for a
+generation-scoped foreground connection. See [`macos/README.md`](macos/README.md)
+for the command surface, credentials and test isolation.
 
 ### Windows / Linux Tauri client
 

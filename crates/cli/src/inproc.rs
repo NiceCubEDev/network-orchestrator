@@ -49,6 +49,12 @@ fn invoking_uid(console: Option<u32>, sudo_uid: Option<u32>) -> Result<u32, Stri
 fn private_dir(path: &Path) -> Result<(), String> {
     std::fs::create_dir_all(path)
         .map_err(|_| "A system directory could not be created".to_string())?;
+    use std::os::unix::fs::MetadataExt;
+    let metadata =
+        std::fs::symlink_metadata(path).map_err(|_| "A system directory could not be inspected")?;
+    if !metadata.is_dir() || metadata.uid() != 0 {
+        return Err("A system directory is not a root-owned directory".into());
+    }
     std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
         .map_err(|_| "A system directory could not be secured".to_string())
 }
@@ -76,16 +82,33 @@ impl InProcess {
         let socket_dir = Path::new(SOCKET_DIR);
         private_dir(socket_dir)?;
         private_dir(Path::new(STATE_DIR))?;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
         let lock = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
             .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(socket_dir.join("netorch-inproc.lock"))
             .map_err(|_| "The tunnel lock could not be opened".to_string())?;
+        let metadata = lock
+            .metadata()
+            .map_err(|_| "The tunnel lock could not be inspected")?;
+        if !metadata.is_file() || metadata.uid() != 0 || metadata.nlink() != 1 {
+            return Err("Unsafe sudo tunnel lock".into());
+        }
         // SAFETY: flock on a descriptor owned by `lock`.
         if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             return Err("Another sudo netorch already runs the tunnels".into());
+        }
+        if !matches!(
+            HelperClient::new(helper_socket).hello(),
+            Err(HelperError::Unreachable(_))
+        ) {
+            return Err(
+                "The Network Orchestrator helper is running; use netorch without sudo".into(),
+            );
         }
         let state_dir = Path::new(STATE_DIR);
         let xray = Arc::new(XrayExecutor::new(
@@ -183,9 +206,130 @@ impl Privileged for InProcess {
     }
 }
 
+impl Drop for InProcess {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+/// A root-owned control connection replaces unsafe PID-based sudo shutdown.
+/// Its accepted stream belongs to this exact executor lifetime.
+pub struct RunControl {
+    listener: std::os::unix::net::UnixListener,
+    path: PathBuf,
+    profile_id: String,
+    pending: Option<std::os::unix::net::UnixStream>,
+}
+
+impl RunControl {
+    pub fn new(profile_id: &str) -> Result<Self, String> {
+        use std::os::unix::fs::PermissionsExt;
+        let path = Path::new(SOCKET_DIR).join("netorch-inproc-control.sock");
+        // InProcess's exclusive system lifetime lock is held before this call.
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                use std::os::unix::fs::{FileTypeExt, MetadataExt};
+                if !metadata.file_type().is_socket() || metadata.uid() != 0 {
+                    return Err("Unsafe sudo control endpoint".into());
+                }
+                std::fs::remove_file(&path)
+                    .map_err(|_| "Could not replace stale sudo control endpoint")?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+            Err(_) => return Err("Could not inspect sudo control endpoint".into()),
+        }
+        let listener = std::os::unix::net::UnixListener::bind(&path)
+            .map_err(|_| "Could not bind sudo control endpoint")?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|_| "Could not protect sudo control endpoint")?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|_| "Could not configure sudo control endpoint")?;
+        Ok(Self {
+            listener,
+            path,
+            profile_id: profile_id.into(),
+            pending: None,
+        })
+    }
+
+    pub fn stop_requested(&mut self) -> Result<bool, String> {
+        use std::io::{BufRead, Write};
+        let (mut stream, _) = match self.listener.accept() {
+            Ok(connection) => connection,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
+            Err(_) => return Err("Could not accept sudo control request".into()),
+        };
+        let mut uid = 0;
+        let mut gid = 0;
+        // SAFETY: getpeereid fills two valid scalars for this accepted socket.
+        if unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } != 0 || uid != 0 {
+            return Ok(false);
+        }
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .map_err(|_| "Could not configure sudo control request")?;
+        let mut request = String::new();
+        std::io::BufReader::new(std::io::Read::take(&mut stream, 1024))
+            .read_line(&mut request)
+            .map_err(|_| "Could not read sudo control request")?;
+        if request.trim_end() != self.profile_id && request.trim_end() != "*" {
+            let _ = stream.write_all(b"wrong-profile\n");
+            return Ok(false);
+        }
+        self.pending = Some(stream);
+        Ok(true)
+    }
+
+    pub fn complete(&mut self) {
+        use std::io::Write;
+        if let Some(mut stream) = self.pending.take() {
+            let _ = stream.write_all(b"stopped\n");
+        }
+    }
+}
+
+impl Drop for RunControl {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+pub fn stop(profile_id: Option<&str>) -> Result<(), String> {
+    use std::io::{BufRead, Write};
+    let mut stream = std::os::unix::net::UnixStream::connect(
+        Path::new(SOCKET_DIR).join("netorch-inproc-control.sock"),
+    )
+    .map_err(|_| "No sudo foreground connection is running")?;
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(30)))
+        .map_err(|_| "Could not configure sudo control connection")?;
+    writeln!(stream, "{}", profile_id.unwrap_or("*"))
+        .map_err(|_| "Could not send sudo stop request")?;
+    let mut response = String::new();
+    std::io::BufReader::new(std::io::Read::take(stream, 1024))
+        .read_line(&mut response)
+        .map_err(|_| "Sudo connection did not stop in time")?;
+    if response == "stopped\n" {
+        Ok(())
+    } else {
+        Err("That sudo foreground connection is not running".into())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn executor_directories_never_follow_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let actual = dir.path().join("actual");
+        std::fs::create_dir(&actual).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&actual, &link).unwrap();
+        assert!(private_dir(&link).is_err());
+    }
 
     #[test]
     fn tunnels_run_only_for_the_console_user() {

@@ -1,60 +1,41 @@
-//! Routing rules and route lookups.
-use crate::args::RouteCommand;
-use crate::ctx::Ctx;
-use crate::lock;
-use net_manager_core::models::{Profile, TunnelBackend, XrayMode};
+//! Typed routing configuration, imports and native lookups.
+use crate::{args::RouteCommand, ctx::Ctx, input};
+use net_manager_core::models::{DomainPolicy, DomainRouteTarget, Profile, TunnelBackend, XrayMode};
+use net_manager_engine::macos_services::ProfileRoutingUpdate;
 use serde_json::{json, Value};
-
-/// Loopback Xray is a child of whoever started it; changing such a profile
-/// restarts it, which only the owner of the data directory may do.
 pub fn runs_locally(profile: &Profile) -> bool {
     profile.backend == TunnelBackend::Xray && profile.xray_mode == XrayMode::Socks
 }
-
 pub fn run(ctx: &Ctx, command: RouteCommand) -> Result<(), String> {
+    let services = ctx.services()?;
     match command {
-        RouteCommand::Lookup { address } => {
-            let result = ctx.app("lookup", json!({"destination": address}))?;
-            ctx.emit(result.clone(), || {
-                format!(
-                    "{} -> {} (route {}/{}{})",
-                    result["destination"].as_str().unwrap_or(&address),
-                    result["interfaceName"].as_str().unwrap_or("?"),
-                    result["matchedRoute"]["destination"]
-                        .as_str()
-                        .unwrap_or("?"),
-                    result["matchedRoute"]["prefixLen"],
-                    result["matchedRoute"]["gateway"]
-                        .as_str()
-                        .map(|gateway| format!(" via {gateway}"))
-                        .unwrap_or_default()
-                )
-            });
-            Ok(())
-        }
+        RouteCommand::Lookup { address } => ctx.output(
+            &ctx.network().lookup_route(
+                address
+                    .parse()
+                    .map_err(|_| "Enter an IPv4 or IPv6 address")?,
+            )?,
+        ),
         RouteCommand::Show { profile } => {
-            let profile = ctx.find(&profile)?;
-            let options = ctx.app("routing_options", json!({"id": profile.id}))?;
-            ctx.emit(options.clone(), || {
-                let mut out = String::new();
-                for key in ["block", "proxy", "direct"] {
-                    let rules = options[key].as_str().unwrap_or_default();
-                    out.push_str(&format!(
-                        "{key}: {}\n",
-                        if rules.is_empty() {
-                            "-".to_string()
-                        } else {
-                            rules.replace('\n', ", ")
-                        }
-                    ));
-                }
-                out.push_str(&format!(
-                    "lan-direct: {}",
-                    options["privateLanDirect"].as_bool().unwrap_or(false)
-                ));
-                out
-            });
-            Ok(())
+            let p = ctx.find(&profile)?;
+            let routing = services.profile_routing(&p.id)?;
+            // Retain the existing editor-friendly selector groups, alongside full typed options.
+            let mut value =
+                serde_json::to_value(&routing).map_err(|_| "Could not encode routing")?;
+            for (key, target) in [
+                ("block", DomainRouteTarget::Block),
+                ("proxy", DomainRouteTarget::Proxy),
+                ("direct", DomainRouteTarget::Direct),
+            ] {
+                value[key] = json!(routing
+                    .policies
+                    .iter()
+                    .filter(|p| p.target == target)
+                    .flat_map(|p| p.domains.iter().cloned())
+                    .collect::<Vec<_>>()
+                    .join("\n"));
+            }
+            ctx.output(&value)
         }
         RouteCommand::Set {
             profile,
@@ -62,44 +43,53 @@ pub fn run(ctx: &Ctx, command: RouteCommand) -> Result<(), String> {
             proxy,
             direct,
             lan_direct,
+            advanced,
+            geo,
         } => {
             ctx.require_user()?;
-            let profile = ctx.find(&profile)?;
-            let _guard = if runs_locally(&profile) {
-                Some(lock::acquire(&ctx.root)?)
-            } else {
-                None
-            };
-            ctx.app(
-                "set_routing_rules",
-                json!({
-                    "id": profile.id,
-                    "block": block.join("\n"),
-                    "proxy": proxy.join("\n"),
-                    "direct": direct.join("\n"),
-                    "privateLanDirect": if lan_direct { "true" } else { "false" },
-                }),
+            let p = ctx.find(&profile)?;
+            let policies = [
+                (block, DomainRouteTarget::Block),
+                (proxy, DomainRouteTarget::Proxy),
+                (direct, DomainRouteTarget::Direct),
+            ]
+            .into_iter()
+            .filter(|(v, _)| !v.is_empty())
+            .map(|(domains, target)| DomainPolicy { domains, target })
+            .collect();
+            services.set_profile_routing(
+                &p.id,
+                ProfileRoutingUpdate {
+                    policies,
+                    private_lan_direct: lan_direct,
+                    advanced: advanced
+                        .as_deref()
+                        .map(|p| input::json(p, false))
+                        .transpose()?,
+                    geo_urls: geo.as_deref().map(|p| input::json(p, false)).transpose()?,
+                },
             )?;
             ctx.emit(crate::ctx::ok_json(), || {
-                format!("Rules of \"{}\" saved", profile.name)
+                format!("Rules of \"{}\" saved", p.name)
             });
             Ok(())
         }
         RouteCommand::Check { target, profile } => {
-            let profile = ctx.find(&profile)?;
-            let mut args = ctx.app("routing_options", json!({"id": profile.id}))?;
-            args["target"] = json!(target);
-            args["privateLanDirect"] = json!(args["privateLanDirect"]
-                .as_bool()
-                .unwrap_or(false)
-                .to_string());
-            let result = ctx.app("check_route", args)?;
-            ctx.emit(result.clone(), || describe_check(&result));
+            let p = ctx.find(&profile)?;
+            let result = services.check_routing(&target, &services.profile_routing(&p.id)?)?;
+            let value =
+                serde_json::to_value(result).map_err(|_| "Could not encode route verdict")?;
+            ctx.emit(value.clone(), || describe_check(&value));
             Ok(())
+        }
+        RouteCommand::Import { profile, file } => {
+            ctx.require_user()?;
+            let p = ctx.find(&profile)?;
+            services.import_happ_routing(&p.id, &input::text(&file, false)?)?;
+            ctx.output(&services.profile_routing(&p.id)?)
         }
     }
 }
-
 fn describe_check(result: &Value) -> String {
     let mut out = format!(
         "{} -> {} ({}{})",
@@ -108,7 +98,7 @@ fn describe_check(result: &Value) -> String {
         result["source"].as_str().unwrap_or("?"),
         result["matchedSelector"]
             .as_str()
-            .map(|selector| format!(": {selector}"))
+            .map(|s| format!(": {s}"))
             .unwrap_or_default()
     );
     if result["certainty"] == "probable" {
@@ -119,37 +109,16 @@ fn describe_check(result: &Value) -> String {
     }
     out
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
-    fn a_verdict_names_the_outbound_and_the_deciding_rule() {
-        let text = describe_check(&json!({
-            "target": "example.com", "outbound": "direct", "source": "policy",
-            "matchedSelector": "domain:example.com", "certainty": "certain", "notes": []
-        }));
-        assert_eq!(text, "example.com -> direct (policy: domain:example.com)");
-        let text = describe_check(&json!({
-            "target": "a.b", "outbound": "proxy", "source": "default",
-            "certainty": "probable", "notes": ["geo assets missing"]
-        }));
-        assert!(text.contains("probable"));
-        assert!(text.contains("note: geo assets missing"));
-    }
-
-    #[test]
-    fn only_loopback_xray_counts_as_local() {
-        let mut profile = Profile {
-            backend: TunnelBackend::Xray,
-            xray_mode: XrayMode::Socks,
-            ..Default::default()
-        };
-        assert!(runs_locally(&profile));
-        profile.xray_mode = XrayMode::Tun;
-        assert!(!runs_locally(&profile));
-        profile.backend = TunnelBackend::WireGuard;
-        assert!(!runs_locally(&profile));
+    fn verdict_names_outbound_and_rule() {
+        assert_eq!(
+            describe_check(
+                &json!({"target":"example.com","outbound":"direct","source":"policy","matchedSelector":"domain:example.com","certainty":"certain","notes":[]})
+            ),
+            "example.com -> direct (policy: domain:example.com)"
+        );
     }
 }

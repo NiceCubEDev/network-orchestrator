@@ -31,10 +31,6 @@ actor CoreBridge {
     let root = root
     return try await Task.detached { try Self.perform(root: root, method, args: args) }.value
   }
-  /// Blocking call for app termination, when the actor can no longer be awaited.
-  nonisolated func callSync(_ method: String) {
-    let _: [String: String]? = try? Self.perform(root: root, method, args: [:])
-  }
   private static func perform<T: Decodable>(root: URL, _ method: String, args: [String: String])
     throws -> T
   {

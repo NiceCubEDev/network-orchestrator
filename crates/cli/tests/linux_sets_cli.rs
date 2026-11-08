@@ -1,6 +1,6 @@
 //! Real CLI consumers of the shared connection-set store. All data is temporary;
 //! daemon sockets point inside the sandbox and no tunnel is started.
-#![cfg(target_os = "linux")]
+#![cfg(all(target_os = "linux", not(feature = "macos-cli")))]
 
 use net_manager_core::config_vault::ConfigVault;
 use net_manager_core::daemon_protocol::SOCKET_ENV;

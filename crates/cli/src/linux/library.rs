@@ -132,6 +132,7 @@ pub fn add_input(ctx: &Ctx, input: &str, name: Option<&str>) -> Result<Vec<Profi
                 &id,
                 &name,
                 &link,
+                net_manager_core::models::XrayMode::platform_default(),
                 loopback_port_available,
             )
             .map_err(io_message)?;
@@ -180,6 +181,7 @@ pub fn add_input(ctx: &Ctx, input: &str, name: Option<&str>) -> Result<Vec<Profi
                     },
                     &fetched.body,
                     fetched.meta,
+                    net_manager_core::models::XrayMode::platform_default(),
                     loopback_port_available,
                 )
                 .map_err(io_message)?;
@@ -213,6 +215,7 @@ fn import_file(ctx: &Ctx, path: &Path) -> Result<(), String> {
         &ctx.store(),
         &[path.to_string_lossy().into_owned()],
         None,
+        net_manager_core::models::XrayMode::platform_default(),
     )
     .map_err(io_message)?;
     match result.errors.first() {
