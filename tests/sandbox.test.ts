@@ -84,9 +84,16 @@ test("profile responses cannot mutate stored fixtures; active profiles cannot be
 
 test("OpenVPN credential flow is simulated without launching a process", () => {
   const backend = new SandboxBackend();
-  assert.throws(() => backend.invoke("connect_profile", { id: "ovpn" }), (error) => error === "OpenVPN credentials required");
-  const status = backend.invoke("connect_openvpn_with_credentials", { id: "ovpn", username: "qa", password: "synthetic" }) as TunnelStatus;
+  assert.throws(() => backend.invoke("connect_profile", { id: "ovpn" }));
+  assert.throws(() => backend.invoke("connect_openvpn_with_credentials", { id: "ovpn", username: "qa", password: "synthetic" }));
+  assert.equal((backend.invoke("get_tunnel_statuses") as TunnelStatus[]).find((s) => s.profileId === "ovpn")!.state, "stopped");
+  const status = backend.invoke("connect_openvpn_with_credentials", {
+    id: "ovpn", credentials: { authUserPass: { username: "qa", password: "synthetic" } }, remember: false,
+  }) as TunnelStatus;
   assert.equal(status.state, "running");
+  assert.equal((backend.invoke("get_tunnel_statuses") as TunnelStatus[]).find((s) => s.profileId === "ovpn")!.state, "running");
+  backend.invoke("disconnect_profile", { id: "ovpn" });
+  assert.throws(() => backend.invoke("connect_profile", { id: "ovpn" }));
 });
 
 test("service results cannot be attributed to a URL changed during a manual check", async () => {

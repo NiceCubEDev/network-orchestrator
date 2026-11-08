@@ -77,6 +77,16 @@ impl Ctx {
         ConfigVault::new(self.root.join("configs"))
     }
 
+    #[cfg(target_os = "linux")]
+    pub fn credentials(
+        &self,
+    ) -> Result<&net_manager_engine::linux_credentials::OpenVpnCredentialStore, String> {
+        if self.root_user {
+            return Err("Run credential changes as your own user, without sudo".into());
+        }
+        Ok(&self.credentials)
+    }
+
     /// Profiles as stored, for running them. Never printed as they are.
     pub fn profiles(&self) -> Result<Vec<Profile>, String> {
         self.store()
@@ -89,17 +99,10 @@ impl Ctx {
         let profiles = self.profiles()?;
         match target::resolve(&profiles, query) {
             Lookup::Found(profile) => Ok(profile.clone()),
-            Lookup::Missing => Err(format!(
-                "No saved profile matches \"{query}\". `netorch ls` lists them."
-            )),
-            Lookup::Ambiguous(found) => Err(format!(
-                "\"{query}\" matches several profiles: {}",
-                found
-                    .iter()
-                    .map(|profile| profile.id.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )),
+            Lookup::Missing => Err("No saved profile matches. `netorch ls` lists them.".into()),
+            Lookup::Ambiguous(_) => {
+                Err("Several saved profiles match; use an ID from `netorch ls`.".into())
+            }
         }
     }
 }

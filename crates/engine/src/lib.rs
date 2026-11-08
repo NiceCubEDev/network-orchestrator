@@ -18,16 +18,30 @@ pub mod linux;
 pub mod linux_compat;
 #[cfg(target_os = "linux")]
 pub mod linux_credentials;
+#[cfg(target_os = "linux")]
+pub mod linux_diagnostics;
 #[cfg(any(target_os = "linux", feature = "linux-engine"))]
 pub mod linux_engine;
 #[cfg(any(target_os = "linux", feature = "linux-engine"))]
 pub mod linux_events;
 #[cfg(target_os = "linux")]
 pub mod linux_geo_assets;
+#[cfg(target_os = "linux")]
+pub mod linux_network;
 #[cfg(any(target_os = "linux", feature = "linux-engine"))]
 pub mod linux_paths;
 #[cfg(target_os = "linux")]
+pub mod linux_profiles;
+#[cfg(target_os = "linux")]
+pub mod linux_runtime;
+#[cfg(target_os = "linux")]
+pub mod linux_services;
+#[cfg(target_os = "linux")]
 pub mod linux_session;
+#[cfg(target_os = "linux")]
+pub mod linux_sets;
+#[cfg(target_os = "linux")]
+pub mod linux_system;
 #[cfg(unix)]
 pub mod privileged;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

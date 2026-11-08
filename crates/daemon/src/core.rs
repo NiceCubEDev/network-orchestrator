@@ -8,7 +8,6 @@ use crate::dns::{DnsApply, DnsExecutor};
 use crate::openvpn::OpenVpnPlan;
 use crate::openvpn_process::OpenVpnProcessRunner;
 use crate::validate::{validate_apply, validate_attach, validate_iface_name, validate_owner};
-use crate::wireguard::{WireGuardPlan, WireGuardPlanWarning};
 use crate::xray::prepare_xray;
 use crate::xray_process::XrayProcessRunner;
 use ipnet::IpNet;
@@ -28,6 +27,7 @@ use net_manager_core::models::TunnelState;
 use net_manager_core::models::{AnalyzedRoute, AppliedRoute, PolicyRoute};
 use net_manager_core::openvpn_management::{ManagementEvent, ManagementSnapshot, OpenVpnState};
 use net_manager_core::policy::{apply_routes_transactional, RouteExecutor, ENDPOINT_BYPASS_METRIC};
+use net_manager_core::wireguard_config::{WireGuardPlan, WireGuardPlanWarning};
 use std::collections::{HashMap, HashSet};
 use std::io;
 #[cfg(target_os = "linux")]
@@ -918,7 +918,8 @@ mod openvpn_tests {
             .any(|event| event.contains(":1:true")));
         let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
         let wg_config = format!("[Interface]\nPrivateKey={key}\nAddress=10.77.0.2/32\n[Peer]\nPublicKey={key}\nEndpoint=198.18.0.1:51820\nAllowedIPs=0.0.0.0/0\n");
-        let wg_plan = crate::wireguard::parse_wireguard_config(&wg_config, &[]).unwrap();
+        let wg_plan =
+            net_manager_core::wireguard_config::parse_wireguard_config(&wg_config, &[]).unwrap();
         assert_eq!(
             core.allocate_full(&wg_plan).err().unwrap().kind(),
             io::ErrorKind::AlreadyExists
@@ -2386,8 +2387,14 @@ impl DaemonCore {
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotConnected, "Xray TUN link is unavailable")
             })?;
-        self.rebind_xray_link(index, process.index, new_index)
-            .map_err(|err| xray_stage("rebind", err))?;
+        if let Err(err) = self.rebind_xray_link(index, process.index, new_index) {
+            // Rebind journals the new ifindex before adding addresses, so
+            // teardown can remove a partially configured replacement link.
+            let _ = self.teardown_xray_entry(index);
+            self.persist();
+            self.tunnel_failed.insert((uid, owner));
+            return Err(xray_stage("rebind", err));
+        }
         // Journal the probe policy the reload actually runs so a daemon
         // restart resurrects the right supervisor.
         for resource in &mut self.journal.entries[index].resources {
@@ -2446,11 +2453,19 @@ impl DaemonCore {
             return Err(incompatible());
         }
         let resources = &self.journal.entries[index].resources;
-        let mut addresses = resources.iter().filter_map(|resource| match resource {
-            OwnedResource::Address(address) => Some(address.address),
-            _ => None,
-        });
-        if addresses.next() != Some(plan.address) || addresses.next().is_some() {
+        let mut addresses: Vec<_> = resources
+            .iter()
+            .filter_map(|resource| match resource {
+                OwnedResource::Address(address) => Some(address.address),
+                _ => None,
+            })
+            .collect();
+        addresses.sort();
+        addresses.dedup();
+        let mut desired_addresses = plan.addresses.clone();
+        desired_addresses.sort();
+        desired_addresses.dedup();
+        if addresses != desired_addresses {
             return Err(incompatible());
         }
         let dns = resources.iter().find_map(|resource| match resource {
@@ -2590,26 +2605,22 @@ impl DaemonCore {
         self.store
             .save(&self.journal)
             .map_err(|err| xray_stage("journal_link", err))?;
-        let address = WireGuardAddressResource {
-            interface_index: link_index,
-            address: plan.address,
-        };
-        self.journal.entries[index]
-            .resources
-            .push(OwnedResource::Address(address.clone()));
-        self.store
-            .save(&self.journal)
-            .map_err(|err| xray_stage("journal_address", err))?;
-        if let Err(err) = self
-            .wg
-            .as_mut()
-            .unwrap()
-            .add_address(link_index, plan.address)
-        {
-            if err.kind() == io::ErrorKind::AlreadyExists {
-                self.journal.entries[index].resources.pop();
+        for address in &plan.addresses {
+            self.journal.entries[index]
+                .resources
+                .push(OwnedResource::Address(WireGuardAddressResource {
+                    interface_index: link_index,
+                    address: *address,
+                }));
+            self.store
+                .save(&self.journal)
+                .map_err(|err| xray_stage("journal_address", err))?;
+            if let Err(err) = self.wg.as_mut().unwrap().add_address(link_index, *address) {
+                if err.kind() == io::ErrorKind::AlreadyExists {
+                    self.journal.entries[index].resources.pop();
+                }
+                return Err(xray_stage("address_add", err));
             }
-            return Err(xray_stage("address_add", err));
         }
         self.wg
             .as_mut()
@@ -7003,6 +7014,115 @@ mod xray_core_tests {
             Ok(())
         }
     }
+
+    #[derive(Clone)]
+    struct AddressTun {
+        events: Events,
+        addresses: Arc<Mutex<Vec<(u32, IpNet)>>>,
+        reject_second_on: Option<u32>,
+    }
+    impl AddressTun {
+        fn new(events: Events) -> Self {
+            Self {
+                events,
+                addresses: Arc::new(Mutex::new(Vec::new())),
+                reject_second_on: None,
+            }
+        }
+        fn list(&self) -> Vec<(u32, IpNet)> {
+            let mut addresses = self.addresses.lock().unwrap().clone();
+            addresses.sort_by_key(|(index, address)| (*index, address.to_string()));
+            addresses
+        }
+    }
+    impl WgSystem for AddressTun {
+        fn create_link(&mut self, _: &str, _: &str) -> io::Result<u32> {
+            unreachable!()
+        }
+        fn link_owned(&mut self, _: &str, _: u32, _: &str) -> io::Result<bool> {
+            unreachable!()
+        }
+        fn delete_link(&mut self, _: &str, _: u32, _: &str) -> io::Result<()> {
+            unreachable!()
+        }
+        fn add_address(&mut self, index: u32, address: IpNet) -> io::Result<()> {
+            let mut addresses = self.addresses.lock().unwrap();
+            if addresses.contains(&(index, address)) {
+                return Err(io::ErrorKind::AlreadyExists.into());
+            }
+            if self.reject_second_on == Some(index)
+                && addresses.iter().filter(|entry| entry.0 == index).count() == 1
+            {
+                return Err(io::Error::other("fake secondary address failure"));
+            }
+            addresses.push((index, address));
+            self.events.push(format!("address-add:{address}"));
+            Ok(())
+        }
+        fn remove_address(&mut self, index: u32, address: IpNet) -> io::Result<()> {
+            let mut addresses = self.addresses.lock().unwrap();
+            let Some(position) = addresses
+                .iter()
+                .position(|entry| *entry == (index, address))
+            else {
+                return Err(io::ErrorKind::NotFound.into());
+            };
+            addresses.remove(position);
+            self.events.push(format!("address-del:{address}"));
+            Ok(())
+        }
+        fn set_mtu(&mut self, _: u32, _: u32) -> io::Result<()> {
+            Ok(())
+        }
+        fn set_state(&mut self, _: u32, _: bool) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn journal_addresses(resources: &[OwnedResource]) -> Vec<(u32, IpNet)> {
+        let mut addresses = resources
+            .iter()
+            .filter_map(|resource| match resource {
+                OwnedResource::Address(address) => Some((address.interface_index, address.address)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        addresses.sort_by_key(|(index, address)| (*index, address.to_string()));
+        addresses
+    }
+
+    fn assert_dual_stack_addresses(addresses: &[(u32, IpNet)], index: u32) {
+        assert_eq!(
+            addresses.len(),
+            2,
+            "each captured family needs an owned address"
+        );
+        assert!(addresses.iter().all(|entry| entry.0 == index));
+        assert_eq!(
+            addresses
+                .iter()
+                .filter(|(_, address)| address.addr().is_ipv4())
+                .count(),
+            1
+        );
+        let ipv4 = addresses
+            .iter()
+            .find(|(_, address)| address.addr().is_ipv4())
+            .unwrap()
+            .1;
+        let ipv6 = addresses
+            .iter()
+            .find(|(_, address)| address.addr().is_ipv6())
+            .unwrap()
+            .1;
+        assert_eq!(ipv4.prefix_len(), 32);
+        assert!("198.18.0.0/15"
+            .parse::<IpNet>()
+            .unwrap()
+            .contains(&ipv4.addr()));
+        assert_eq!(ipv6.prefix_len(), 128);
+        assert!("fc00::/7".parse::<IpNet>().unwrap().contains(&ipv6.addr()));
+    }
     struct Process(Events);
     impl XrayProcessRunner for Process {
         fn verify_binary(&self) -> io::Result<()> {
@@ -7057,6 +7177,24 @@ mod xray_core_tests {
             service_checks: Vec::new(),
             proxy_exits: Vec::new(),
         }
+    }
+
+    fn dual_stack_params(full: bool) -> XrayConnectParams {
+        let mut input = params();
+        let destinations = if full {
+            ["0.0.0.0/0", "::/0"]
+        } else {
+            ["10.20.0.0/16", "2001:db8:20::/48"]
+        };
+        input.routes = destinations
+            .iter()
+            .map(|destination| PolicyRoute {
+                destination: destination.parse().unwrap(),
+                metric: 5,
+                via: None,
+            })
+            .collect();
+        input
     }
 
     struct Policy(Events);
@@ -7666,6 +7804,58 @@ mod xray_core_tests {
     }
 
     #[test]
+    fn ipv6_xray_endpoint_bypass_keeps_the_actual_underlay_and_host_prefix() {
+        for full in [false, true] {
+            let events = Events::default();
+            let dir = std::env::temp_dir().join(format!(
+                "netmgr-xray-ipv6-underlay-{full}-{}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let routes = GatewayRoutes::new(events.clone());
+            *routes.gateways.lock().unwrap() = vec![
+                ("192.0.2.1".parse().unwrap(), 3),
+                ("fd73::2".parse().unwrap(), 9),
+            ];
+            let mut core = DaemonCore::open_with_xray(
+                JournalStore::new(dir.join("state.json")),
+                Box::new(routes),
+                Box::new(Links),
+                Box::new(AddressTun::new(events.clone())),
+                Box::new(Flaky::new(events.clone())),
+            )
+            .unwrap();
+            core.policy = Some(Box::new(Policy(events)));
+            let mut input = params();
+            let mut config: serde_json::Value = serde_json::from_str(&input.config).unwrap();
+            config["outbounds"][0]["settings"]["vnext"][0]["address"] = json!("fd79::3");
+            input.config = config.to_string();
+            input.routes[0].destination = if full { "::/0" } else { "fd75::/64" }.parse().unwrap();
+            core.connect_xray(1000, input).unwrap();
+            let owned = core.owned(1000);
+            let bypass = owned[0]
+                .resources
+                .iter()
+                .filter_map(|resource| match resource {
+                    OwnedResource::Route(route)
+                        if route.destination == "fd79::3/128".parse::<IpNet>().unwrap() =>
+                    {
+                        Some(route)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(bypass.len(), 1);
+            assert_eq!(bypass[0].interface_index, 9);
+            assert_eq!(bypass[0].gateway, Some("fd73::2".parse().unwrap()));
+            assert_eq!(bypass[0].table, None);
+            core.disconnect_xray(1000, "home").unwrap();
+            assert!(core.owned(1000).is_empty());
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
     fn full_xray_bypasses_server_and_captured_dns_via_physical_gateway() {
         let events = Events::default();
         let dir = std::env::temp_dir().join(format!("netmgr-xray-bypass-{}", std::process::id()));
@@ -7830,6 +8020,493 @@ mod xray_core_tests {
         assert!(!events.iter().any(|e| e == "route-add:1.1.1.1/32"));
         core.disconnect_xray(1000, "home").unwrap();
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn dual_stack_xray_journals_both_families_and_disconnect_cleans_addresses() {
+        for (full, secondary) in [(false, false), (true, false), (false, true)] {
+            let events = Events::default();
+            let dir = std::env::temp_dir().join(format!(
+                "netmgr-xray-dual-addresses-{full}-{secondary}-{}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let tun = AddressTun::new(events.clone());
+            let mut core = DaemonCore::open_with_xray(
+                JournalStore::new(dir.join("state.json")),
+                Box::new(Routes(events.clone())),
+                Box::new(Links),
+                Box::new(tun.clone()),
+                Box::new(Flaky::new(events.clone())),
+            )
+            .unwrap();
+            core.policy = Some(Box::new(Policy(events)));
+            let mut input = dual_stack_params(full);
+            if secondary {
+                input.role = net_manager_core::models::TunnelRole::Secondary;
+            }
+            let status = core.connect_xray(1000, input).unwrap();
+            assert_eq!(status.ipv4_covered, full);
+            assert_eq!(status.ipv6_covered, full);
+            let owned = journal_addresses(&core.owned(1000)[0].resources);
+            assert_dual_stack_addresses(&owned, 42);
+            assert_eq!(tun.list(), owned);
+            let saved = JournalStore::new(dir.join("state.json")).load().unwrap();
+            assert_eq!(journal_addresses(&saved.entries[0].resources), owned);
+            core.disconnect_xray(1000, "home").unwrap();
+            assert!(tun.list().is_empty());
+            assert!(core.owned(1000).is_empty());
+            assert!(JournalStore::new(dir.join("state.json"))
+                .load()
+                .unwrap()
+                .entries
+                .is_empty());
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn dual_stack_xray_second_address_failure_rolls_back_first_and_process() {
+        let events = Events::default();
+        let dir =
+            std::env::temp_dir().join(format!("netmgr-xray-ipv6-fail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut tun = AddressTun::new(events.clone());
+        tun.reject_second_on = Some(42);
+        let mut core = DaemonCore::open_with_xray(
+            JournalStore::new(dir.join("state.json")),
+            Box::new(Routes(events.clone())),
+            Box::new(Links),
+            Box::new(tun.clone()),
+            Box::new(Flaky::new(events.clone())),
+        )
+        .unwrap();
+        let error = core
+            .connect_xray(1000, dual_stack_params(false))
+            .unwrap_err();
+        assert_eq!(error.to_string(), "Xray address_add failed");
+        assert!(tun.list().is_empty());
+        assert!(core.owned(1000).is_empty());
+        let logged = events.list();
+        assert!(logged.iter().any(|event| event.starts_with("address-add:")));
+        assert!(logged.iter().any(|event| event.starts_with("address-del:")));
+        assert!(!logged.iter().any(|event| event.starts_with("route-add:")));
+        assert!(logged.iter().any(|event| event == "stop"));
+        assert!(JournalStore::new(dir.join("state.json"))
+            .load()
+            .unwrap()
+            .entries
+            .is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn dual_stack_xray_route_failure_rolls_back_both_address_families() {
+        let events = Events::default();
+        let dir =
+            std::env::temp_dir().join(format!("netmgr-xray-dual-rollback-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tun = AddressTun::new(events.clone());
+        let mut core = DaemonCore::open_with_xray(
+            JournalStore::new(dir.join("state.json")),
+            Box::new(RejectRoutes(events.clone())),
+            Box::new(Links),
+            Box::new(tun.clone()),
+            Box::new(Flaky::new(events.clone())),
+        )
+        .unwrap();
+        let error = core
+            .connect_xray(1000, dual_stack_params(false))
+            .unwrap_err();
+        assert_eq!(error.to_string(), "Xray route_add failed");
+        assert!(tun.list().is_empty());
+        assert!(core.owned(1000).is_empty());
+        let removed = events
+            .list()
+            .iter()
+            .filter_map(|event| {
+                event
+                    .strip_prefix("address-del:")
+                    .map(|address| (42, address.parse().unwrap()))
+            })
+            .collect::<Vec<_>>();
+        assert_dual_stack_addresses(&removed, 42);
+        assert!(JournalStore::new(dir.join("state.json"))
+            .load()
+            .unwrap()
+            .entries
+            .is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn dual_stack_xray_respawn_rebinds_both_address_families() {
+        let events = Events::default();
+        let dir =
+            std::env::temp_dir().join(format!("netmgr-xray-dual-respawn-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tun = AddressTun::new(events.clone());
+        let runner = Flaky::new(events.clone());
+        let state = runner.handle();
+        let mut core = DaemonCore::open_with_xray(
+            JournalStore::new(dir.join("state.json")),
+            Box::new(Routes(events)),
+            Box::new(Links),
+            Box::new(tun.clone()),
+            Box::new(runner),
+        )
+        .unwrap();
+        core.connect_xray(1000, dual_stack_params(false)).unwrap();
+        // A dead child loses its link and all addresses before respawn.
+        tun.addresses
+            .lock()
+            .unwrap()
+            .retain(|(index, _)| *index != 42);
+        state.lock().unwrap().0 = true;
+        core.reconcile_network(&[]);
+        assert_eq!(core.xray_status(1000, "home").state, TunnelState::Running);
+        let owned = journal_addresses(&core.owned(1000)[0].resources);
+        assert_dual_stack_addresses(&owned, 43);
+        assert_eq!(tun.list(), owned);
+        let saved = JournalStore::new(dir.join("state.json")).load().unwrap();
+        assert_eq!(journal_addresses(&saved.entries[0].resources), owned);
+        core.disconnect_xray(1000, "home").unwrap();
+        assert!(tun.list().is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn dual_stack_xray_respawn_second_address_failure_cleans_half_rebound_link() {
+        let events = Events::default();
+        let dir = std::env::temp_dir().join(format!(
+            "netmgr-xray-dual-rebind-fail-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut tun = AddressTun::new(events.clone());
+        tun.reject_second_on = Some(43);
+        let runner = Flaky::new(events.clone());
+        let state = runner.handle();
+        let mut core = DaemonCore::open_with_xray(
+            JournalStore::new(dir.join("state.json")),
+            Box::new(Routes(events.clone())),
+            Box::new(Links),
+            Box::new(tun.clone()),
+            Box::new(runner),
+        )
+        .unwrap();
+        core.connect_xray(1000, dual_stack_params(false)).unwrap();
+        tun.addresses.lock().unwrap().clear();
+        state.lock().unwrap().0 = true;
+        core.reconcile_network(&[]);
+        assert_eq!(core.xray_status(1000, "home").state, TunnelState::Failed);
+        assert!(tun.list().is_empty());
+        assert!(core.owned(1000).is_empty());
+        assert!(events.list().iter().any(|event| event == "stop"));
+        assert!(JournalStore::new(dir.join("state.json"))
+            .load()
+            .unwrap()
+            .entries
+            .is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn dual_stack_xray_split_defaults_install_both_family_policy_routes_and_rules() {
+        let events = Events::default();
+        let dir =
+            std::env::temp_dir().join(format!("netmgr-xray-four-halves-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tun = AddressTun::new(events.clone());
+        let mut core = DaemonCore::open_with_xray(
+            JournalStore::new(dir.join("state.json")),
+            Box::new(GatewayRoutes::new(events.clone())),
+            Box::new(Links),
+            Box::new(tun.clone()),
+            Box::new(Flaky::new(events.clone())),
+        )
+        .unwrap();
+        core.policy = Some(Box::new(Policy(events)));
+        let destinations = ["0.0.0.0/1", "128.0.0.0/1", "::/1", "8000::/1"];
+        let mut input = dual_stack_params(true);
+        input.routes = destinations
+            .iter()
+            .map(|destination| PolicyRoute {
+                destination: destination.parse().unwrap(),
+                metric: 5,
+                via: None,
+            })
+            .collect();
+        let status = core.connect_xray(1000, input).unwrap();
+        assert!(status.ipv4_covered && status.ipv6_covered);
+        let owned = core.owned(1000);
+        let resources = &owned[0].resources;
+        assert_dual_stack_addresses(&journal_addresses(resources), 42);
+        let full = resources
+            .iter()
+            .find_map(|resource| match resource {
+                OwnedResource::XrayProcess(process) => process.full.as_ref(),
+                _ => None,
+            })
+            .unwrap();
+        assert!(full.ipv4 && full.ipv6);
+        let routes = resources
+            .iter()
+            .filter_map(|resource| match resource {
+                OwnedResource::Route(route) if route.interface_index == 42 => Some(route),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(routes.len(), destinations.len());
+        for destination in destinations {
+            let route = routes
+                .iter()
+                .find(|route| route.destination == destination.parse::<IpNet>().unwrap())
+                .unwrap();
+            assert_eq!(route.table, Some(full.table));
+            assert_eq!(route.metric, 5);
+            assert_eq!(route.gateway, None);
+        }
+        let rules = resources
+            .iter()
+            .filter_map(|resource| match resource {
+                OwnedResource::Rule(rule) => Some(rule),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rules.len(), 4);
+        for family in [IpFamily::Ipv4, IpFamily::Ipv6] {
+            let family_rules = rules
+                .iter()
+                .filter(|rule| rule.family == family)
+                .collect::<Vec<_>>();
+            assert_eq!(family_rules.len(), 2);
+            assert!(family_rules.iter().any(|rule| rule.table == 254
+                && rule.suppress_prefix_length == Some(0)
+                && rule.fwmark.is_none()
+                && !rule.invert));
+            assert!(family_rules.iter().any(|rule| rule.table == full.table
+                && rule.fwmark == Some(full.fwmark)
+                && rule.invert
+                && rule.suppress_prefix_length.is_none()));
+        }
+        core.disconnect_xray(1000, "home").unwrap();
+        assert!(tun.list().is_empty());
+        assert!(core.owned(1000).is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn dual_stack_xray_reload_accepts_reordered_address_set() {
+        let events = Events::default();
+        let dir =
+            std::env::temp_dir().join(format!("netmgr-xray-dual-reload-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tun = AddressTun::new(events.clone());
+        let mut core = DaemonCore::open_with_xray(
+            JournalStore::new(dir.join("state.json")),
+            Box::new(GatewayRoutes::new(events.clone())),
+            Box::new(Links),
+            Box::new(tun.clone()),
+            Box::new(Flaky::new(events)),
+        )
+        .unwrap();
+        core.connect_xray(1000, dual_stack_params(false)).unwrap();
+        let before = journal_addresses(&core.owned(1000)[0].resources);
+        let positions = core.journal.entries[0]
+            .resources
+            .iter()
+            .enumerate()
+            .filter_map(|(index, resource)| {
+                matches!(resource, OwnedResource::Address(_)).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(positions.len(), 2);
+        core.journal.entries[0]
+            .resources
+            .swap(positions[0], positions[1]);
+        // Reload replaces the child/link, so only the re-applied addresses remain.
+        tun.addresses.lock().unwrap().clear();
+        let status = core.reload_xray(1000, dual_stack_params(false)).unwrap();
+        assert_eq!(status.state, TunnelState::Running);
+        let after = journal_addresses(&core.owned(1000)[0].resources);
+        assert_dual_stack_addresses(&after, 43);
+        assert_eq!(
+            after.iter().map(|entry| entry.1).collect::<Vec<_>>(),
+            before.iter().map(|entry| entry.1).collect::<Vec<_>>()
+        );
+        assert_eq!(tun.list(), after);
+        core.disconnect_xray(1000, "home").unwrap();
+        assert!(tun.list().is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn dual_stack_xray_reload_second_address_failure_cleans_half_rebound_link() {
+        let events = Events::default();
+        let dir = std::env::temp_dir().join(format!(
+            "netmgr-xray-dual-reload-fail-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut tun = AddressTun::new(events.clone());
+        tun.reject_second_on = Some(43);
+        let mut core = DaemonCore::open_with_xray(
+            JournalStore::new(dir.join("state.json")),
+            Box::new(GatewayRoutes::new(events.clone())),
+            Box::new(Links),
+            Box::new(tun.clone()),
+            Box::new(Flaky::new(events.clone())),
+        )
+        .unwrap();
+        core.connect_xray(1000, dual_stack_params(false)).unwrap();
+        tun.addresses.lock().unwrap().clear();
+        let error = core
+            .reload_xray(1000, dual_stack_params(false))
+            .unwrap_err();
+        assert_eq!(error.to_string(), "Xray rebind failed");
+        assert_eq!(core.xray_status(1000, "home").state, TunnelState::Failed);
+        assert!(tun.list().is_empty());
+        assert!(core.owned(1000).is_empty());
+        assert!(events.list().iter().any(|event| event == "stop"));
+        assert!(JournalStore::new(dir.join("state.json"))
+            .load()
+            .unwrap()
+            .entries
+            .is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn dual_stack_xray_startup_recovery_removes_each_journaled_address() {
+        for state in [OwnedState::Applying, OwnedState::Applied, OwnedState::Stale] {
+            let events = Events::default();
+            let dir = std::env::temp_dir()
+                .join(format!("netmgr-xray-dual-recovery-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let tun = AddressTun::new(events.clone());
+            let expected = [
+                (42, "198.18.0.1/32".parse::<IpNet>().unwrap()),
+                (42, "fd20::1/128".parse::<IpNet>().unwrap()),
+            ];
+            let foreign = (7, "fd99::99/128".parse::<IpNet>().unwrap());
+            tun.addresses
+                .lock()
+                .unwrap()
+                .extend(expected.iter().copied());
+            tun.addresses.lock().unwrap().push(foreign);
+            let mut resources = vec![OwnedResource::XrayProcess(XrayProcessResource {
+                name: "xray-123abc".into(),
+                index: 42,
+                owner_marker: "network-orchestrator:1000:xray:home".into(),
+                transport_mark: 51820,
+                full: None,
+                failover: None,
+                reject_quic: false,
+                probe_url: None,
+                pinned_keys: Vec::new(),
+                mtu: None,
+                proxy_exits: Vec::new(),
+            })];
+            resources.extend(expected.iter().map(|(index, address)| {
+                OwnedResource::Address(WireGuardAddressResource {
+                    interface_index: *index,
+                    address: *address,
+                })
+            }));
+            let store = JournalStore::new(dir.join("state.json"));
+            store
+                .save(&JournalDocument {
+                    version: net_manager_core::journal::JOURNAL_VERSION,
+                    entries: vec![JournalEntry {
+                        uid: 1000,
+                        owner: "xray:home".into(),
+                        state,
+                        resources,
+                    }],
+                })
+                .unwrap();
+            let runner = Flaky::new(events.clone());
+            *runner.handle().lock().unwrap() = (false, 42);
+            let core = DaemonCore::open_with_xray(
+                store,
+                Box::new(Routes(events.clone())),
+                Box::new(Links),
+                Box::new(tun.clone()),
+                Box::new(runner),
+            )
+            .unwrap();
+            assert!(core.owned(1000).is_empty());
+            assert_eq!(tun.list(), vec![foreign]);
+            let removed = events
+                .list()
+                .iter()
+                .filter_map(|event| {
+                    event
+                        .strip_prefix("address-del:")
+                        .map(|address| (42, address.parse().unwrap()))
+                })
+                .collect::<Vec<_>>();
+            assert_dual_stack_addresses(&removed, 42);
+            assert!(events.list().iter().any(|event| event == "stop"));
+            assert!(JournalStore::new(dir.join("state.json"))
+                .load()
+                .unwrap()
+                .entries
+                .is_empty());
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn scoped_xray_owns_only_the_requested_address_family() {
+        for (ipv6, secondary) in [(false, false), (true, false), (true, true)] {
+            let events = Events::default();
+            let dir = std::env::temp_dir().join(format!(
+                "netmgr-xray-scoped-address-{ipv6}-{secondary}-{}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let tun = AddressTun::new(events.clone());
+            let mut core = DaemonCore::open_with_xray(
+                JournalStore::new(dir.join("state.json")),
+                Box::new(Routes(events.clone())),
+                Box::new(Links),
+                Box::new(tun.clone()),
+                Box::new(Flaky::new(events)),
+            )
+            .unwrap();
+            let mut input = params();
+            if ipv6 {
+                input.routes[0].destination = "2001:db8:20::/48".parse().unwrap();
+            }
+            if secondary {
+                input.role = net_manager_core::models::TunnelRole::Secondary;
+            }
+            let status = core.connect_xray(1000, input).unwrap();
+            assert!(!status.ipv4_covered && !status.ipv6_covered);
+            let owned = core.owned(1000);
+            let addresses = journal_addresses(&owned[0].resources);
+            assert_eq!(addresses.len(), 1);
+            assert_eq!(addresses[0].0, 42);
+            assert_eq!(addresses[0].1.addr().is_ipv6(), ipv6);
+            assert_eq!(addresses[0].1.prefix_len(), if ipv6 { 128 } else { 32 });
+            let pool = if ipv6 { "fc00::/7" } else { "198.18.0.0/15" };
+            assert!(pool
+                .parse::<IpNet>()
+                .unwrap()
+                .contains(&addresses[0].1.addr()));
+            assert_eq!(tun.list(), addresses);
+            assert!(!owned[0]
+                .resources
+                .iter()
+                .any(|resource| matches!(resource, OwnedResource::Rule(_))));
+            let saved = JournalStore::new(dir.join("state.json")).load().unwrap();
+            assert_eq!(journal_addresses(&saved.entries[0].resources), addresses);
+            core.disconnect_xray(1000, "home").unwrap();
+            assert!(tun.list().is_empty());
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     #[test]
@@ -8838,7 +9515,8 @@ mod tests {
         .unwrap();
         let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
         let config = format!("[Interface]\nPrivateKey={key}\nAddress=10.77.0.2/32\n[Peer]\nPublicKey={key}\nEndpoint=198.18.0.1:51820\nAllowedIPs=0.0.0.0/0\n");
-        let plan = crate::wireguard::parse_wireguard_config(&config, &[]).unwrap();
+        let plan =
+            net_manager_core::wireguard_config::parse_wireguard_config(&config, &[]).unwrap();
         let status = core.connect_wireguard(1000, "home", plan).unwrap();
         assert_eq!(status.state, TunnelState::Running);
         assert_eq!(status.warnings, vec![WireGuardWarning::Ipv6NotCovered]);
@@ -8867,7 +9545,8 @@ mod tests {
             .iter()
             .any(|event| event == "verify:51820"));
         let before_second_connect = events.lock().unwrap().len();
-        let second_plan = crate::wireguard::parse_wireguard_config(&config, &[]).unwrap();
+        let second_plan =
+            net_manager_core::wireguard_config::parse_wireguard_config(&config, &[]).unwrap();
         assert_eq!(
             core.connect_wireguard(1001, "other", second_plan)
                 .unwrap_err()
@@ -8913,7 +9592,8 @@ mod tests {
         .unwrap();
         let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
         let config = format!("[Interface]\nPrivateKey={key}\nAddress=10.77.0.2/32, fd77::2/128\n[Peer]\nPublicKey={key}\nEndpoint=198.18.0.1:51820\nAllowedIPs=0.0.0.0/0, ::/0\n");
-        let plan = crate::wireguard::parse_wireguard_config(&config, &[]).unwrap();
+        let plan =
+            net_manager_core::wireguard_config::parse_wireguard_config(&config, &[]).unwrap();
         let status = core.connect_wireguard(1000, "home", plan).unwrap();
         assert!(!status.warnings.contains(&WireGuardWarning::Ipv6NotCovered));
         let rules = rules.lock().unwrap();
@@ -8976,7 +9656,8 @@ mod tests {
         .unwrap();
         let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
         let config = format!("[Interface]\nPrivateKey={key}\nAddress=10.77.0.2/32\n[Peer]\nPublicKey={key}\nEndpoint=198.18.0.1:51820\nAllowedIPs=0.0.0.0/0\n");
-        let plan = crate::wireguard::parse_wireguard_config(&config, &[]).unwrap();
+        let plan =
+            net_manager_core::wireguard_config::parse_wireguard_config(&config, &[]).unwrap();
         core.connect_wireguard(1000, "home", plan).unwrap();
         let full = core.owned(1000)[0]
             .resources
@@ -9122,7 +9803,8 @@ mod tests {
         .unwrap();
         let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
         let config = format!("[Interface]\nPrivateKey={key}\nAddress=10.77.0.2/32\nDNS=10.77.0.1\n[Peer]\nPublicKey={key}\nEndpoint=198.18.0.1:51820\nAllowedIPs=0.0.0.0/0\n");
-        let plan = crate::wireguard::parse_wireguard_config(&config, &[]).unwrap();
+        let plan =
+            net_manager_core::wireguard_config::parse_wireguard_config(&config, &[]).unwrap();
         let status = core.connect_wireguard(1000, "home", plan).unwrap();
         assert!(status.dns_applied);
         assert!(
@@ -9174,7 +9856,8 @@ mod tests {
         .unwrap();
         let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
         let config = format!("[Interface]\nPrivateKey={key}\nAddress=10.77.0.2/32\nDNS=10.77.0.1\n[Peer]\nPublicKey={key}\nEndpoint=192.0.2.1:51820\nAllowedIPs=10.77.0.0/24\n");
-        let plan = crate::wireguard::parse_wireguard_config(&config, &[]).unwrap();
+        let plan =
+            net_manager_core::wireguard_config::parse_wireguard_config(&config, &[]).unwrap();
         let status = core.connect_wireguard(1000, "home", plan).unwrap();
         assert!(!status.dns_applied);
         assert_eq!(status.warnings, vec![WireGuardWarning::DnsNotApplied]);
@@ -9243,7 +9926,8 @@ mod tests {
         .unwrap();
         let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
         let config = format!("[Interface]\nPrivateKey={key}\nAddress=10.77.0.2/32\nDNS=10.77.0.1\n[Peer]\nPublicKey={key}\nEndpoint=198.18.0.1:51820\nAllowedIPs=0.0.0.0/0\n");
-        let plan = crate::wireguard::parse_wireguard_config(&config, &[]).unwrap();
+        let plan =
+            net_manager_core::wireguard_config::parse_wireguard_config(&config, &[]).unwrap();
         assert!(
             core.connect_wireguard(1000, "home", plan)
                 .unwrap()
@@ -9295,7 +9979,8 @@ mod tests {
         .unwrap();
         let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
         let config = format!("[Interface]\nPrivateKey={key}\nAddress=10.77.0.2/32\nDNS=10.77.0.1\n[Peer]\nPublicKey={key}\nEndpoint=198.18.0.1:51820\nAllowedIPs=0.0.0.0/0\n");
-        let plan = crate::wireguard::parse_wireguard_config(&config, &[]).unwrap();
+        let plan =
+            net_manager_core::wireguard_config::parse_wireguard_config(&config, &[]).unwrap();
         let unavailable = core.connect_wireguard(1000, "home", plan).unwrap();
         assert_eq!(unavailable.state, TunnelState::Running);
         assert!(!unavailable.dns_applied);
@@ -9347,7 +10032,8 @@ mod tests {
         .unwrap();
         let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
         let config = format!("[Interface]\nPrivateKey={key}\nAddress=10.77.0.2/32\nPostUp=echo SECRET-HOOK\n[Peer]\nPublicKey={key}\nEndpoint=192.0.2.1:51820\nAllowedIPs=10.77.0.0/24\n");
-        let plan = crate::wireguard::parse_wireguard_config(&config, &[]).unwrap();
+        let plan =
+            net_manager_core::wireguard_config::parse_wireguard_config(&config, &[]).unwrap();
         let status = core.connect_wireguard(1000, "home", plan).unwrap();
         assert_eq!(status.state, net_manager_core::models::TunnelState::Running);
         assert_eq!(
@@ -9410,7 +10096,8 @@ mod tests {
             )
             .unwrap();
             let config = format!("[Interface]\nPrivateKey={key}\nAddress={address}\n[Peer]\nPublicKey={key}\nEndpoint=vpn.example.test:51820\nAllowedIPs={allowed}\n");
-            let plan = crate::wireguard::parse_wireguard_config(&config, &[]).unwrap();
+            let plan =
+                net_manager_core::wireguard_config::parse_wireguard_config(&config, &[]).unwrap();
             let result = core.connect_wireguard(1000, "home", plan);
             if rejected {
                 let error = result.unwrap_err();
@@ -9461,7 +10148,8 @@ mod tests {
         .unwrap();
         let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
         let config = format!("[Interface]\nPrivateKey={key}\nAddress=10.77.0.2/32\n[Peer]\nPublicKey={key}\nEndpoint=198.18.0.1:51820\nAllowedIPs=0.0.0.0/1, 128.0.0.0/1\n");
-        let plan = crate::wireguard::parse_wireguard_config(&config, &[]).unwrap();
+        let plan =
+            net_manager_core::wireguard_config::parse_wireguard_config(&config, &[]).unwrap();
         core.connect_wireguard(1000, "home", plan).unwrap();
         let routes: Vec<_> = core.owned(1000)[0]
             .resources
@@ -9505,7 +10193,8 @@ mod tests {
             }),
         )
         .unwrap();
-        let plan = crate::wireguard::parse_wireguard_config(&config, &[]).unwrap();
+        let plan =
+            net_manager_core::wireguard_config::parse_wireguard_config(&config, &[]).unwrap();
         core.connect_wireguard(1000, "home", plan).unwrap();
         assert!(core.disconnect_wireguard(1000, "home").is_err());
         assert_eq!(
@@ -9620,7 +10309,8 @@ mod tests {
         .unwrap();
         let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
         let config = format!("[Interface]\nPrivateKey={key}\nAddress=10.77.0.2/32\n[Peer]\nPublicKey={key}\nEndpoint=198.18.0.1:51820\nAllowedIPs=0.0.0.0/0\n");
-        let plan = crate::wireguard::parse_wireguard_config(&config, &[]).unwrap();
+        let plan =
+            net_manager_core::wireguard_config::parse_wireguard_config(&config, &[]).unwrap();
         core.connect_wireguard(1000, "home", plan).unwrap();
         FullWgFixture {
             dir,
@@ -9784,7 +10474,8 @@ mod tests {
         core.clock = Box::new(move || clock.load(Ordering::SeqCst));
         let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
         let config = format!("[Interface]\nPrivateKey={key}\nAddress=10.77.0.2/32\n[Peer]\nPublicKey={key}\nEndpoint=192.0.2.1:51820\nAllowedIPs=10.77.0.0/24\n");
-        let plan = crate::wireguard::parse_wireguard_config(&config, &[]).unwrap();
+        let plan =
+            net_manager_core::wireguard_config::parse_wireguard_config(&config, &[]).unwrap();
         let state_at = |core: &mut DaemonCore, at: u64| {
             now.store(at, Ordering::SeqCst);
             core.wireguard_status(1000, "home").state
@@ -9881,7 +10572,8 @@ mod tests {
         .unwrap();
         let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
         let config = format!("[Interface]\nPrivateKey={key}\nAddress=10.77.0.2/32\n[Peer]\nPublicKey={key}\nEndpoint=192.0.2.1:51820\nAllowedIPs=10.77.0.0/24\n");
-        let plan = crate::wireguard::parse_wireguard_config(&config, &[]).unwrap();
+        let plan =
+            net_manager_core::wireguard_config::parse_wireguard_config(&config, &[]).unwrap();
         let error = core.connect_wireguard(1000, "home", plan).unwrap_err();
         assert!(!error.to_string().contains(key));
         assert!(core.owned(1000).is_empty());
@@ -9947,7 +10639,8 @@ mod tests {
         .unwrap();
         let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
         let config = format!("[Interface]\nPrivateKey={key}\nAddress=10.77.0.2/32\n[Peer]\nPublicKey={key}\nEndpoint=192.0.2.1:51820\nAllowedIPs=10.77.0.0/24\n");
-        let plan = crate::wireguard::parse_wireguard_config(&config, &[]).unwrap();
+        let plan =
+            net_manager_core::wireguard_config::parse_wireguard_config(&config, &[]).unwrap();
         assert!(core.connect_wireguard(1000, "home", plan).is_err());
         assert_eq!(
             JournalStore::new(&journal_path).load().unwrap().entries[0].state,
@@ -9972,7 +10665,8 @@ mod tests {
         .unwrap();
         let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
         let config = format!("[Interface]\nPrivateKey={key}\nAddress=10.77.0.2/32\n[Peer]\nPublicKey={key}\nEndpoint=192.0.2.1:51820\nAllowedIPs=10.77.0.0/24\n");
-        let plan = crate::wireguard::parse_wireguard_config(&config, &[]).unwrap();
+        let plan =
+            net_manager_core::wireguard_config::parse_wireguard_config(&config, &[]).unwrap();
         assert!(core.connect_wireguard(1000, "home", plan).is_err());
         assert_eq!(
             JournalStore::new(&journal_path).load().unwrap().entries[0].state,
@@ -10026,7 +10720,8 @@ mod tests {
         .unwrap();
         let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
         let config = format!("[Interface]\nPrivateKey={key}\nAddress=10.77.0.2/32\n[Peer]\nPublicKey={key}\nEndpoint=192.0.2.1:51820\nAllowedIPs=10.77.0.0/24\n");
-        let plan = crate::wireguard::parse_wireguard_config(&config, &[]).unwrap();
+        let plan =
+            net_manager_core::wireguard_config::parse_wireguard_config(&config, &[]).unwrap();
         assert_eq!(
             core.connect_wireguard(1000, "home", plan)
                 .unwrap_err()
@@ -10388,7 +11083,8 @@ mod tests {
         .unwrap();
         let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
         let config = format!("[Interface]\nPrivateKey={key}\nAddress=10.77.0.2/32\n[Peer]\nPublicKey={key}\nEndpoint=192.0.2.1:51820\nAllowedIPs=10.77.0.0/24\n");
-        let mut plan = crate::wireguard::parse_wireguard_config(&config, &[]).unwrap();
+        let mut plan =
+            net_manager_core::wireguard_config::parse_wireguard_config(&config, &[]).unwrap();
         plan.interface_name = Some("wg-kzn2".into());
         let status = core.connect_wireguard(1000, "home", plan).unwrap();
         let name = status.interface_name.expect("interface name");
@@ -10424,7 +11120,8 @@ mod tests {
         .unwrap();
         let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
         let config = format!("[Interface]\nPrivateKey={key}\nAddress=10.77.0.2/32\n[Peer]\nPublicKey={key}\nEndpoint=192.0.2.1:51820\nAllowedIPs=10.77.0.0/24\n");
-        let mut plan = crate::wireguard::parse_wireguard_config(&config, &[]).unwrap();
+        let mut plan =
+            net_manager_core::wireguard_config::parse_wireguard_config(&config, &[]).unwrap();
         plan.interface_name = Some("wg-kzn2".into());
         let status = core.connect_wireguard(1000, "home", plan).unwrap();
         assert_eq!(status.interface_name.as_deref(), Some("wg-kzn2"));

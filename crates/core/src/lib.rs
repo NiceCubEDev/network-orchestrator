@@ -46,5 +46,6 @@ pub mod subscription;
 pub mod system_proxy;
 pub mod vpn;
 pub mod windows_job;
+pub mod wireguard_config;
 pub mod xray;
 pub mod xray_migrate;

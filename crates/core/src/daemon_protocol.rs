@@ -142,6 +142,14 @@ pub mod method {
     ];
 }
 
+/// Non-method promises carried in `hello.capabilities`. Unknown entries remain
+/// readable by older clients; only the implementing daemon advertises them.
+pub mod feature {
+    /// Linux Xray TUN owns both families' link addresses, routes and DNS.
+    /// Not part of the shared method list or the macOS helper's capabilities.
+    pub const XRAY_TUN_IPV6: &str = "xray.tun.ipv6";
+}
+
 /// Tool names reported in `HelloResult::tools`. A `false` value means the
 /// daemon cannot use the required system binary right now; a missing key
 /// (older daemon) means "unknown", not "missing" — callers must treat it
@@ -318,6 +326,7 @@ pub struct HelloResult {
     pub protocol: u32,
     pub daemon_version: String,
     pub uid: u32,
+    /// Implemented method names and explicit `feature::*` promises.
     pub capabilities: Vec<String>,
     /// Whether each `tool::*` system binary is present and safe for the
     /// daemon to execute. Absent entirely on daemons older than this
@@ -1947,6 +1956,21 @@ mod tests {
             r#"{"id":1,"ok":false,"error":{"code":"protocolMismatch","message":"daemon speaks protocol 1, client 2"}}"#,
         );
         assert_eq!(error.code, ErrorCode::ProtocolMismatch);
+    }
+
+    #[test]
+    fn hello_feature_promises_remain_string_list_compatible() {
+        let hello: HelloResult = serde_json::from_str(
+            r#"{"protocol":1,"daemonVersion":"new","uid":1000,"capabilities":["xray.connect","xray.tun.ipv6","future.feature"]}"#,
+        )
+        .unwrap();
+        assert_eq!(hello.protocol, PROTOCOL_VERSION);
+        assert_eq!(hello.capabilities[1], feature::XRAY_TUN_IPV6);
+        assert_eq!(hello.capabilities[2], "future.feature");
+        assert!(hello.tools.is_empty());
+        let encoded = serde_json::to_value(&hello).unwrap();
+        assert_eq!(encoded["capabilities"][1], "xray.tun.ipv6");
+        assert_eq!(encoded["capabilities"][2], "future.feature");
     }
 
     #[test]

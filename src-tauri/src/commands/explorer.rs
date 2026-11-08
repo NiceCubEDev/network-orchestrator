@@ -1,14 +1,21 @@
+#[cfg(not(target_os = "linux"))]
 use net_manager_core::explorer;
 use net_manager_core::models::*;
 use std::net::IpAddr;
 
 #[tauri::command]
 pub(crate) async fn get_interfaces() -> Result<Vec<NetworkInterface>, String> {
+    #[cfg(target_os = "linux")]
+    return net_manager_engine::linux_network::interfaces();
+    #[cfg(not(target_os = "linux"))]
     explorer::list_interfaces().map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub(crate) async fn get_routes() -> Result<Vec<RouteEntry>, String> {
+    #[cfg(target_os = "linux")]
+    return net_manager_engine::linux_network::routes().await;
+    #[cfg(not(target_os = "linux"))]
     explorer::list_routes().await.map_err(|e| e.to_string())
 }
 
@@ -17,6 +24,9 @@ pub(crate) async fn lookup_destination(dest: String) -> Result<RouteLookupResult
     let ip: IpAddr = dest
         .parse()
         .map_err(|e: std::net::AddrParseError| e.to_string())?;
+    #[cfg(target_os = "linux")]
+    return net_manager_engine::linux_network::lookup(ip).await;
+    #[cfg(not(target_os = "linux"))]
     explorer::lookup_route(ip).await.map_err(|e| e.to_string())
 }
 
@@ -24,13 +34,11 @@ pub(crate) async fn lookup_destination(dest: String) -> Result<RouteLookupResult
 pub(crate) async fn set_interface_state(name: String, up: bool) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
-        use net_manager_core::daemon_protocol::{method, LinkSetStateParams};
-        let client = crate::daemon_client::DaemonClient::system();
-        let _: serde_json::Value = client
-            .request(method::LINK_SET_STATE, LinkSetStateParams { name, up })
-            .await
-            .map_err(|e| crate::daemon_client::user_message(&e))?;
-        Ok(())
+        net_manager_engine::linux_network::set_interface_state(
+            &net_manager_engine::linux_engine::LinuxEngine::new("netmanager-gui"),
+            &name,
+            up,
+        )
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -45,16 +53,10 @@ pub(crate) async fn set_interface_state(name: String, up: bool) -> Result<(), St
 pub(crate) async fn stop_external_tunnel(name: String) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
-        use net_manager_core::daemon_protocol::{method, ExternalTunnelStopParams};
-        let client = crate::daemon_client::DaemonClient::system();
-        let _: serde_json::Value = client
-            .request(
-                method::EXTERNAL_TUNNEL_STOP,
-                ExternalTunnelStopParams { name },
-            )
-            .await
-            .map_err(|e| crate::daemon_client::user_message(&e))?;
-        Ok(())
+        net_manager_engine::linux_network::stop_external_tunnel(
+            &net_manager_engine::linux_engine::LinuxEngine::new("netmanager-gui"),
+            &name,
+        )
     }
     #[cfg(not(target_os = "linux"))]
     {

@@ -1,10 +1,10 @@
 //! Pure validation and planning for a Linux WireGuard client connection.
 //! No filesystem, subprocess or network access happens here.
 
-use crate::validate::full_coverage;
+use crate::connect_plan::full_coverage;
+use crate::models::PolicyRoute;
 use base64::Engine;
 use ipnet::IpNet;
-use net_manager_core::models::PolicyRoute;
 use std::collections::HashSet;
 use std::fmt;
 use std::net::IpAddr;
@@ -506,7 +506,7 @@ fn contains_net(outer: &IpNet, inner: &IpNet) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use net_manager_core::models::PolicyRoute;
+    use crate::models::PolicyRoute;
 
     const KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
 

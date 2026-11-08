@@ -4,12 +4,20 @@
 use super::commands::Output;
 use super::ctx::Ctx;
 use super::library::require_user;
+#[cfg(not(target_os = "linux"))]
 use net_manager_core::config_vault::SubscriptionEndpoint;
-use net_manager_core::models::{DomainRouteTarget, Profile, TunnelBackend, TunnelState};
+#[cfg(not(target_os = "linux"))]
+use net_manager_core::models::TunnelState;
+use net_manager_core::models::{DomainRouteTarget, Profile, TunnelBackend};
+#[cfg(not(target_os = "linux"))]
 use net_manager_core::subscription;
-use net_manager_core::xray_migrate::{self, XrayPolicyMigration};
+#[cfg(not(target_os = "linux"))]
+use net_manager_core::xray_migrate;
+use net_manager_core::xray_migrate::XrayPolicyMigration;
+#[cfg(not(target_os = "linux"))]
 use net_manager_engine::linux_engine::LinuxEngine;
 use serde_json::{json, Value};
+#[cfg(not(target_os = "linux"))]
 use std::io::Read;
 use std::path::Path;
 
@@ -29,6 +37,7 @@ fn xray_profile(ctx: &Ctx, query: &str) -> Result<Profile, String> {
     Ok(profile)
 }
 
+#[cfg(not(target_os = "linux"))]
 fn read_source(path: &Path) -> Result<Value, String> {
     const LIMIT: u64 = 512 * 1024;
     let mut body = Vec::new();
@@ -42,6 +51,7 @@ fn read_source(path: &Path) -> Result<Value, String> {
         .map_err(|_| "The selected file is not a JSON Xray configuration".to_string())
 }
 
+#[cfg(not(target_os = "linux"))]
 fn source_endpoints(ctx: &Ctx, profile: &Profile) -> Result<Vec<SubscriptionEndpoint>, String> {
     if profile.subscription.is_none() {
         return Ok(Vec::new());
@@ -51,6 +61,7 @@ fn source_endpoints(ctx: &Ctx, profile: &Profile) -> Result<Vec<SubscriptionEndp
         .map_err(|_| "The subscription endpoint vault could not be read".to_string())
 }
 
+#[cfg(not(target_os = "linux"))]
 fn primary_key(profile: &Profile, endpoints: &[SubscriptionEndpoint]) -> Option<String> {
     let subscription = profile.subscription.as_ref()?;
     subscription.active_key.clone().or_else(|| {
@@ -60,6 +71,7 @@ fn primary_key(profile: &Profile, endpoints: &[SubscriptionEndpoint]) -> Option<
     })
 }
 
+#[cfg(not(target_os = "linux"))]
 fn plan(
     profile: &Profile,
     source: &Value,
@@ -161,6 +173,7 @@ fn preview_text(migration: &XrayPolicyMigration) -> String {
     text
 }
 
+#[cfg(not(target_os = "linux"))]
 fn preview(ctx: &Ctx, query: &str, path: &Path) -> Result<Output, String> {
     let profile = xray_profile(ctx, query)?;
     let endpoints = source_endpoints(ctx, &profile)?;
@@ -169,6 +182,7 @@ fn preview(ctx: &Ctx, query: &str, path: &Path) -> Result<Output, String> {
     Ok((preview_value(&migration), preview_text(&migration)))
 }
 
+#[cfg(not(target_os = "linux"))]
 fn apply(ctx: &Ctx, query: &str, path: &Path) -> Result<Output, String> {
     require_user(ctx)?;
     let expected = xray_profile(ctx, query)?;
@@ -230,6 +244,37 @@ fn apply(ctx: &Ctx, query: &str, path: &Path) -> Result<Output, String> {
                 .to_string()
         })?;
 
+    value["applied"] = json!(true);
+    value["requiresReconnect"] = json!(false);
+    Ok((
+        value,
+        format!("Applied the local Xray routing policy.\n{summary}"),
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn preview(ctx: &Ctx, query: &str, path: &Path) -> Result<Output, String> {
+    let profile = xray_profile(ctx, query)?;
+    let (migration, _) = net_manager_engine::linux_profiles::ProfileService::new(
+        ctx.root.clone(),
+        ctx.engine.clone(),
+    )
+    .plan_migration(&profile.id, path)?;
+    Ok((preview_value(&migration), preview_text(&migration)))
+}
+
+#[cfg(target_os = "linux")]
+fn apply(ctx: &Ctx, query: &str, path: &Path) -> Result<Output, String> {
+    require_user(ctx)?;
+    let profile = xray_profile(ctx, query)?;
+    let service = net_manager_engine::linux_profiles::ProfileService::new(
+        ctx.root.clone(),
+        ctx.engine.clone(),
+    );
+    let (migration, _) = service.plan_migration(&profile.id, path)?;
+    let mut value = preview_value(&migration);
+    let summary = preview_text(&migration);
+    service.apply_migration(&profile.id, path)?;
     value["applied"] = json!(true);
     value["requiresReconnect"] = json!(false);
     Ok((

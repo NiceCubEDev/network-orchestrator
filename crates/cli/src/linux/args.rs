@@ -23,8 +23,63 @@ pub struct Cli {
     pub command: Command,
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Subcommand)]
 pub enum Command {
+    /// Saved profile settings and managed configuration
+    #[cfg(target_os = "linux")]
+    #[command(subcommand)]
+    Profile(super::profile::ProfileCommand),
+    /// Subscription imports and refresh settings
+    #[cfg(target_os = "linux")]
+    #[command(subcommand)]
+    Subscription(super::profile::SubscriptionCommand),
+    /// Network interfaces, routes, DNS and intent
+    #[cfg(target_os = "linux")]
+    #[command(subcommand)]
+    Net(super::network::Command),
+    /// NetworkManager, Tailscale and NetBird
+    #[cfg(target_os = "linux")]
+    #[command(subcommand)]
+    Service(super::services::ServiceCommand),
+    /// Persistent daemon-owned enrollment
+    #[cfg(target_os = "linux")]
+    #[command(name = "always-on", subcommand)]
+    AlwaysOn(super::services::AlwaysOnCommand),
+    /// Conditional routing rules
+    #[cfg(target_os = "linux")]
+    #[command(subcommand)]
+    Condition(super::services::ConditionCommand),
+    /// Linux system integration
+    #[cfg(target_os = "linux")]
+    #[command(subcommand)]
+    System(super::system::SystemCommand),
+    /// Backend availability, selection and managed installation
+    #[cfg(target_os = "linux")]
+    #[command(subcommand)]
+    Backend(super::system::BackendCommand),
+    /// OpenVPN planning, probing and credential management
+    #[cfg(target_os = "linux")]
+    #[command(name = "openvpn", subcommand)]
+    Openvpn(super::runtime::OpenVpnCommand),
+    /// Reload a connected Xray profile
+    #[cfg(target_os = "linux")]
+    Reload { profile: String },
+    /// Profile inspection, runtime counters and network diagnostics
+    #[cfg(target_os = "linux")]
+    #[command(subcommand)]
+    Diagnostics(super::diagnostics::DiagnosticsCommand),
+    /// Shared application logs and daemon journal
+    #[cfg(target_os = "linux")]
+    #[command(subcommand)]
+    Logs(super::diagnostics::LogsCommand),
+    /// Inspect or clean up leftover owned resources
+    #[cfg(target_os = "linux")]
+    #[command(subcommand)]
+    Recovery(super::diagnostics::RecoveryCommand),
+    /// Shared connection sets
+    #[cfg(target_os = "linux")]
+    #[command(subcommand)]
+    Sets(super::sets::Command),
     /// List saved profiles
     Ls,
     /// Routing rules of Xray profiles: what goes direct, through the tunnel or nowhere
@@ -98,6 +153,12 @@ pub enum Command {
     Serve,
 }
 
+impl std::fmt::Debug for Command {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Command(<redacted>)")
+    }
+}
+
 #[derive(Subcommand)]
 pub enum ChecksCommand {
     /// List saved checks without contacting their destinations
@@ -140,6 +201,13 @@ pub enum ChecksCommand {
         profile: String,
         #[arg(long = "id", value_name = "ID")]
         ids: Vec<String>,
+    },
+    /// Replace the complete saved check list from JSON
+    #[cfg(target_os = "linux")]
+    Set {
+        profile: String,
+        #[arg(long, value_name = "FILE")]
+        file: PathBuf,
     },
 }
 

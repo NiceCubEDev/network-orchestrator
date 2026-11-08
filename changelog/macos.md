@@ -10,6 +10,14 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+### Changed
+
+- Refresh the shared localization catalog for profile-edit conflict feedback.
+
+### Fixed
+
+- Retain shared proxy and child-process ownership when cleanup must be retried.
+
 ## [0.10.2] - 2026-11-03
 
 Core 0.13.0.

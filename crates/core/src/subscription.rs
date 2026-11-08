@@ -679,12 +679,42 @@ pub fn switch_endpoint_key(
     key: &str,
     available: impl Fn(u16) -> bool,
 ) -> io::Result<ProfileDocument> {
+    let document = store.load()?;
+    let profile = prepare_endpoint_switch(vault, &document.profiles, id, key, available)?;
+    let old_path = &document
+        .profiles
+        .iter()
+        .find(|stored| stored.id == id)
+        .expect("the prepared profile came from this document")
+        .config_path;
+    let new_path = profile.config_path.clone();
+    match store.upsert(profile) {
+        Ok(document) => {
+            if vault.is_managed_profile_path(id, old_path) {
+                vault.remove_revision_for_config(old_path)?;
+            }
+            Ok(document)
+        }
+        Err(error) => {
+            let _ = vault.remove_revision_for_config(&new_path);
+            Err(error)
+        }
+    }
+}
+
+/// Build a candidate revision and selection without changing the store or
+/// removing its current revision. A live switch commits only after connecting.
+pub fn prepare_endpoint_switch(
+    vault: &ConfigVault,
+    profiles: &[Profile],
+    id: &str,
+    key: &str,
+    available: impl Fn(u16) -> bool,
+) -> io::Result<Profile> {
     if !valid_endpoint_key(key) {
         return Err(invalid("Invalid endpoint key"));
     }
-    let document = store.load()?;
-    let mut profile = document
-        .profiles
+    let mut profile = profiles
         .iter()
         .find(|p| p.id == id)
         .cloned()
@@ -697,7 +727,7 @@ pub fn switch_endpoint_key(
     let index = key_index(&endpoints, key)
         .ok_or_else(|| invalid("Endpoint is no longer part of the subscription"))?;
     let endpoint = &endpoints[index];
-    let used = profile_listener_ports(&document.profiles, id);
+    let used = profile_listener_ports(profiles, id);
     let (socks, http) = select_generated_ports(
         profile.xray_socks_port,
         profile.xray_http_port,
@@ -707,8 +737,7 @@ pub fn switch_endpoint_key(
     let config = xray::generate_share_link_config_with_http(&endpoint.url, socks, http)
         .map_err(|_| invalid("Invalid or unsupported share link"))?;
     let imported = vault.store_generated_xray(id, &serde_json::to_vec_pretty(&config)?)?;
-    let old_path = profile.config_path;
-    profile.config_path = imported.config_path.clone();
+    profile.config_path = imported.config_path;
     profile.xray_socks_port = Some(socks);
     profile.xray_http_port = Some(http);
     // Generated names follow the selection; a user-chosen name is kept.
@@ -719,18 +748,7 @@ pub fn switch_endpoint_key(
     subscription.active_index = index;
     subscription.active_key = Some(key.to_string());
     subscription.endpoint_count = endpoints.len();
-    match store.upsert(profile) {
-        Ok(document) => {
-            if vault.is_managed_profile_path(id, &old_path) {
-                vault.remove_revision_for_config(&old_path)?;
-            }
-            Ok(document)
-        }
-        Err(error) => {
-            let _ = vault.remove_revision_for_config(&imported.config_path);
-            Err(error)
-        }
-    }
+    Ok(profile)
 }
 
 /// Endpoint rows for clients: real endpoints first (key + flags), then one

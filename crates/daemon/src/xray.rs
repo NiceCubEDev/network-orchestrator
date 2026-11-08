@@ -1,4 +1,5 @@
-use crate::validate::{full_coverage, validate_owner};
+use crate::validate::validate_owner;
+use net_manager_core::connect_plan::full_coverage;
 use net_manager_core::daemon_protocol::XrayConnectParams;
 use net_manager_core::models::PolicyRoute;
 use serde_json::{json, Map, Value};
@@ -13,7 +14,7 @@ pub struct XrayPlan {
     pub name: String,
     pub config: String,
     pub routes: Vec<PolicyRoute>,
-    pub address: ipnet::IpNet,
+    pub addresses: Vec<ipnet::IpNet>,
     pub mtu: u32,
     pub dns_servers: Vec<IpAddr>,
     pub dns_domains: Vec<String>,
@@ -58,7 +59,7 @@ impl std::fmt::Debug for XrayPlan {
             .field("name", &self.name)
             .field("config", &"[REDACTED]")
             .field("routes", &self.routes)
-            .field("address", &self.address)
+            .field("addresses", &self.addresses)
             .field("mtu", &self.mtu)
             .field("dns_servers", &self.dns_servers)
             .field("dns_domains", &self.dns_domains)
@@ -1107,16 +1108,29 @@ pub fn prepare_xray(uid: u32, params: XrayConnectParams, mark: u32) -> io::Resul
         &params.profile_id,
         params.interface_name.as_deref(),
     );
-    // Build an address within 198.18.0.0/15 without accepting a caller IP.
-    let host = (hash as u32) & 0x1ffff;
-    let address: ipnet::IpNet = format!(
-        "198.{}.{}.{}/32",
-        18 + (host >> 16),
-        (host >> 8) & 255,
-        host & 255
-    )
-    .parse()
-    .map_err(|_| rejected())?;
+    // Address only the requested families; /32 and /128 add no connected
+    // subnet routes. Empty raw requests retain the legacy IPv4 address.
+    let ipv4 = params.routes.is_empty() || seen.iter().any(|net| net.addr().is_ipv4());
+    let ipv6 = seen.iter().any(|net| net.addr().is_ipv6());
+    let mut addresses = Vec::with_capacity(usize::from(ipv4) + usize::from(ipv6));
+    if ipv4 {
+        let host = (hash as u32) & 0x1ffff;
+        addresses.push(
+            format!(
+                "198.{}.{}.{}/32",
+                18 + (host >> 16),
+                (host >> 8) & 255,
+                host & 255
+            )
+            .parse()
+            .map_err(|_| rejected())?,
+        );
+    }
+    if ipv6 {
+        // The same uid/profile FNV-1a hash fills the host half of fd00::/64.
+        let address = std::net::Ipv6Addr::from((0xfd_u128 << 120) | u128::from(hash));
+        addresses.push(ipnet::IpNet::new(address.into(), 128).map_err(|_| rejected())?);
+    }
     let mtu = params.mtu.unwrap_or(1500);
     if !(1280..=9000).contains(&mtu) {
         return Err(rejected());
@@ -1300,7 +1314,7 @@ pub fn prepare_xray(uid: u32, params: XrayConnectParams, mark: u32) -> io::Resul
         name,
         config: serde_json::to_string(&config).map_err(|_| rejected())?,
         routes: params.routes,
-        address,
+        addresses,
         mtu,
         dns_servers: params.dns_servers,
         dns_domains: params.dns_domains,
@@ -1561,6 +1575,61 @@ mod tests {
             mtu: None,
             service_checks: Vec::new(),
             proxy_exits: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn address_set_tracks_all_route_families_without_expanding_scope() {
+        for destinations in [
+            vec!["10.20.0.0/16"],
+            vec!["2001:db8:20::/48"],
+            vec!["10.20.0.0/16", "2001:db8:20::/48"],
+            vec!["::/1"],
+            vec![],
+        ] {
+            let mut input = params();
+            input.routes = destinations
+                .iter()
+                .map(|destination| PolicyRoute {
+                    destination: destination.parse().unwrap(),
+                    metric: 5,
+                    via: None,
+                })
+                .collect();
+            let requested = input.routes.clone();
+            let plan = prepare_xray(1000, input.clone(), 51820).unwrap();
+            let ipv4 = destinations.is_empty() || destinations.iter().any(|net| !net.contains(':'));
+            let ipv6 = destinations.iter().any(|net| net.contains(':'));
+            assert_eq!(plan.addresses.len(), usize::from(ipv4) + usize::from(ipv6));
+            assert_eq!(plan.addresses.iter().any(|net| net.addr().is_ipv4()), ipv4);
+            assert_eq!(plan.addresses.iter().any(|net| net.addr().is_ipv6()), ipv6);
+            for address in &plan.addresses {
+                let pool: ipnet::IpNet = if address.addr().is_ipv4() {
+                    assert_eq!(address.prefix_len(), 32);
+                    "198.18.0.0/15"
+                } else {
+                    assert_eq!(address.prefix_len(), 128);
+                    "fd00::/8"
+                }
+                .parse()
+                .unwrap();
+                assert!(pool.contains(&address.addr()));
+            }
+            assert_eq!(plan.routes, requested);
+            assert!(!plan.full_ipv4 && !plan.full_ipv6);
+            assert_eq!(
+                plan.addresses,
+                prepare_xray(1000, input.clone(), 51821).unwrap().addresses
+            );
+            assert_ne!(
+                plan.addresses,
+                prepare_xray(1001, input.clone(), 51820).unwrap().addresses
+            );
+            input.profile_id = "other".into();
+            assert_ne!(
+                plan.addresses,
+                prepare_xray(1000, input, 51820).unwrap().addresses
+            );
         }
     }
 

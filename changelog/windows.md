@@ -10,6 +10,12 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+### Fixed
+
+- Reject stale shared profile-editor saves without overwriting newer settings
+  from another client; show a localized reload conflict.
+- Retain proxy and child-process ownership when cleanup must be retried.
+
 ## [0.10.2] - 2026-11-03
 
 Core 0.13.0.

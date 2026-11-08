@@ -9,6 +9,7 @@ mod elevation;
 mod lifecycle;
 #[cfg(target_os = "linux")]
 mod profile_watcher;
+#[cfg(not(target_os = "linux"))]
 mod route_runtime;
 mod state;
 #[cfg(test)]
@@ -78,10 +79,6 @@ pub fn run() {
             }
             #[cfg(target_os = "linux")]
             {
-                app.handle().plugin(tauri_plugin_autostart::init(
-                    tauri_plugin_autostart::MacosLauncher::LaunchAgent,
-                    None,
-                ))?;
                 match tray::install(app) {
                     Ok(true) => {
                         tauri::async_runtime::spawn(tray::refresh_loop(app.handle().clone()));
@@ -109,8 +106,6 @@ pub fn run() {
                     });
                 }
             }
-            #[cfg(target_os = "linux")]
-            app.manage(auto_connect::AutoConnectStatus::default());
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 #[cfg(target_os = "linux")]
@@ -219,7 +214,15 @@ pub fn run() {
             set_vpn_auth_mode,
             get_auto_connect_result,
             get_login_autostart,
-            set_login_autostart
+            set_login_autostart,
+            list_connection_sets,
+            get_connection_set,
+            put_connection_set,
+            delete_connection_set,
+            import_connection_sets,
+            capture_connection_set,
+            apply_connection_set,
+            down_connection_set
         ])
         .on_window_event(lifecycle::handle_window_event)
         .build(tauri::generate_context!())

@@ -983,6 +983,21 @@ fn wireguard_health_from_dump(dump: &str) -> ProtocolHealth {
     }
 }
 
+/// An input-only local-runtime snapshot. Never log or persist its configuration.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreparedXrayConnection {
+    executable: PathBuf,
+    config: Vec<u8>,
+    assets: Option<PathBuf>,
+}
+
+impl PreparedXrayConnection {
+    pub fn analyze(&self, profile: &Profile) -> io::Result<crate::models::ConfigAnalysis> {
+        crate::analysis::analyze_xray_snapshot(profile, &self.config)
+    }
+}
+
 pub struct TunnelManager {
     wireguard_exe: Option<PathBuf>,
     openvpn_exe: Option<PathBuf>,
@@ -1281,7 +1296,7 @@ impl TunnelManager {
         }
     }
 
-    pub fn connect(&mut self, profile: &Profile) -> io::Result<TunnelStatus> {
+    fn ensure_not_running(&mut self, profile: &Profile) -> io::Result<()> {
         Self::reap_child_if_exited(&mut self.openvpn_children, &profile.id)?;
         Self::reap_child_if_exited(&mut self.xray_children, &profile.id)?;
         if self.wireguard_services.contains(&profile.id)
@@ -1294,6 +1309,78 @@ impl TunnelManager {
                 format!("profile '{}' is already running", profile.id),
             ));
         }
+        Ok(())
+    }
+
+    pub fn prepare_xray_connection(&self, profile: &Profile) -> io::Result<PreparedXrayConnection> {
+        if profile.backend != TunnelBackend::Xray {
+            return Err(invalid_data(
+                "prepared Xray connection requires an Xray profile",
+            ));
+        }
+        let executable = resolve_xray_executable(self.xray_exe.as_deref())?;
+        let config = prepare_xray_config(profile)?;
+        let assets = self.xray_asset_dirs.get(&profile.id).cloned();
+        run_xray_validation_with_assets(&executable, &config, assets.as_deref())?;
+        Ok(PreparedXrayConnection {
+            executable,
+            config,
+            assets,
+        })
+    }
+
+    /// Revalidate private IPC input against the current approved executable and assets.
+    pub fn connect_prepared_xray(
+        &mut self,
+        profile: &Profile,
+        prepared: &PreparedXrayConnection,
+    ) -> io::Result<TunnelStatus> {
+        self.ensure_not_running(profile)?;
+        crate::profiles::validate_profile(profile)?;
+        profile.check_role().map_err(invalid_data)?;
+        if profile.backend != TunnelBackend::Xray
+            || prepared.executable != resolve_xray_executable(self.xray_exe.as_deref())?
+            || prepared.assets.as_ref() != self.xray_asset_dirs.get(&profile.id)
+        {
+            return Err(invalid_data("prepared Xray executable or assets changed"));
+        }
+        run_xray_validation_with_assets(
+            &prepared.executable,
+            &prepared.config,
+            prepared.assets.as_deref(),
+        )?;
+        self.spawn_prepared_xray(profile, prepared)
+    }
+
+    fn spawn_prepared_xray(
+        &mut self,
+        profile: &Profile,
+        prepared: &PreparedXrayConnection,
+    ) -> io::Result<TunnelStatus> {
+        let executable = resolve_xray_executable(self.xray_exe.as_deref())?;
+        if executable != prepared.executable {
+            return Err(invalid_data("prepared Xray executable changed"));
+        }
+        let (out, err) = self.child_log_stdio(&profile.id, "xray")?;
+        let mut child = spawn_xray(
+            &executable,
+            &prepared.config,
+            prepared.assets.as_deref(),
+            out,
+            err,
+        )?;
+        if let Err(err) = self.ensure_child_job().and_then(|job| job.assign(&child)) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(err);
+        }
+        self.xray_children.insert(profile.id.clone(), child);
+        self.failures.remove(&profile.id);
+        Ok(status_for(&profile.id, TunnelState::Running, None))
+    }
+
+    pub fn connect(&mut self, profile: &Profile) -> io::Result<TunnelStatus> {
+        self.ensure_not_running(profile)?;
         if profile.backend == TunnelBackend::None {
             if profile.routes.is_empty() && profile.endpoint_bypasses.is_empty() {
                 return Err(io::Error::new(
@@ -1364,20 +1451,8 @@ impl TunnelManager {
                 Ok(status_for(&profile.id, TunnelState::Running, None))
             }
             TunnelBackend::Xray => {
-                let exe = resolve_xray_executable(self.xray_exe.as_deref())?;
-                let config = prepare_xray_config(profile)?;
-                let assets = self.xray_asset_dirs.get(&profile.id).cloned();
-                run_xray_validation_with_assets(&exe, &config, assets.as_deref())?;
-                let (out, err) = self.child_log_stdio(&profile.id, "xray")?;
-                let mut child = spawn_xray(&exe, &config, assets.as_deref(), out, err)?;
-                if let Err(err) = self.ensure_child_job().and_then(|job| job.assign(&child)) {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(err);
-                }
-                self.xray_children.insert(profile.id.clone(), child);
-                self.failures.remove(&profile.id);
-                Ok(status_for(&profile.id, TunnelState::Running, None))
+                let prepared = self.prepare_xray_connection(profile)?;
+                self.spawn_prepared_xray(profile, &prepared)
             }
             TunnelBackend::None => unreachable!("None handled before config_path check"),
         }
@@ -1599,6 +1674,52 @@ mod tests {
                     io::ErrorKind::NotFound
                 );
             }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn prepared_xray_uses_retained_bytes_after_source_revision_changes_or_disappears() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+        for remove_source in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let executable = directory.path().join("xray");
+            let captured = directory.path().join("captured.json");
+            fs::write(&executable, format!("#!/bin/sh\ncase \" $* \" in *\" -test \"*) /bin/cat >/dev/null; exit 0;; esac\n/bin/cat >'{}'\nexec /bin/sleep 30\n", captured.display())).unwrap();
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+            let path = directory.path().join("config.json");
+            fs::write(
+                &path,
+                br#"{"inbounds":[],"outbounds":[{"protocol":"freedom","tag":"direct"}]}"#,
+            )
+            .unwrap();
+            let mut profile = xray_profile();
+            profile.config_path = path.clone();
+            let mut manager = TunnelManager::with_all_executables(None, None, Some(executable));
+            let prepared = manager.prepare_xray_connection(&profile).unwrap();
+            if remove_source {
+                fs::remove_file(&path).unwrap();
+            } else {
+                fs::write(&path, br#"{"outbounds":[],"changed":true}"#).unwrap();
+            }
+            let result = manager.connect_prepared_xray(&profile, &prepared);
+            assert!(
+                result.is_ok(),
+                "a retained validated snapshot must not reread its mutable source: {result:?}"
+            );
+            assert_eq!(result.unwrap().state, TunnelState::Running);
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while fs::metadata(&captured)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0)
+                != prepared.config.len() as u64
+                && Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(fs::read(&captured).unwrap(), prepared.config);
+            manager.disconnect(&profile).unwrap();
         }
     }
 

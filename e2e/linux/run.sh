@@ -64,7 +64,8 @@ cleanup() {
 trap cleanup EXIT
 
 echo "==> Starting isolated peer on $NETWORK"
-"$ENGINE" network create "$NETWORK" >/dev/null
+IPV6_SUBNET=$(printf 'fd6e:6574:%x:%x::/64' "$(( $$ / 65536 ))" "$(( $$ % 65536 ))")
+"$ENGINE" network create --ipv6 --subnet "$IPV6_SUBNET" "$NETWORK" >/dev/null
 
 "$ENGINE" run -d --name "$SERVER" --network "$NETWORK" --network-alias wg-server \
     --cap-add NET_ADMIN --device /dev/net/tun \

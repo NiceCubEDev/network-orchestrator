@@ -12,6 +12,24 @@ use std::net::Ipv4Addr;
 use std::path::Path;
 
 pub fn analyze_profile(profile: &Profile) -> io::Result<ConfigAnalysis> {
+    analyze_with_xray_snapshot(profile, None)
+}
+
+/// Analyze retained Xray input without consulting a mutable managed revision.
+pub fn analyze_xray_snapshot(profile: &Profile, bytes: &[u8]) -> io::Result<ConfigAnalysis> {
+    if profile.backend != TunnelBackend::Xray {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "snapshot analysis requires an Xray profile",
+        ));
+    }
+    analyze_with_xray_snapshot(profile, Some(bytes))
+}
+
+fn analyze_with_xray_snapshot(
+    profile: &Profile,
+    bytes: Option<&[u8]>,
+) -> io::Result<ConfigAnalysis> {
     let mut analysis = ConfigAnalysis {
         profile_id: profile.id.clone(),
         os_routes: Vec::new(),
@@ -35,7 +53,10 @@ pub fn analyze_profile(profile: &Profile) -> io::Result<ConfigAnalysis> {
         TunnelBackend::None => {}
         TunnelBackend::WireGuard => analyze_wireguard(&profile.config_path, &mut analysis)?,
         TunnelBackend::OpenVpn => analyze_openvpn(&profile.config_path, &mut analysis)?,
-        TunnelBackend::Xray => analyze_xray(profile, &mut analysis)?,
+        TunnelBackend::Xray => match bytes {
+            Some(bytes) => analyze_xray_bytes(profile, bytes, &mut analysis)?,
+            None => analyze_xray(profile, &mut analysis)?,
+        },
     }
     if profile.tunnel_role == crate::models::TunnelRole::Secondary {
         // The privileged side installs exactly the listed networks and ignores
@@ -532,7 +553,15 @@ fn parse_openvpn_route(tokens: &[String]) -> Option<IpNet> {
 
 fn analyze_xray(profile: &Profile, analysis: &mut ConfigAnalysis) -> io::Result<()> {
     let bytes = crate::config_security::read_xray_config(&profile.config_path, &profile.id)?;
-    let root: Value = serde_json::from_slice(&bytes).map_err(|err| {
+    analyze_xray_bytes(profile, &bytes, analysis)
+}
+
+fn analyze_xray_bytes(
+    profile: &Profile,
+    bytes: &[u8],
+    analysis: &mut ConfigAnalysis,
+) -> io::Result<()> {
+    let root: Value = serde_json::from_slice(bytes).map_err(|err| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("invalid JSON in '{}': {err}", profile.config_path.display()),
@@ -614,10 +643,25 @@ fn analyze_xray(profile: &Profile, analysis: &mut ConfigAnalysis) -> io::Result<
         }
     }
 
-    // If the profile is configured for TUN mode, the TUN inbound is injected
-    // at connect time by `prepare_xray_config` and may not be present in the
-    // stored config yet. Add the 0.0.0.0/0 OS route proactively so conflict
-    // detection works before connect.
+    // Managed Linux capture must match the actual scoped or dual-stack request.
+    // Secondary routes are assigned by analyze_profile after config analysis.
+    #[cfg(target_os = "linux")]
+    if profile.xray_mode == crate::models::XrayMode::Tun
+        && profile.tunnel_role == crate::models::TunnelRole::Primary
+    {
+        analysis.os_routes.clear();
+        analysis.os_routes.extend(
+            crate::connect_plan::linux_xray_tun_routes(profile)
+                .into_iter()
+                .map(|route| AnalyzedRoute {
+                    metric: Some(route.metric),
+                    destination: route.destination,
+                    source: "Xray TUN".to_string(),
+                }),
+        );
+    }
+    // Other platforms retain their existing capture contract.
+    #[cfg(not(target_os = "linux"))]
     if profile.xray_mode == crate::models::XrayMode::Tun
         && !analysis.os_routes.iter().any(|r| r.source == "Xray TUN")
     {

@@ -42,7 +42,6 @@ pub mod tailscale;
 pub mod validate;
 #[cfg(target_os = "linux")]
 pub mod watchdog;
-pub mod wireguard;
 pub mod xray;
 #[cfg(target_os = "linux")]
 pub mod xray_process;

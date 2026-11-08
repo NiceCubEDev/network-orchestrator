@@ -41,6 +41,36 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
   rather than leaving a failed session that cannot be cleared.
 
 
+## [0.15.0] - 2026-11-07
+
+Core 0.15.0.
+
+### Added
+
+- CLI access to Linux profile settings, subscriptions, network routes/rules and
+  DNS, provider services, always-on and conditional routing, diagnostics, logs,
+  backend management and saved connection sets through shared Engine services.
+- Dual-stack Linux Xray TUN capture, IPv6-only scoped routes, IPv6 tunnel
+  addresses and negotiated daemon capability checks before network mutations.
+- Shared protected connection sets with legacy GUI migration and explicit,
+  per-profile OpenVPN credential input for interactive and CLI application.
+
+### Changed
+
+- Linux GUI commands use the same business operations as the CLI rather than a
+  separate in-process tunnel/settings implementation.
+- Connection-set and subscription endpoint changes validate retained connection
+  inputs before teardown and restore previously running connections on failure;
+  failed resources are cleaned without being restored as healthy connections.
+
+### Fixed
+
+- Scope fake-DNS pools to captured address families and route coverage; avoid
+  claiming IPv4 default capture for explicit IPv6-only scopes.
+- Preserve concurrent named-exit changes and cached subscription HWIDs.
+- Keep remembered OpenVPN credentials unchanged after failed/unconfirmed
+  connection attempts and protect unknown-status/always-on resources.
+
 ## [0.14.0] - 2026-11-07
 
 Core 0.14.0.

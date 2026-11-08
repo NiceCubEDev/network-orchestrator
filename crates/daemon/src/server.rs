@@ -11,10 +11,9 @@ use crate::core::DaemonCore;
 use crate::openvpn::{prepare_openvpn, OpenVpnPlan};
 use crate::settings::{DaemonSettings, SettingsStore};
 use crate::validate::{validate_apply, validate_attach, validate_iface_name, validate_owner};
-use crate::wireguard::parse_wireguard_config;
 use crate::xray::prepare_xray;
 use net_manager_core::daemon_protocol::{
-    encode_line, event, from_value, method, read_frame, AlwaysOnKind, AlwaysOnListResult,
+    encode_line, event, feature, from_value, method, read_frame, AlwaysOnKind, AlwaysOnListResult,
     AlwaysOnProfileInfo, AlwaysOnRemoveParams, AlwaysOnRemoveResult, AlwaysOnResumeResult,
     AlwaysOnSetParams, AlwaysOnSetResult, CondRulesListResult, CondRulesPutParams,
     CondRulesPutResult, CondRulesRemoveParams, CondRulesRemoveResult, ConditionalRuleEntry,
@@ -29,6 +28,7 @@ use net_manager_core::daemon_protocol::{
     XrayDisconnectResult, XrayInstallParams, XrayInstallResult, XrayProfileParams,
     XrayRemoveResult, HELLO_TIMEOUT_SECS, MAX_CONNECTIONS, MAX_FRAME_BYTES, PROTOCOL_VERSION,
 };
+use net_manager_core::wireguard_config::parse_wireguard_config;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;
@@ -198,7 +198,12 @@ where
         protocol: PROTOCOL_VERSION,
         daemon_version: env!("CARGO_PKG_VERSION").to_string(),
         uid: peer.uid,
-        capabilities: method::CAPABILITIES.iter().map(|m| m.to_string()).collect(),
+        capabilities: method::CAPABILITIES
+            .iter()
+            .copied()
+            .chain([feature::XRAY_TUN_IPV6])
+            .map(str::to_string)
+            .collect(),
         tools: (ctx.tools_probe)(),
     };
     write_frame(&mut write, &ok(request_id, &hello)).await?;
@@ -2316,9 +2321,29 @@ mod tests {
         assert_eq!(reply["result"]["protocol"], json!(1));
         assert_eq!(
             reply["result"]["capabilities"],
-            json!(net_manager_core::daemon_protocol::method::CAPABILITIES)
+            json!(method::CAPABILITIES
+                .iter()
+                .copied()
+                .chain([feature::XRAY_TUN_IPV6])
+                .collect::<Vec<_>>())
         );
         assert!(reply["result"]["tools"].is_object());
+    }
+
+    #[tokio::test]
+    async fn hello_advertises_linux_xray_tun_ipv6_address_ownership() {
+        let harness = Harness::new(AuthDecision::Authorized);
+        let mut client = harness.connect(1000);
+        let reply = client
+            .call(1, "hello", json!({"protocol":1,"client":"legacy-client"}))
+            .await;
+        let hello: HelloResult = serde_json::from_value(reply["result"].clone()).unwrap();
+        assert_eq!(hello.protocol, PROTOCOL_VERSION);
+        assert!(hello
+            .capabilities
+            .iter()
+            .any(|capability| capability == "xray.tun.ipv6"));
+        assert!(!method::CAPABILITIES.contains(&"xray.tun.ipv6"));
     }
 
     #[tokio::test]

@@ -1,25 +1,33 @@
+#[cfg(not(target_os = "linux"))]
 use crate::route_runtime::RouteRuntime;
+#[cfg(not(target_os = "linux"))]
 use net_manager_core::backend_settings::BackendSettingsStore;
 use net_manager_core::config_vault::ConfigVault;
+#[cfg(not(target_os = "linux"))]
 use net_manager_core::managed_xray;
-#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+#[cfg(not(target_os = "linux"))]
 use net_manager_core::managed_xray::MANAGED_XRAY_VERSION;
 use net_manager_core::models::*;
-use net_manager_core::profiles::{ProfileDocument, ProfileStore};
-#[cfg(any(not(target_os = "linux"), test))]
+#[cfg(not(target_os = "linux"))]
+use net_manager_core::profiles::ProfileDocument;
+use net_manager_core::profiles::ProfileStore;
+#[cfg(not(target_os = "linux"))]
 use net_manager_core::system_proxy::SystemProxyManager;
+#[cfg(not(target_os = "linux"))]
 use net_manager_core::vpn::{self, TunnelManager};
+#[cfg(not(target_os = "linux"))]
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
+#[cfg(not(target_os = "linux"))]
 pub(crate) struct RuntimeState {
     pub(crate) tunnels: TunnelManager,
     pub(crate) routes: RouteRuntime,
-    #[cfg(any(not(target_os = "linux"), test))]
     pub(crate) proxy: SystemProxyManager,
 }
 
+#[cfg(not(target_os = "linux"))]
 #[derive(Debug)]
 pub(crate) struct ResolvedBackendExecutable {
     pub(crate) path: PathBuf,
@@ -30,28 +38,28 @@ pub(crate) struct ResolvedBackendExecutable {
 pub(crate) struct AppState {
     pub(crate) profiles: ProfileStore,
     pub(crate) config_vault: ConfigVault,
+    #[cfg(not(target_os = "linux"))]
     pub(crate) backend_settings: BackendSettingsStore,
-    /// Windows managed-install store root; on 64-bit Linux managed Xray
-    /// lives in the daemon-owned package root instead.
-    #[cfg_attr(all(target_os = "linux", target_arch = "x86_64"), allow(dead_code))]
+    /// Windows/non-Linux managed-install store root.
+    #[cfg(not(target_os = "linux"))]
     pub(crate) managed_xray_root: PathBuf,
-    /// Per-profile downloaded geoip.dat/geosite.dat overrides
-    /// (`geoassets/<sha256(url-pair)[:16]>/` — shared between profiles).
-    #[cfg(target_os = "linux")]
-    pub(crate) geo_assets_root: PathBuf,
+    #[cfg(not(target_os = "linux"))]
     pub(crate) backend_install_lock: tokio::sync::Mutex<()>,
+    #[cfg(not(target_os = "linux"))]
     pub(crate) backend_install_cancel: AtomicBool,
     pub(crate) shutting_down: AtomicBool,
     pub(crate) cleanup_complete: AtomicBool,
+    #[cfg(not(target_os = "linux"))]
     pub(crate) runtime: tokio::sync::Mutex<RuntimeState>,
-    /// Bounded app-side event log for the Logs view (connect/disconnect,
-    /// errors). Never persisted — ring buffer, newest last.
+    /// Non-Linux event log; Linux frontends use the shared per-data-root store.
+    #[cfg(not(target_os = "linux"))]
     pub(crate) log: std::sync::Mutex<std::collections::VecDeque<crate::commands::logs::LogEvent>>,
     #[cfg(target_os = "linux")]
     pub(crate) openvpn_credentials:
         std::sync::Arc<net_manager_engine::linux_credentials::OpenVpnCredentialStore>,
 }
 
+#[cfg(not(target_os = "linux"))]
 pub(crate) fn resolve_backend_path(
     backend: TunnelBackend,
     configured: Option<&Path>,
@@ -76,21 +84,14 @@ impl AppState {
             .expect("vault is under the application data directory")
     }
 
+    #[cfg(not(target_os = "linux"))]
     pub(crate) async fn proxy_ownership(
         &self,
     ) -> io::Result<Option<net_manager_core::system_proxy::ProxyOwnership>> {
-        #[cfg(target_os = "linux")]
-        {
-            net_manager_core::system_proxy::load_ownership(
-                &self.data_dir().join("proxy-state.json"),
-            )
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            Ok(self.runtime.lock().await.proxy.ownership().cloned())
-        }
+        Ok(self.runtime.lock().await.proxy.ownership().cloned())
     }
 
+    #[cfg(not(target_os = "linux"))]
     pub(crate) fn resolve_backend_executable(
         &self,
         backend: TunnelBackend,
@@ -118,24 +119,6 @@ impl AppState {
                             "managed executables are only supported for the Xray backend",
                         ));
                     }
-                    // Linux managed installs live in the daemon-owned
-                    // package root; Windows keeps a user-owned store under
-                    // `managed_xray_root`. Each verifies against its own
-                    // pinned version and file hashes.
-                    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-                    {
-                        if setting.version.as_deref() != Some(managed_xray::LINUX_XRAY_VERSION) {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "managed Xray setting does not match the managed version",
-                            ));
-                        }
-                        managed_xray::verify_managed_linux_executable(
-                            Path::new(managed_xray::LINUX_XRAY_PACKAGE_ROOT),
-                            &setting.path,
-                        )?;
-                    }
-                    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
                     {
                         if setting.version.as_deref() != Some(MANAGED_XRAY_VERSION) {
                             return Err(io::Error::new(
@@ -161,25 +144,32 @@ impl AppState {
 
 pub(crate) fn build_state(data_dir: PathBuf) -> std::io::Result<AppState> {
     let store = ProfileStore::new(data_dir.join("profiles.json"));
+    #[cfg(not(target_os = "linux"))]
     let routes = RouteRuntime::new(&data_dir)?;
     let config_vault = ConfigVault::new(data_dir.join("configs"));
     config_vault.ensure_root_protected()?;
+    #[cfg(not(target_os = "linux"))]
     let backend_settings = BackendSettingsStore::new(data_dir.join("backend-settings.json"));
+    #[cfg(not(target_os = "linux"))]
     let backend_document = backend_settings.load()?;
+    #[cfg(not(target_os = "linux"))]
     let setting_path = |setting: Option<net_manager_core::models::BackendExecutableSetting>| {
         setting.map(|s| s.path)
     };
     Ok(AppState {
         profiles: store,
         config_vault,
+        #[cfg(not(target_os = "linux"))]
         backend_settings,
+        #[cfg(not(target_os = "linux"))]
         managed_xray_root: data_dir.join("backends").join("xray"),
-        #[cfg(target_os = "linux")]
-        geo_assets_root: data_dir.join("geoassets"),
+        #[cfg(not(target_os = "linux"))]
         backend_install_lock: tokio::sync::Mutex::new(()),
+        #[cfg(not(target_os = "linux"))]
         backend_install_cancel: AtomicBool::new(false),
         shutting_down: AtomicBool::new(false),
         cleanup_complete: AtomicBool::new(false),
+        #[cfg(not(target_os = "linux"))]
         runtime: tokio::sync::Mutex::new(RuntimeState {
             tunnels: TunnelManager::with_all_executables_and_log_dir(
                 setting_path(backend_document.wire_guard),
@@ -188,9 +178,9 @@ pub(crate) fn build_state(data_dir: PathBuf) -> std::io::Result<AppState> {
                 data_dir.join("logs"),
             ),
             routes,
-            #[cfg(any(not(target_os = "linux"), test))]
             proxy: SystemProxyManager::new(data_dir.join("proxy-state.json"))?,
         }),
+        #[cfg(not(target_os = "linux"))]
         log: std::sync::Mutex::new(std::collections::VecDeque::new()),
         #[cfg(target_os = "linux")]
         openvpn_credentials: std::sync::Arc::new(
@@ -211,6 +201,7 @@ pub(crate) fn find_profile(store: &ProfileStore, id: &str) -> Result<Profile, St
         .ok_or_else(|| format!("profile '{id}' not found"))
 }
 
+#[cfg(not(target_os = "linux"))]
 pub(crate) fn existing_profile_for_update<'a>(
     document: &'a ProfileDocument,
     incoming_id: &str,
@@ -218,7 +209,7 @@ pub(crate) fn existing_profile_for_update<'a>(
     document.profiles.iter().find(|p| p.id == incoming_id)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "linux")))]
 mod tests {
     use super::*;
     use crate::test_support::*;

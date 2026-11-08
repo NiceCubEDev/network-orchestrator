@@ -1,5 +1,6 @@
+#[cfg(not(target_os = "linux"))]
 use crate::commands::profiles::loopback_port_available;
-#[cfg(any(not(target_os = "linux"), test))]
+#[cfg(not(target_os = "linux"))]
 use crate::state::RuntimeState;
 use crate::state::{find_profile, AppState};
 #[cfg(not(target_os = "linux"))]
@@ -12,7 +13,7 @@ use net_manager_core::connect_plan::{
 #[cfg(not(target_os = "linux"))]
 use net_manager_core::explorer;
 use net_manager_core::models::*;
-#[cfg(any(not(target_os = "linux"), test))]
+#[cfg(not(target_os = "linux"))]
 use std::io::ErrorKind;
 #[cfg(not(target_os = "linux"))]
 use std::time::Duration;
@@ -20,12 +21,12 @@ use std::time::Duration;
 use std::time::Instant;
 use tauri::{Emitter, State};
 
-#[cfg(target_os = "linux")]
-use net_manager_core::daemon_protocol::{
-    method, OpenVpnCredentials, OpenVpnStatusResult, WireGuardStatusResult, XrayStatusResult,
-};
-#[cfg(target_os = "linux")]
-pub(crate) use net_manager_engine::linux::*;
+#[cfg(all(target_os = "linux", test))]
+use net_manager_core::daemon_protocol::{method, OpenVpnCredentials};
+#[cfg(all(target_os = "linux", test))]
+use net_manager_core::daemon_protocol::{OpenVpnStatusResult, XrayStatusResult};
+#[cfg(all(target_os = "linux", test))]
+use net_manager_engine::linux::*;
 #[cfg(target_os = "linux")]
 use net_manager_engine::linux_credentials::OpenVpnCredentialStore;
 
@@ -39,6 +40,7 @@ fn select_connect_ports(
         .map_err(|err| err.to_string())
 }
 
+#[cfg(not(target_os = "linux"))]
 fn prepare_xray_listener_ports(
     state: &AppState,
     profile: &mut Profile,
@@ -55,137 +57,6 @@ fn prepare_xray_listener_ports(
 }
 
 #[cfg(target_os = "linux")]
-async fn linux_xray_connect(
-    client: &crate::daemon_client::DaemonClient,
-    vault: &net_manager_core::config_vault::ConfigVault,
-    profile: &Profile,
-) -> Result<TunnelStatus, String> {
-    let root = vault.root().to_path_buf();
-    let profile = profile.clone();
-    client
-        .engine_request(move |engine| {
-            engine.connect(
-                &net_manager_core::config_vault::ConfigVault::new(root),
-                &profile,
-                None,
-                &(),
-            )
-        })
-        .await
-}
-
-/// Re-send the profile's current generated config to the running Xray tunnel:
-/// the daemon swaps the staged config and restarts the child in place,
-/// keeping routes, DNS and the ownership journal. Network-level changes
-/// (routes, DNS, interface name, full capture) are rejected by the daemon —
-/// the caller is expected to reconnect in that case.
-#[cfg(target_os = "linux")]
-async fn linux_xray_reload(
-    client: &crate::daemon_client::DaemonClient,
-    vault: &net_manager_core::config_vault::ConfigVault,
-    profile: &Profile,
-) -> Result<TunnelStatus, String> {
-    let root = vault.root().to_path_buf();
-    let profile = profile.clone();
-    client
-        .engine_request(move |engine| {
-            engine.reload_xray(
-                &net_manager_core::config_vault::ConfigVault::new(root),
-                &profile,
-            )
-        })
-        .await
-}
-
-#[cfg(target_os = "linux")]
-pub(crate) async fn linux_xray_status_result(
-    client: &crate::daemon_client::DaemonClient,
-    profile: &Profile,
-) -> Result<XrayStatusResult, String> {
-    let id = profile.id.clone();
-    client
-        .engine_observation(move |engine| engine.xray_status_result(&id))
-        .await
-}
-
-#[cfg(target_os = "linux")]
-pub(crate) async fn linux_xray_status(
-    client: &crate::daemon_client::DaemonClient,
-    profile: &Profile,
-) -> Result<TunnelStatus, String> {
-    Ok(linux_xray_tunnel_status(
-        linux_xray_status_result(client, profile).await?,
-        profile,
-    ))
-}
-
-#[cfg(target_os = "linux")]
-async fn linux_xray_disconnect(
-    client: &crate::daemon_client::DaemonClient,
-    profile: &Profile,
-) -> Result<TunnelStatus, String> {
-    let profile = profile.clone();
-    client
-        .engine_request(move |engine| engine.disconnect(&profile))
-        .await
-}
-
-#[cfg(target_os = "linux")]
-async fn linux_openvpn_connect(
-    client: &crate::daemon_client::DaemonClient,
-    vault: &net_manager_core::config_vault::ConfigVault,
-    credential_store: &std::sync::Arc<OpenVpnCredentialStore>,
-    profile: &Profile,
-) -> Result<TunnelStatus, String> {
-    linux_openvpn_connect_with_credentials(client, vault, credential_store, profile, None, false)
-        .await
-}
-
-#[cfg(target_os = "linux")]
-async fn linux_openvpn_connect_with_credentials(
-    client: &crate::daemon_client::DaemonClient,
-    vault: &net_manager_core::config_vault::ConfigVault,
-    credential_store: &std::sync::Arc<OpenVpnCredentialStore>,
-    profile: &Profile,
-    supplied_credentials: Option<OpenVpnCredentials>,
-    remember: bool,
-) -> Result<TunnelStatus, String> {
-    let credentials = supplied_credentials.clone();
-    let root = vault.root().to_path_buf();
-    let connecting = profile.clone();
-    let source = credential_store.clone();
-    let mut status = client
-        .engine_request(move |engine| {
-            engine.connect(
-                &net_manager_core::config_vault::ConfigVault::new(root),
-                &connecting,
-                supplied_credentials,
-                source.as_ref(),
-            )
-        })
-        .await?;
-    let explicit = credentials.is_some();
-    let notice = if explicit && remember {
-        credential_store.remember(&profile.id, credentials.as_ref().unwrap())
-    } else if explicit {
-        let legacy = openvpn_credentials_path(vault, profile).ok();
-        credential_store
-            .forget(&profile.id, legacy.as_deref())
-            .err()
-            .map(|_| "OpenVPN started, but old remembered credentials could not be removed")
-    } else {
-        None
-    };
-    if let Some(notice) = notice {
-        status.message = Some(match status.message.take() {
-            Some(message) => format!("{message}; {notice}"),
-            None => notice.into(),
-        });
-    }
-    Ok(status)
-}
-
-#[cfg(target_os = "linux")]
 async fn linux_openvpn_probe(
     client: &crate::daemon_client::DaemonClient,
     vault: &net_manager_core::config_vault::ConfigVault,
@@ -197,7 +68,8 @@ async fn linux_openvpn_probe(
     let source = credential_store.clone();
     client
         .engine_request(move |engine| {
-            engine.probe_openvpn_routes(
+            net_manager_engine::linux_runtime::openvpn_probe(
+                &engine,
                 &net_manager_core::config_vault::ConfigVault::new(root),
                 &profile,
                 source.as_ref(),
@@ -206,122 +78,7 @@ async fn linux_openvpn_probe(
         .await
 }
 
-#[cfg(target_os = "linux")]
-pub(crate) async fn linux_openvpn_status_result(
-    client: &crate::daemon_client::DaemonClient,
-    profile: &Profile,
-) -> Result<OpenVpnStatusResult, String> {
-    let id = profile.id.clone();
-    client
-        .engine_observation(move |engine| engine.openvpn_status_result(&id))
-        .await
-}
-
-#[cfg(target_os = "linux")]
-pub(crate) async fn linux_openvpn_status(
-    client: &crate::daemon_client::DaemonClient,
-    profile: &Profile,
-) -> Result<TunnelStatus, String> {
-    Ok(linux_openvpn_tunnel_status(
-        linux_openvpn_status_result(client, profile).await?,
-    ))
-}
-
-#[cfg(target_os = "linux")]
-async fn linux_openvpn_disconnect(
-    client: &crate::daemon_client::DaemonClient,
-    profile: &Profile,
-) -> Result<TunnelStatus, String> {
-    let profile = profile.clone();
-    client
-        .engine_request(move |engine| engine.disconnect(&profile))
-        .await
-}
-
-#[cfg(target_os = "linux")]
-async fn linux_wireguard_connect(
-    client: &crate::daemon_client::DaemonClient,
-    vault: &net_manager_core::config_vault::ConfigVault,
-    profile: &Profile,
-) -> Result<TunnelStatus, String> {
-    let root = vault.root().to_path_buf();
-    let profile = profile.clone();
-    client
-        .engine_request(move |engine| {
-            engine.connect(
-                &net_manager_core::config_vault::ConfigVault::new(root),
-                &profile,
-                None,
-                &(),
-            )
-        })
-        .await
-}
-
-#[cfg(target_os = "linux")]
-pub(crate) async fn linux_wireguard_status_result(
-    client: &crate::daemon_client::DaemonClient,
-    profile: &Profile,
-) -> Result<WireGuardStatusResult, String> {
-    let id = profile.id.clone();
-    client
-        .engine_observation(move |engine| engine.wireguard_status_result(&id))
-        .await
-}
-
-#[cfg(target_os = "linux")]
-pub(crate) async fn linux_wireguard_status(
-    client: &crate::daemon_client::DaemonClient,
-    profile: &Profile,
-) -> Result<TunnelStatus, String> {
-    Ok(linux_wireguard_tunnel_status(
-        linux_wireguard_status_result(client, profile).await?,
-    ))
-}
-
-#[cfg(target_os = "linux")]
-async fn linux_wireguard_disconnect(
-    client: &crate::daemon_client::DaemonClient,
-    profile: &Profile,
-) -> Result<TunnelStatus, String> {
-    let profile = profile.clone();
-    client
-        .engine_request(move |engine| engine.disconnect(&profile))
-        .await
-}
-
-#[cfg(target_os = "linux")]
-pub(crate) async fn linux_profile_status(
-    client: &crate::daemon_client::DaemonClient,
-    state: &AppState,
-    profile: &Profile,
-) -> Result<TunnelStatus, String> {
-    match profile.backend {
-        TunnelBackend::WireGuard => linux_wireguard_status(client, profile).await,
-        TunnelBackend::OpenVpn => linux_openvpn_status(client, profile).await,
-        TunnelBackend::Xray if profile.xray_mode == XrayMode::Tun => {
-            linux_xray_status(client, profile).await
-        }
-        _ => {
-            let root = state.data_dir().to_path_buf();
-            let id = profile.id.clone();
-            let interface = profile.interface_name.clone();
-            let proxy = profile.backend == TunnelBackend::Xray;
-            client
-                .engine_observation(move |engine| {
-                    let engine = engine.with_data_root(root);
-                    if proxy {
-                        engine.local_proxy_status(&id)
-                    } else {
-                        engine.static_status(&id, &interface)
-                    }
-                })
-                .await
-        }
-    }
-}
-
-#[cfg(any(not(target_os = "linux"), test))]
+#[cfg(not(target_os = "linux"))]
 async fn cleanup_stale_routes_before_connect(
     runtime: &mut RuntimeState,
     profile: &Profile,
@@ -348,8 +105,11 @@ pub(crate) async fn connect_profile(
     app: tauri::AppHandle,
 ) -> Result<TunnelStatus, String> {
     let result = connect_profile_inner(id.clone(), state.inner(), &app).await;
-    let label = super::logs::profile_label(&state, &id);
-    super::logs::record_tunnel_result(&state, "connect", &label, &result);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let label = super::logs::profile_label(&state, &id);
+        super::logs::record_tunnel_result(&state, "connect", &label, &result);
+    }
     result
 }
 
@@ -358,67 +118,38 @@ async fn connect_profile_inner(
     state: &AppState,
     app: &tauri::AppHandle,
 ) -> Result<TunnelStatus, String> {
-    let mut profile = find_profile(&state.profiles, &id)?;
-    profile.check_role()?;
-    #[cfg(target_os = "linux")]
-    if profile.backend == TunnelBackend::WireGuard {
-        let status = linux_wireguard_connect(
-            &crate::daemon_client::DaemonClient::system(),
-            &state.config_vault,
-            &profile,
-        )
-        .await?;
-        let _ = app.emit("route-changed", ());
-        return Ok(status);
-    }
-    #[cfg(target_os = "linux")]
-    if profile.backend == TunnelBackend::OpenVpn {
-        let status = linux_openvpn_connect(
-            &crate::daemon_client::DaemonClient::system(),
-            &state.config_vault,
-            &state.openvpn_credentials,
-            &profile,
-        )
-        .await?;
-        let _ = app.emit("route-changed", ());
-        return Ok(status);
-    }
-    #[cfg(target_os = "linux")]
-    if profile.backend == TunnelBackend::Xray && profile.xray_mode == XrayMode::Tun {
-        let mut profiles = state.profiles.load().map_err(|e| e.to_string())?.profiles;
-        let port_notice = prepare_xray_listener_ports(state, &mut profile, &mut profiles)?;
-        let mut status = linux_xray_connect(
-            &crate::daemon_client::DaemonClient::system(),
-            &state.config_vault,
-            &profile,
-        )
-        .await?;
-        if let Some(notice) = port_notice {
-            status.message = Some(match status.message.take() {
-                Some(existing) => format!("{existing}; {notice}"),
-                None => notice,
-            });
-        }
-        let _ = app.emit("route-changed", ());
-        return Ok(status);
-    }
     #[cfg(target_os = "linux")]
     {
         let root = state.data_dir().to_path_buf();
-        let vault = state.config_vault.root().to_path_buf();
+        let credentials = state.openvpn_credentials.clone();
         let status = crate::daemon_client::DaemonClient::system()
             .engine_request(move |engine| {
-                engine.with_data_root(root).connect(
-                    &net_manager_core::config_vault::ConfigVault::new(vault),
-                    &profile,
+                let engine = engine.with_data_root(root.clone());
+                net_manager_engine::linux_runtime::connect(
+                    &net_manager_engine::linux_runtime::Context {
+                        engine: &engine,
+                        root: &root,
+                        vault: &net_manager_core::config_vault::ConfigVault::new(
+                            root.join("configs"),
+                        ),
+                        store: &net_manager_core::profiles::ProfileStore::new(
+                            root.join("profiles.json"),
+                        ),
+                    },
+                    &id,
                     None,
-                    &(),
+                    credentials.as_ref(),
+                    None,
                 )
             })
             .await?;
         let _ = app.emit("route-changed", ());
         Ok(status)
     }
+    #[cfg(not(target_os = "linux"))]
+    let mut profile = find_profile(&state.profiles, &id)?;
+    #[cfg(not(target_os = "linux"))]
+    profile.check_role()?;
     #[cfg(not(target_os = "linux"))]
     {
         if profile.backend != TunnelBackend::None {
@@ -659,8 +390,11 @@ pub(crate) async fn connect_openvpn_with_credentials(
     let result =
         connect_openvpn_with_credentials_inner(id.clone(), credentials, remember, &state, &app)
             .await;
-    let label = super::logs::profile_label(&state, &id);
-    super::logs::record_tunnel_result(&state, "connect", &label, &result);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let label = super::logs::profile_label(&state, &id);
+        super::logs::record_tunnel_result(&state, "connect", &label, &result);
+    }
     result
 }
 
@@ -673,19 +407,30 @@ async fn connect_openvpn_with_credentials_inner(
 ) -> Result<TunnelStatus, String> {
     #[cfg(target_os = "linux")]
     {
-        let profile = find_profile(&state.profiles, &id)?;
-        if profile.backend != TunnelBackend::OpenVpn {
-            return Err("profile is not OpenVPN".into());
-        }
-        let status = linux_openvpn_connect_with_credentials(
-            &crate::daemon_client::DaemonClient::system(),
-            &state.config_vault,
-            &state.openvpn_credentials,
-            &profile,
-            Some(credentials),
-            remember,
-        )
-        .await?;
+        let root = state.data_dir().to_path_buf();
+        let credential_store = state.openvpn_credentials.clone();
+        let status = crate::daemon_client::DaemonClient::system()
+            .engine_request(move |engine| {
+                let engine = engine.with_data_root(root.clone());
+                net_manager_engine::linux_runtime::connect_with_credentials(
+                    &net_manager_engine::linux_runtime::Context {
+                        engine: &engine,
+                        root: &root,
+                        vault: &net_manager_core::config_vault::ConfigVault::new(
+                            root.join("configs"),
+                        ),
+                        store: &net_manager_core::profiles::ProfileStore::new(
+                            root.join("profiles.json"),
+                        ),
+                    },
+                    &id,
+                    Some(credentials),
+                    credential_store.as_ref(),
+                    Some(credential_store.as_ref()),
+                    remember,
+                )
+            })
+            .await?;
         let _ = app.emit("route-changed", ());
         Ok(status)
     }
@@ -703,8 +448,11 @@ pub(crate) async fn disconnect_profile(
     app: tauri::AppHandle,
 ) -> Result<TunnelStatus, String> {
     let result = disconnect_profile_inner(id.clone(), state.inner(), &app).await;
-    let label = super::logs::profile_label(&state, &id);
-    super::logs::record_tunnel_result(&state, "disconnect", &label, &result);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let label = super::logs::profile_label(&state, &id);
+        super::logs::record_tunnel_result(&state, "disconnect", &label, &result);
+    }
     result
 }
 
@@ -713,39 +461,24 @@ async fn disconnect_profile_inner(
     state: &AppState,
     app: &tauri::AppHandle,
 ) -> Result<TunnelStatus, String> {
-    let profile = find_profile(&state.profiles, &id)?;
-    #[cfg(target_os = "linux")]
-    if profile.backend == TunnelBackend::WireGuard {
-        let status =
-            linux_wireguard_disconnect(&crate::daemon_client::DaemonClient::system(), &profile)
-                .await?;
-        let _ = app.emit("route-changed", ());
-        return Ok(status);
-    }
-    #[cfg(target_os = "linux")]
-    if profile.backend == TunnelBackend::OpenVpn {
-        let status =
-            linux_openvpn_disconnect(&crate::daemon_client::DaemonClient::system(), &profile)
-                .await?;
-        let _ = app.emit("route-changed", ());
-        return Ok(status);
-    }
-    #[cfg(target_os = "linux")]
-    if profile.backend == TunnelBackend::Xray && profile.xray_mode == XrayMode::Tun {
-        let status =
-            linux_xray_disconnect(&crate::daemon_client::DaemonClient::system(), &profile).await?;
-        let _ = app.emit("route-changed", ());
-        return Ok(status);
-    }
     #[cfg(target_os = "linux")]
     {
         let root = state.data_dir().to_path_buf();
         let status = crate::daemon_client::DaemonClient::system()
-            .engine_request(move |engine| engine.with_data_root(root).disconnect(&profile))
+            .engine_request(move |engine| {
+                net_manager_engine::linux_runtime::disconnect_with_root(
+                    &engine.with_data_root(root.clone()),
+                    &root,
+                    &net_manager_core::profiles::ProfileStore::new(root.join("profiles.json")),
+                    &id,
+                )
+            })
             .await?;
         let _ = app.emit("route-changed", ());
         Ok(status)
     }
+    #[cfg(not(target_os = "linux"))]
+    let profile = find_profile(&state.profiles, &id)?;
     #[cfg(not(target_os = "linux"))]
     {
         let mut runtime = state.runtime.lock().await;
@@ -781,23 +514,16 @@ pub(crate) async fn collect_tunnel_statuses(
 ) -> Result<Vec<TunnelStatus>, String> {
     #[cfg(target_os = "linux")]
     {
-        let mut statuses = Vec::with_capacity(profiles.len());
-        let client = crate::daemon_client::DaemonClient::system();
-        for profile in profiles {
-            statuses.push(
-                linux_profile_status(&client, state, profile)
-                    .await
-                    .unwrap_or_else(|error| TunnelStatus {
-                        profile_id: profile.id.clone(),
-                        state: TunnelState::Failed,
-                        message: Some(error),
-                        interface_name: None,
-                        failover: None,
-                        watchdog: None,
-                    }),
-            );
-        }
-        Ok(statuses)
+        let root = state.data_dir().to_path_buf();
+        let profiles = profiles.to_vec();
+        crate::daemon_client::DaemonClient::system()
+            .engine_observation(move |engine| {
+                net_manager_engine::linux_runtime::statuses_for(
+                    &engine.with_data_root(root),
+                    &profiles,
+                )
+            })
+            .await
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -832,18 +558,18 @@ pub(crate) async fn openvpn_plan(
     }
     #[cfg(target_os = "linux")]
     {
-        let (request, _) = prepare_linux_openvpn_request(
-            &state.config_vault,
-            state.openvpn_credentials.as_ref(),
-            &profile,
-            None,
-            profile.effective_routes(),
-            method::OPENVPN_PLAN,
-        )?;
+        let root = state.data_dir().to_path_buf();
+        let credentials = state.openvpn_credentials.clone();
         crate::daemon_client::DaemonClient::system()
-            .request(method::OPENVPN_PLAN, request)
+            .engine_request(move |engine| {
+                net_manager_engine::linux_runtime::openvpn_plan(
+                    &engine.with_data_root(root.clone()),
+                    &net_manager_core::config_vault::ConfigVault::new(root.join("configs")),
+                    &profile,
+                    credentials.as_ref(),
+                )
+            })
             .await
-            .map_err(|err| crate::daemon_client::user_message(&err))
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -866,12 +592,16 @@ pub(crate) async fn reload_xray_profile(
     }
     #[cfg(target_os = "linux")]
     {
-        linux_xray_reload(
-            &crate::daemon_client::DaemonClient::system(),
-            &state.config_vault,
-            &profile,
-        )
-        .await
+        let root = state.data_dir().to_path_buf();
+        crate::daemon_client::DaemonClient::system()
+            .engine_request(move |engine| {
+                net_manager_engine::linux_runtime::reload(
+                    &engine.with_data_root(root.clone()),
+                    &net_manager_core::config_vault::ConfigVault::new(root.join("configs")),
+                    &profile,
+                )
+            })
+            .await
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -888,9 +618,8 @@ pub(crate) async fn tailscale_status(
     #[cfg(target_os = "linux")]
     {
         crate::daemon_client::DaemonClient::system()
-            .request(method::TAILSCALE_STATUS, serde_json::Value::Null)
+            .engine_request(|engine| net_manager_engine::linux_services::tailscale_status(&engine))
             .await
-            .map_err(|err| crate::daemon_client::user_message(&err))
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -907,16 +636,10 @@ pub(crate) async fn tailscale_set_running(
     #[cfg(target_os = "linux")]
     {
         crate::daemon_client::DaemonClient::system()
-            .request(
-                if running {
-                    method::TAILSCALE_UP
-                } else {
-                    method::TAILSCALE_DOWN
-                },
-                serde_json::Value::Null,
-            )
+            .engine_request(move |engine| {
+                net_manager_engine::linux_services::tailscale_set_running(&engine, running)
+            })
             .await
-            .map_err(|err| crate::daemon_client::user_message(&err))
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -1056,6 +779,99 @@ mod tests {
     use net_manager_core::daemon_protocol::{OpenVpnConnectionState, OpenVpnWarning};
 
     #[cfg(target_os = "linux")]
+    async fn linux_openvpn_connect(
+        client: &crate::daemon_client::DaemonClient,
+        vault: &net_manager_core::config_vault::ConfigVault,
+        store: &std::sync::Arc<OpenVpnCredentialStore>,
+        profile: &Profile,
+    ) -> Result<TunnelStatus, String> {
+        linux_openvpn_connect_with_credentials(client, vault, store, profile, None, false).await
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn linux_openvpn_connect_with_credentials(
+        client: &crate::daemon_client::DaemonClient,
+        vault: &net_manager_core::config_vault::ConfigVault,
+        store: &std::sync::Arc<OpenVpnCredentialStore>,
+        profile: &Profile,
+        supplied: Option<OpenVpnCredentials>,
+        remember: bool,
+    ) -> Result<TunnelStatus, String> {
+        let root = vault.root().to_path_buf();
+        let profile = profile.clone();
+        let store = store.clone();
+        client
+            .engine_request(move |engine| {
+                let vault = net_manager_core::config_vault::ConfigVault::new(root);
+                let root = vault
+                    .root()
+                    .parent()
+                    .ok_or("The application data directory is unavailable")?;
+                let profiles =
+                    net_manager_core::profiles::ProfileStore::new(root.join("profiles.json"));
+                let context = net_manager_engine::linux_runtime::Context {
+                    engine: &engine,
+                    root,
+                    vault: &vault,
+                    store: &profiles,
+                };
+                net_manager_engine::linux_runtime::connect_prepared(
+                    &context,
+                    &profile,
+                    supplied,
+                    store.as_ref(),
+                    Some(store.as_ref()),
+                    remember,
+                )
+            })
+            .await
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn linux_xray_connect(
+        client: &crate::daemon_client::DaemonClient,
+        vault: &net_manager_core::config_vault::ConfigVault,
+        profile: &Profile,
+    ) -> Result<TunnelStatus, String> {
+        let root = vault.root().to_path_buf();
+        let profile = profile.clone();
+        client
+            .engine_request(move |engine| {
+                let vault = net_manager_core::config_vault::ConfigVault::new(root);
+                let root = vault
+                    .root()
+                    .parent()
+                    .ok_or("The application data directory is unavailable")?;
+                let profiles =
+                    net_manager_core::profiles::ProfileStore::new(root.join("profiles.json"));
+                let context = net_manager_engine::linux_runtime::Context {
+                    engine: &engine,
+                    root,
+                    vault: &vault,
+                    store: &profiles,
+                };
+                net_manager_engine::linux_runtime::connect_prepared(
+                    &context,
+                    &profile,
+                    None,
+                    &(),
+                    None,
+                    false,
+                )
+            })
+            .await
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn linux_wireguard_connect(
+        client: &crate::daemon_client::DaemonClient,
+        vault: &net_manager_core::config_vault::ConfigVault,
+        profile: &Profile,
+    ) -> Result<TunnelStatus, String> {
+        linux_xray_connect(client, vault, profile).await
+    }
+
+    #[cfg(target_os = "linux")]
     fn test_credential_store() -> std::sync::Arc<OpenVpnCredentialStore> {
         std::sync::Arc::new(OpenVpnCredentialStore::new(Box::new(
             crate::test_support::FakeKeyring::default(),
@@ -1145,11 +961,16 @@ mod tests {
                 .state,
             TunnelState::Running
         );
-        let status = linux_openvpn_status(&client, &profile).await.unwrap();
+        let observed_profile = profile.clone();
+        let status = client
+            .engine_request(move |engine| engine.status(&observed_profile))
+            .await
+            .unwrap();
         assert_eq!(status.state, TunnelState::Running);
         assert!(status.message.unwrap().contains("DNS was not applied"));
         assert_eq!(
-            linux_openvpn_disconnect(&client, &profile)
+            client
+                .engine_request(move |engine| engine.disconnect(&profile))
                 .await
                 .unwrap()
                 .state,
@@ -1410,6 +1231,142 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_openvpn_failed_connect_preserves_remembered_credentials() {
+        use net_manager_core::daemon_protocol::{
+            ErrorBody, ErrorCode, HelloResult, OpenVpnUserPass, PROTOCOL_VERSION,
+        };
+        use net_manager_core::helper_client::HelperError;
+        use net_manager_engine::{linux_engine::LinuxEngine, Privileged};
+
+        struct ConnectOutcome {
+            rejected: bool,
+            failure_delivered: std::sync::atomic::AtomicBool,
+        }
+        impl Privileged for ConnectOutcome {
+            fn hello(&self) -> Result<HelloResult, HelperError> {
+                Ok(HelloResult {
+                    protocol: PROTOCOL_VERSION,
+                    daemon_version: "test".into(),
+                    uid: 1000,
+                    capabilities: vec![method::OPENVPN_CONNECT.into()],
+                    tools: Default::default(),
+                })
+            }
+            fn call_raw(
+                &self,
+                operation: &str,
+                params: serde_json::Value,
+            ) -> Result<serde_json::Value, HelperError> {
+                if operation == method::OPENVPN_CONNECT {
+                    self.failure_delivered
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                match operation {
+                    method::OPENVPN_CONNECT if self.rejected => {
+                        Err(HelperError::Rejected(ErrorBody {
+                            code: ErrorCode::NotAuthorized,
+                            message: "connection rejected".into(),
+                        }))
+                    }
+                    method::OPENVPN_CONNECT => Ok(serde_json::json!({
+                        "status": {
+                            "profileId": params["profileId"],
+                            "state": "failed",
+                            "interfaceName": null,
+                            "rxBytes": 0,
+                            "txBytes": 0,
+                            "appliedRoutes": [],
+                            "warnings": [],
+                        }
+                    })),
+                    _ => panic!("unexpected operation in connection-outcome provider"),
+                }
+            }
+            fn log_dir(&self) -> std::path::PathBuf {
+                Default::default()
+            }
+        }
+
+        let dir = unique_dir("ovpn-failed-credential-transition");
+        let source = dir.join("client.ovpn");
+        std::fs::write(&source, "client\nremote vpn.example\nauth-user-pass\n").unwrap();
+        let vault = net_manager_core::config_vault::ConfigVault::new(dir.join("configs"));
+        let mut p = profile("ovpn");
+        p.backend = TunnelBackend::OpenVpn;
+        p.config_path = vault
+            .import(&p.id, TunnelBackend::OpenVpn, &source)
+            .unwrap()
+            .config_path;
+        let old = OpenVpnCredentials {
+            auth_user_pass: Some(OpenVpnUserPass {
+                username: "private-user".into(),
+                password: "old-private-password".into(),
+            }),
+            private_key_passphrase: None,
+        };
+        let supplied = OpenVpnCredentials {
+            auth_user_pass: Some(OpenVpnUserPass {
+                username: "private-user".into(),
+                password: "new-private-password".into(),
+            }),
+            private_key_passphrase: None,
+        };
+        for remember in [true, false] {
+            for rejected in [true, false] {
+                let keyring = crate::test_support::FakeKeyring::default();
+                let entries = keyring.entries.clone();
+                let store = OpenVpnCredentialStore::new(Box::new(keyring));
+                assert!(store.remember(&p.id, &old).is_none());
+                let provider = std::sync::Arc::new(ConnectOutcome {
+                    rejected,
+                    failure_delivered: std::sync::atomic::AtomicBool::new(false),
+                });
+                let engine = LinuxEngine::with_privileged(provider.clone());
+                let profiles =
+                    net_manager_core::profiles::ProfileStore::new(dir.join("profiles.json"));
+                let context = net_manager_engine::linux_runtime::Context {
+                    engine: &engine,
+                    root: &dir,
+                    vault: &vault,
+                    store: &profiles,
+                };
+
+                let result = net_manager_engine::linux_runtime::connect_prepared(
+                    &context,
+                    &p,
+                    Some(supplied.clone()),
+                    &store,
+                    Some(&store),
+                    remember,
+                );
+
+                assert!(result.is_err(), "rejected or unconfirmed connect must fail");
+                assert!(
+                    provider
+                        .failure_delivered
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    "the configured rejection/unconfirmed outcome was not exercised"
+                );
+                let persisted: Option<OpenVpnCredentials> = entries
+                    .lock()
+                    .unwrap()
+                    .get(&p.id)
+                    .map(|bytes| serde_json::from_slice(bytes).unwrap());
+                assert!(persisted.as_ref() == Some(&old),
+                    "failed connect changed persistent credentials (remember={remember}, rejected={rejected})");
+                let cached = store
+                    .load(&p.id, &openvpn_credentials_path(&vault, &p).unwrap())
+                    .unwrap()
+                    .0;
+                assert!(cached.as_ref() == Some(&old),
+                    "failed connect changed cached credentials (remember={remember}, rejected={rejected})");
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn linux_openvpn_probe_uses_managed_bytes_and_remembered_credentials() {
         use net_manager_core::daemon_protocol::{OpenVpnUserPass, RequestFrame, ResponseFrame};
@@ -1565,152 +1522,6 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn linux_wireguard_uses_daemon_connect_disconnect_and_status() {
-        use net_manager_core::daemon_protocol::{method, RequestFrame, ResponseFrame};
-        use serde_json::json;
-        use tokio::io::{AsyncWriteExt, BufReader};
-        use tokio::net::UnixListener;
-
-        let dir = unique_dir("wg-daemon-bridge");
-        let socket = dir.join("daemon.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
-        let mut profile = profile("wg-p1");
-        profile.config_path = dir.join("p1.conf");
-        std::fs::write(
-            &profile.config_path,
-            "[Interface]\nPrivateKey = fixture\nAddress = 10.77.0.2/32\n[Peer]\nAllowedIPs = 10.77.0.0/24\n",
-        )
-        .unwrap();
-        let vault = net_manager_core::config_vault::ConfigVault::new(dir.join("configs"));
-        profile.config_path = vault
-            .import(&profile.id, TunnelBackend::WireGuard, &profile.config_path)
-            .unwrap()
-            .config_path;
-        let server = tokio::spawn(async move {
-            for expected in [
-                method::WIREGUARD_CONNECT,
-                method::WIREGUARD_STATUS,
-                method::WIREGUARD_DISCONNECT,
-            ] {
-                let (stream, _) = listener.accept().await.unwrap();
-                let (reader, mut writer) = stream.into_split();
-                let mut reader = BufReader::new(reader);
-                let hello: RequestFrame = serde_json::from_slice(
-                    &net_manager_core::daemon_protocol::read_frame(&mut reader, 1024)
-                        .await
-                        .unwrap()
-                        .unwrap(),
-                )
-                .unwrap();
-                assert_eq!(hello.method, method::HELLO);
-                writer
-                    .write_all(
-                        &net_manager_core::daemon_protocol::encode_line(&ResponseFrame::ok(
-                            hello.id,
-                            json!({"protocol":1,"daemonVersion":"test","uid":1000,"capabilities":[]}),
-                        ))
-                        .unwrap(),
-                    )
-                    .await
-                    .unwrap();
-                let request: RequestFrame = serde_json::from_slice(
-                    &net_manager_core::daemon_protocol::read_frame(&mut reader, 4096)
-                        .await
-                        .unwrap()
-                        .unwrap(),
-                )
-                .unwrap();
-                assert_eq!(request.method, expected);
-                assert_eq!(request.params["profileId"], "p1");
-                if expected == method::WIREGUARD_CONNECT {
-                    assert!(request.params["config"]
-                        .as_str()
-                        .unwrap()
-                        .contains("[Interface]"));
-                    assert_eq!(request.params["routes"], json!([]));
-                }
-                let result = match expected {
-                    method::WIREGUARD_CONNECT => {
-                        json!({"status": {"profileId":"p1","state":"running","interfaceName":"wg-p1","latestHandshake":null,"rxBytes":0,"txBytes":0,"dnsApplied":false,"warnings":[]}})
-                    }
-                    method::WIREGUARD_STATUS => {
-                        json!({"profileId":"p1","state":"stopped","interfaceName":null,"latestHandshake":null,"rxBytes":0,"txBytes":0,"dnsApplied":false,"warnings":[]})
-                    }
-                    _ => json!({"stopped":true}),
-                };
-                writer
-                    .write_all(
-                        &net_manager_core::daemon_protocol::encode_line(&ResponseFrame::ok(
-                            request.id, result,
-                        ))
-                        .unwrap(),
-                    )
-                    .await
-                    .unwrap();
-            }
-        });
-        let client = crate::daemon_client::DaemonClient::new(socket);
-        assert_eq!(
-            linux_wireguard_connect(&client, &vault, &profile)
-                .await
-                .unwrap()
-                .state,
-            TunnelState::Running
-        );
-        assert_eq!(
-            linux_wireguard_status(&client, &profile)
-                .await
-                .unwrap()
-                .state,
-            TunnelState::Stopped
-        );
-        assert_eq!(
-            linux_wireguard_disconnect(&client, &profile)
-                .await
-                .unwrap()
-                .state,
-            TunnelState::Stopped
-        );
-        server.await.unwrap();
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn generated_xray_tun_params_use_vault_config_default_route_and_dns() {
-        let dir = unique_dir("xray-tun-params");
-        let vault = net_manager_core::config_vault::ConfigVault::new(dir.join("configs"));
-        let mut p = profile("xray-tun");
-        p.id = "xray-tun".into();
-        p.backend = TunnelBackend::Xray;
-        p.xray_mode = XrayMode::Tun;
-        p.xray_socks_port = Some(10808);
-        p.xray_http_port = Some(10809);
-        let config = net_manager_core::xray::generate_share_link_config_with_http(
-            "vless://11111111-2222-3333-4444-555555555555@node.test:443?security=tls",
-            10808,
-            10809,
-        )
-        .unwrap();
-        p.config_path = vault
-            .store_xray_config(&p.id, &serde_json::to_vec(&config).unwrap())
-            .unwrap()
-            .config_path;
-        let params = prepare_linux_xray_tun_params(&vault, &p).unwrap();
-        assert_eq!(params.profile_id, p.id);
-        assert_eq!(params.routes.len(), 1);
-        assert_eq!(params.routes[0].destination.to_string(), "0.0.0.0/0");
-        assert_eq!(
-            params.dns_servers,
-            vec!["1.1.1.1".parse::<std::net::IpAddr>().unwrap()]
-        );
-        assert!(params.dns_domains.is_empty());
-        assert!(params.config.contains("\"http-in\""));
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[cfg(target_os = "linux")]
     #[test]
     fn xray_tun_rejects_arbitrary_json_without_echoing_secret() {
         let dir = unique_dir("xray-tun-reject");
@@ -1733,7 +1544,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn split_default_profile_emits_def1_halves_and_dns_bypasses() {
+    fn split_default_profile_bypasses_direct_dns_but_not_proxy_dns() {
         let dir = unique_dir("xray-split-default");
         let vault = net_manager_core::config_vault::ConfigVault::new(dir.join("configs"));
         let mut p = profile("xray-split-def");
@@ -1777,18 +1588,8 @@ mod tests {
             .unwrap()
             .config_path;
         let params = prepare_linux_xray_tun_params(&vault, &p).unwrap();
-        assert_eq!(
-            params
-                .routes
-                .iter()
-                .map(|r| r.destination.to_string())
-                .collect::<Vec<_>>(),
-            ["0.0.0.0/1", "128.0.0.0/1"]
-        );
-        // Direct resolvers and the well-known public DNS stay on the
-        // physical uplink; the proxy-routed resolver does not (it must be
-        // reachable *through* the tunnel).
-        for expected in ["1.1.1.1", "8.8.8.8", "9.9.9.9", "dns.resolver.test"] {
+        // Direct resolvers stay on the physical uplink; proxy-routed DNS must use the tunnel.
+        for expected in ["9.9.9.9", "dns.resolver.test"] {
             assert!(
                 params.dns_bypass.iter().any(|h| h == expected),
                 "missing {expected} in {:?}",
@@ -1942,109 +1743,6 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn linux_xray_tun_uses_daemon_for_connect_restart_status_and_disconnect() {
-        use net_manager_core::daemon_protocol::{RequestFrame, ResponseFrame};
-        use serde_json::json;
-        use tokio::io::{AsyncWriteExt, BufReader};
-        use tokio::net::UnixListener;
-
-        let dir = unique_dir("xray-tun-daemon");
-        let socket = dir.join("daemon.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
-        let vault = net_manager_core::config_vault::ConfigVault::new(dir.join("configs"));
-        let mut p = profile("xray-p1");
-        p.id = "xray-p1".into();
-        p.backend = TunnelBackend::Xray;
-        p.xray_mode = XrayMode::Tun;
-        p.xray_socks_port = Some(10808);
-        p.xray_http_port = Some(10809);
-        let config = net_manager_core::xray::generate_share_link_config_with_http(
-            "hy2://private-auth@node.test:443",
-            10808,
-            10809,
-        )
-        .unwrap();
-        p.config_path = vault
-            .store_xray_config(&p.id, &serde_json::to_vec(&config).unwrap())
-            .unwrap()
-            .config_path;
-        let server = tokio::spawn(async move {
-            for method_name in [
-                method::XRAY_CONNECT,
-                method::XRAY_STATUS,
-                method::XRAY_DISCONNECT,
-            ] {
-                let (stream, _) = listener.accept().await.unwrap();
-                let (reader, mut writer) = stream.into_split();
-                let mut reader = BufReader::new(reader);
-                let hello: RequestFrame = serde_json::from_slice(
-                    &net_manager_core::daemon_protocol::read_frame(&mut reader, 1024)
-                        .await
-                        .unwrap()
-                        .unwrap(),
-                )
-                .unwrap();
-                writer.write_all(&net_manager_core::daemon_protocol::encode_line(&ResponseFrame::ok(
-                    hello.id, json!({"protocol":1,"daemonVersion":"test","uid":1000,"capabilities":[]})
-                )).unwrap()).await.unwrap();
-                let request: RequestFrame = serde_json::from_slice(
-                    &net_manager_core::daemon_protocol::read_frame(&mut reader, 8192)
-                        .await
-                        .unwrap()
-                        .unwrap(),
-                )
-                .unwrap();
-                assert_eq!(request.method, method_name);
-                assert_eq!(request.params["profileId"], "xray-p1");
-                if method_name == method::XRAY_CONNECT {
-                    assert_eq!(request.params["routes"][0]["destination"], "0.0.0.0/0");
-                    assert_eq!(request.params["dnsServers"], json!(["1.1.1.1"]));
-                    let config: serde_json::Value =
-                        serde_json::from_str(request.params["config"].as_str().unwrap()).unwrap();
-                    assert_eq!(config["outbounds"][0]["protocol"], "hysteria");
-                }
-                let status = json!({"profileId":"xray-p1","state":"running","interfaceName":"xray-test","dnsApplied":true,"ipv4Covered":true,"ipv6Covered":false});
-                let result = match method_name {
-                    method::XRAY_CONNECT => json!({"status": status}),
-                    method::XRAY_STATUS => status,
-                    _ => json!({"stopped":true}),
-                };
-                writer
-                    .write_all(
-                        &net_manager_core::daemon_protocol::encode_line(&ResponseFrame::ok(
-                            request.id, result,
-                        ))
-                        .unwrap(),
-                    )
-                    .await
-                    .unwrap();
-            }
-        });
-        let client = crate::daemon_client::DaemonClient::new(socket.clone());
-        let connected = linux_xray_connect(&client, &vault, &p).await.unwrap();
-        assert_eq!(connected.state, TunnelState::Running);
-        assert!(connected.message.unwrap().contains("IPv6 is not covered"));
-        let restarted_client = crate::daemon_client::DaemonClient::new(socket);
-        assert_eq!(
-            linux_xray_status(&restarted_client, &p)
-                .await
-                .unwrap()
-                .state,
-            TunnelState::Running
-        );
-        assert_eq!(
-            linux_xray_disconnect(&restarted_client, &p)
-                .await
-                .unwrap()
-                .state,
-            TunnelState::Stopped
-        );
-        server.await.unwrap();
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
     async fn linux_wireguard_forwards_full_and_dns_and_shows_daemon_outcomes() {
         use net_manager_core::daemon_protocol::{method, ErrorCode, RequestFrame, ResponseFrame};
         use serde_json::json;
@@ -2162,8 +1860,9 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    #[cfg(not(target_os = "linux"))]
     #[tokio::test]
-    #[cfg_attr(not(target_os = "linux"), allow(irrefutable_let_patterns))]
+    #[allow(irrefutable_let_patterns)]
     async fn cleanup_stale_clears_tracked_routes_and_persists_registry() {
         let dir = unique_dir("cleanup-stale");
         let state = app_state(&dir);

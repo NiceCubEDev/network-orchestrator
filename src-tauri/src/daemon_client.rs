@@ -4,10 +4,9 @@ use net_manager_core::daemon_protocol::{
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
-use serde_json::Value;
 use std::fmt;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
@@ -128,10 +127,6 @@ impl DaemonClient {
                 hello.protocol
             )));
         }
-        if method_name == method::HELLO {
-            return serde_json::from_value(serde_json::to_value(hello).unwrap())
-                .map_err(|e| ClientError::Protocol(e.to_string()));
-        }
         let request = RequestFrame {
             id: 2,
             method: method_name.into(),
@@ -142,10 +137,6 @@ impl DaemonClient {
             .write_all(&daemon_protocol::encode_line(&request)?)
             .await?;
         read_response(&mut reader, 2, method_name).await
-    }
-
-    pub(crate) async fn hello(&self) -> Result<HelloResult, ClientError> {
-        self.exchange(method::HELLO, Value::Null).await
     }
 
     pub(crate) async fn request<P: Serialize, R: DeserializeOwned>(
@@ -195,99 +186,11 @@ fn response_timeout(method_name: &str) -> Option<std::time::Duration> {
     Some(std::time::Duration::from_secs(secs))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[allow(dead_code)]
-#[serde(rename_all = "camelCase")]
-pub(crate) enum DaemonState {
-    NotRequired,
-    NotInstalled,
-    NotRunning,
-    Incompatible,
-    Ready,
-    Error,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct DaemonStatus {
-    pub(crate) state: DaemonState,
-    pub(crate) message: String,
-}
-
-pub(crate) fn classify_status(socket: &Path, unit: &Path) -> DaemonStatus {
-    let state = if !socket.exists() {
-        if unit.exists() {
-            DaemonState::NotRunning
-        } else {
-            DaemonState::NotInstalled
-        }
-    } else {
-        DaemonState::Error
-    };
-    let message = match state {
-        DaemonState::NotInstalled => {
-            "Network daemon is not installed. Install the network-orchestrator package."
-        }
-        DaemonState::NotRunning => {
-            "Network daemon is not running. Start network-orchestrator.service."
-        }
-        _ => "Network daemon is unavailable.",
-    };
-    DaemonStatus {
-        state,
-        message: message.into(),
-    }
-}
-
-pub(crate) async fn daemon_status() -> DaemonStatus {
-    let client = DaemonClient::system();
-    match client.hello().await {
-        Ok(_) => DaemonStatus {
-            state: DaemonState::Ready,
-            message: "Network daemon is ready.".into(),
-        },
-        Err(err) => {
-            let units = [
-                "/etc/systemd/system/network-orchestrator.service",
-                "/usr/lib/systemd/system/network-orchestrator.service",
-                "/lib/systemd/system/network-orchestrator.service",
-            ];
-            let unit = units
-                .iter()
-                .find(|path| Path::new(path).exists())
-                .copied()
-                .unwrap_or(units[0]);
-            classify_error(err, &client.path, Path::new(unit))
-        }
-    }
-}
-
-fn classify_error(err: ClientError, socket: &Path, unit: &Path) -> DaemonStatus {
-    match err {
-        ClientError::Daemon(ErrorBody {
-            code: ErrorCode::ProtocolMismatch,
-            message,
-        }) => DaemonStatus {
-            state: DaemonState::Incompatible,
-            message,
-        },
-        ClientError::Protocol(message) if message.contains("protocol") => DaemonStatus {
-            state: DaemonState::Incompatible,
-            message,
-        },
-        ClientError::Transport(err) if socket.exists() => DaemonStatus {
-            state: DaemonState::Error,
-            message: format!("Network daemon socket is present but cannot be reached: {err}"),
-        },
-        _ => classify_status(socket, unit),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use net_manager_core::daemon_protocol::{method, ErrorCode, RequestFrame, ResponseFrame};
-    use serde_json::json;
+    use serde_json::{json, Value};
     use tokio::io::{AsyncWriteExt, BufReader};
     use tokio::net::UnixListener;
 
@@ -349,28 +252,6 @@ mod tests {
     }
 
     #[test]
-    fn missing_socket_without_unit_is_not_installed() {
-        let dir = crate::test_support::unique_dir("daemon-status");
-        assert_eq!(
-            classify_status(&dir.join("missing.sock"), &dir.join("missing.service")).state,
-            DaemonState::NotInstalled
-        );
-    }
-
-    #[test]
-    fn missing_socket_with_unit_is_not_running() {
-        let dir = crate::test_support::unique_dir("daemon-status-unit");
-        std::fs::create_dir_all(&dir).unwrap();
-        let unit = dir.join("daemon.service");
-        std::fs::write(&unit, "[Service]\n").unwrap();
-        assert_eq!(
-            classify_status(&dir.join("missing.sock"), &unit).state,
-            DaemonState::NotRunning
-        );
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
     fn not_authorized_message_mentions_polkit() {
         let message = user_message(&ClientError::Daemon(
             net_manager_core::daemon_protocol::ErrorBody {
@@ -379,20 +260,6 @@ mod tests {
             },
         ));
         assert!(message.contains("polkit"));
-    }
-
-    #[test]
-    fn mismatch_classifies_incompatible() {
-        let err = ClientError::Daemon(net_manager_core::daemon_protocol::ErrorBody {
-            code: ErrorCode::ProtocolMismatch,
-            message: "daemon speaks protocol 2".into(),
-        });
-        let status = classify_error(
-            err,
-            Path::new("/missing.sock"),
-            Path::new("/missing.service"),
-        );
-        assert_eq!(status.state, DaemonState::Incompatible);
     }
 
     #[test]
@@ -439,7 +306,10 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let err = DaemonClient::new(path.clone()).hello().await.unwrap_err();
+        let err = DaemonClient::new(path.clone())
+            .request::<_, Value>(method::OWNED_LIST, Value::Null)
+            .await
+            .unwrap_err();
         match err {
             ClientError::Daemon(body) => {
                 assert_eq!(body.code, ErrorCode::Busy);
@@ -448,22 +318,6 @@ mod tests {
             other => panic!("expected daemon error, got {other:?}"),
         }
         server.await.unwrap();
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn existing_socket_transport_error_is_explained() {
-        let dir = crate::test_support::unique_dir("daemon-socket-error");
-        std::fs::create_dir_all(&dir).unwrap();
-        let socket = dir.join("daemon.sock");
-        std::fs::write(&socket, b"stale").unwrap();
-        let status = classify_error(
-            ClientError::Transport(io::Error::new(io::ErrorKind::ConnectionRefused, "refused")),
-            &socket,
-            &dir.join("daemon.service"),
-        );
-        assert_eq!(status.state, DaemonState::Error);
-        assert!(status.message.contains("refused"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

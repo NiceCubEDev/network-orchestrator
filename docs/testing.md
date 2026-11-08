@@ -56,6 +56,43 @@ Workspace fmt/check/strict Clippy/tests (excluding native macOS crates), version
 checks/tests, `npm run build` and frontend tests passed. This verifies Linux, not
 macOS/Windows integration or physical logout/reboot behavior.
 
+## Linux CLI-first and dual-stack validation
+
+Run ordinary Rust tests as an unprivileged user. On Linux, the relevant package
+gate excludes the macOS-only bridge/helper targets:
+
+```bash
+cargo test -p net-manager-core -p net-manager-engine -p network-orchestrator-daemon -p net-manager-cli -p net-manager-app
+npm run test
+npm run build
+```
+
+Consumer regressions cover cached subscription identity/redaction and atomic
+partial edits, concurrent named exits and connection-set writers, missing
+references, credential/configuration preflight before teardown, retained
+rollback bytes, legacy user-runtime rejection, shared logs and cross-process
+installation cancellation. No ignored Windows network tests are needed.
+
+`e2e/linux/run.sh` creates an IPv6-enabled disposable Docker network. Its
+`xray_tun_scenarios.py CLIENT SERVER` stage uses the pinned Xray binary and
+geodata (`XRAY_E2E_BINARY`/`XRAY_E2E_GEO_DIR` override their fixture paths).
+All routes, addresses, DNS and process mutations stay inside the containers.
+The host needs no working public IPv6 uplink.
+
+The packet scenarios exercise IPv6-only scope, dual-stack secondary scope and
+dual-stack primary capture; IPv6 VLESS transport, TCP HTTP and fresh AAAA/UDP
+DNS queries; reload and child respawn; daemon crash recovery and removal of
+addresses, rules, routes, children and resolved configuration. An eth0 packet
+observer requires actual VLESS transport and rejects direct packets to the
+selected IPv6 payload target. This proves the selected TCP/DNS paths, not the
+absence of every possible underlay leak or public-provider IPv6 availability.
+
+GUI smoke uses the browser sandbox with synthetic data: insert-only legacy
+set migration, missing-member display, reload persistence, external-store
+refresh, cancellation before teardown and memory-only OpenVPN credential
+collection. Native desktop/tray acceptance and live third-party provider login
+remain separate from this sandbox contract.
+
 ## Linux multinode routing and recovery
 
 ```bash

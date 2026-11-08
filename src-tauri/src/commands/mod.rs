@@ -14,6 +14,7 @@ pub(crate) mod proxies;
 pub(crate) mod recovery;
 pub(crate) mod route_check;
 pub(crate) mod route_map;
+pub(crate) mod sets;
 pub(crate) mod system;
 pub(crate) mod tunnels;
 
@@ -52,6 +53,10 @@ pub(crate) use proxies::scan_local_proxies;
 pub(crate) use recovery::{cleanup_recovery, get_recovery_report};
 pub(crate) use route_check::xray_test_route;
 pub(crate) use route_map::get_route_map;
+pub(crate) use sets::{
+    apply_connection_set, capture_connection_set, delete_connection_set, down_connection_set,
+    get_connection_set, import_connection_sets, list_connection_sets, put_connection_set,
+};
 pub(crate) use system::{
     cancel_managed_xray_install, daemon_status, discover_wireguard_configs,
     get_backend_availability, get_managed_xray_offer, get_platform_capabilities, get_vpn_auth_mode,

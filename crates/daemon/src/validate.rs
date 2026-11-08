@@ -13,16 +13,6 @@ use std::net::IpAddr;
 /// VPN servers, not a bulk list.
 pub const MAX_ENDPOINT_BYPASSES: usize = 256;
 
-/// Detect a full address-family union even when no single route is `/0`.
-pub fn full_coverage(routes: impl IntoIterator<Item = IpNet>) -> (bool, bool) {
-    let networks: Vec<_> = routes.into_iter().collect();
-    let aggregated = IpNet::aggregate(&networks);
-    (
-        aggregated.iter().any(|net| net.to_string() == "0.0.0.0/0"),
-        aggregated.iter().any(|net| net.to_string() == "::/0"),
-    )
-}
-
 /// Linux interface names are limited to `IFNAMSIZ - 1` = 15 bytes. Beyond
 /// that we accept only characters that can never be mistaken for a flag or a
 /// shell metacharacter, even though nothing here ever touches a shell.
@@ -179,25 +169,6 @@ mod tests {
             gateway: Some(gateway.parse().unwrap()),
             ..route(dest, 5)
         }
-    }
-
-    #[test]
-    fn full_coverage_detects_decomposed_ipv4_and_ipv6_unions() {
-        let networks: Vec<IpNet> = [
-            "0.0.0.0/2",
-            "64.0.0.0/2",
-            "128.0.0.0/2",
-            "192.0.0.0/2",
-            "::/2",
-            "4000::/2",
-            "8000::/2",
-            "c000::/2",
-        ]
-        .into_iter()
-        .map(|network| network.parse().unwrap())
-        .collect();
-        assert_eq!(full_coverage(networks.iter().copied()), (true, true));
-        assert_eq!(full_coverage(networks[..3].iter().copied()), (false, false));
     }
 
     #[test]

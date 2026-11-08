@@ -11,13 +11,27 @@ mod checks;
 mod commands;
 mod compat;
 mod ctx;
+#[cfg(target_os = "linux")]
+mod diagnostics;
 mod endpoints;
 mod hold;
 mod library;
 mod migrate;
+#[cfg(target_os = "linux")]
+mod network;
 mod observe;
+#[cfg(target_os = "linux")]
+mod profile;
 mod proxy;
 mod route;
+#[cfg(target_os = "linux")]
+mod runtime;
+#[cfg(target_os = "linux")]
+mod services;
+#[cfg(target_os = "linux")]
+mod sets;
+#[cfg(target_os = "linux")]
+mod system;
 
 use args::{Cli, Command};
 use clap::{CommandFactory, Parser};
@@ -25,8 +39,11 @@ use std::process::ExitCode;
 
 pub fn main() -> ExitCode {
     let private_command = std::env::args_os().find_map(|arg| match arg.to_str() {
-        Some("checks") => Some("checks"),
-        Some("proxy") => Some("proxy"),
+        Some(
+            command @ ("checks" | "proxy" | "profile" | "subscription" | "net" | "service"
+            | "always-on" | "condition" | "diagnostics" | "logs" | "recovery" | "system"
+            | "backend" | "sets" | "openvpn" | "reload" | "add" | "up"),
+        ) => Some(command.to_string()),
         _ => None,
     });
     let json_requested = std::env::args_os().any(|arg| arg == "--json");
@@ -46,14 +63,18 @@ pub fn main() -> ExitCode {
             return ExitCode::from(2);
         }
         Err(error)
-            if private_command.is_some()
-                && !matches!(
-                    error.kind(),
-                    clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
-                ) =>
+            if !matches!(
+                error.kind(),
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+            ) =>
         {
-            let command = private_command.unwrap_or("proxy");
-            eprintln!("netorch: invalid {command} arguments; use `netorch {command} --help`");
+            let command = private_command.as_deref().unwrap_or("");
+            let help = if command.is_empty() {
+                "netorch --help".to_string()
+            } else {
+                format!("netorch {command} --help")
+            };
+            eprintln!("netorch: invalid {command} arguments; use `{help}`");
             return ExitCode::from(2);
         }
         Err(error) => error.exit(),
@@ -190,6 +211,34 @@ fn run(ctx: &ctx::Ctx, command: Command, json: bool) -> Result<commands::Output,
         )
         .map(|_| (serde_json::Value::Null, String::new())),
         Command::Version => compat::version(ctx),
+        #[cfg(target_os = "linux")]
+        Command::Profile(command) => profile::run_profile(ctx, command),
+        #[cfg(target_os = "linux")]
+        Command::Subscription(command) => profile::run_subscription(ctx, command),
+        #[cfg(target_os = "linux")]
+        Command::Net(command) => network::run(ctx, command),
+        #[cfg(target_os = "linux")]
+        Command::Service(command) => services::run_service(ctx, command),
+        #[cfg(target_os = "linux")]
+        Command::AlwaysOn(command) => services::run_always_on(ctx, command),
+        #[cfg(target_os = "linux")]
+        Command::Condition(command) => services::run_condition(ctx, command),
+        #[cfg(target_os = "linux")]
+        Command::System(command) => system::run_system(ctx, command),
+        #[cfg(target_os = "linux")]
+        Command::Backend(command) => system::run_backend(ctx, command),
+        #[cfg(target_os = "linux")]
+        Command::Openvpn(command) => runtime::run_openvpn(ctx, command),
+        #[cfg(target_os = "linux")]
+        Command::Reload { profile } => runtime::run_reload(ctx, profile),
+        #[cfg(target_os = "linux")]
+        Command::Diagnostics(command) => diagnostics::run_diagnostics(ctx, command),
+        #[cfg(target_os = "linux")]
+        Command::Logs(command) => diagnostics::run_logs(ctx, command),
+        #[cfg(target_os = "linux")]
+        Command::Recovery(command) => diagnostics::run_recovery(ctx, command),
+        #[cfg(target_os = "linux")]
+        Command::Sets(command) => sets::run(ctx, command),
         Command::Ls => commands::ls(ctx),
         Command::Status { target } => commands::status(ctx, target.as_deref()),
         Command::Watch { target } => observe::watch(ctx, target.as_deref(), json),

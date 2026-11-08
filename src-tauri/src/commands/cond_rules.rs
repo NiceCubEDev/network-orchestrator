@@ -3,7 +3,7 @@ use net_manager_core::daemon_protocol::{
 };
 
 #[cfg(target_os = "linux")]
-use net_manager_core::daemon_protocol::{method, CondRulesPutParams, CondRulesRemoveParams};
+use net_manager_engine::{linux_engine::LinuxEngine, linux_services};
 
 /// Per-user conditional rules with live evaluation status. Linux daemon
 /// only; other platforms report an empty list.
@@ -11,10 +11,11 @@ use net_manager_core::daemon_protocol::{method, CondRulesPutParams, CondRulesRem
 pub(crate) async fn list_conditional_rules() -> Result<CondRulesListResult, String> {
     #[cfg(target_os = "linux")]
     {
-        crate::daemon_client::DaemonClient::system()
-            .request(method::COND_RULES_LIST, serde_json::Value::Null)
-            .await
-            .map_err(|err| crate::daemon_client::user_message(&err))
+        tauri::async_runtime::spawn_blocking(|| {
+            linux_services::condition_list(&LinuxEngine::new("network-orchestrator"))
+        })
+        .await
+        .map_err(|_| "Conditional rule task failed".to_string())?
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -30,10 +31,11 @@ pub(crate) async fn put_conditional_rule(
 ) -> Result<CondRulesPutResult, String> {
     #[cfg(target_os = "linux")]
     {
-        crate::daemon_client::DaemonClient::system()
-            .request(method::COND_RULES_PUT, CondRulesPutParams { rule })
-            .await
-            .map_err(|err| crate::daemon_client::user_message(&err))
+        tauri::async_runtime::spawn_blocking(move || {
+            linux_services::condition_put(&LinuxEngine::new("network-orchestrator"), rule)
+        })
+        .await
+        .map_err(|_| "Conditional rule task failed".to_string())?
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -48,10 +50,11 @@ pub(crate) async fn remove_conditional_rule(
 ) -> Result<CondRulesRemoveResult, String> {
     #[cfg(target_os = "linux")]
     {
-        crate::daemon_client::DaemonClient::system()
-            .request(method::COND_RULES_REMOVE, CondRulesRemoveParams { rule_id })
-            .await
-            .map_err(|err| crate::daemon_client::user_message(&err))
+        tauri::async_runtime::spawn_blocking(move || {
+            linux_services::condition_remove(&LinuxEngine::new("network-orchestrator"), &rule_id)
+        })
+        .await
+        .map_err(|_| "Conditional rule task failed".to_string())?
     }
     #[cfg(not(target_os = "linux"))]
     {

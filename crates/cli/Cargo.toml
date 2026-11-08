@@ -16,7 +16,7 @@ net-manager-core = { path = "../core" }
 net-manager-engine = { path = "../engine" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt", "time", "sync"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "sync"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 plist = "1"

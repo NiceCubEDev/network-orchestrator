@@ -114,8 +114,16 @@ pub fn status(ctx: &Ctx, target: Option<&str>) -> Result<Output, String> {
         Some(query) => vec![ctx.find(query)?],
         None => daemon_profiles(ctx)?,
     };
+    #[cfg(target_os = "linux")]
+    let mut statuses =
+        net_manager_engine::linux_runtime::statuses_for(&ctx.engine, &profiles)?.into_iter();
     let mut rows = Vec::new();
     for profile in &profiles {
+        #[cfg(target_os = "linux")]
+        let status = statuses
+            .next()
+            .ok_or("The requested connection status is unavailable")?;
+        #[cfg(not(target_os = "linux"))]
         let status = ctx.engine.status(profile)?;
         if target.is_some() || status.state != TunnelState::Stopped {
             rows.push((profile, status));
@@ -161,6 +169,7 @@ fn resolve_or_add(ctx: &Ctx, args: &UpArgs) -> Result<Profile, String> {
     Ok(profile)
 }
 
+#[cfg(not(target_os = "linux"))]
 /// Connects a profile the daemon runs; a failed start is an error.
 pub fn connect(
     ctx: &Ctx,
@@ -185,6 +194,28 @@ pub fn connect(
             .unwrap_or_else(|| format!("\"{}\" failed to connect", profile.name)));
     }
     Ok(status)
+}
+
+#[cfg(target_os = "linux")]
+pub fn connect(
+    ctx: &Ctx,
+    profile: &Profile,
+    credentials: Option<OpenVpnCredentials>,
+) -> Result<TunnelStatus, String> {
+    auth::run(ctx.root_user, || {
+        net_manager_engine::linux_runtime::connect(
+            &net_manager_engine::linux_runtime::Context {
+                engine: &ctx.engine,
+                root: &ctx.root,
+                vault: &ctx.vault(),
+                store: &ctx.store(),
+            },
+            &profile.id,
+            credentials.clone(),
+            ctx,
+            None,
+        )
+    })
 }
 
 pub fn up(ctx: &Ctx, args: &UpArgs) -> Result<Output, String> {
@@ -258,6 +289,16 @@ pub fn down(ctx: &Ctx, target: Option<&str>, all: bool) -> Result<Output, String
         let running = LinuxEngine::handles(profile)
             && ctx.engine.status(profile)?.state != TunnelState::Stopped;
         if running {
+            #[cfg(target_os = "linux")]
+            auth::run(ctx.root_user, || {
+                net_manager_engine::linux_runtime::disconnect_with_root(
+                    &ctx.engine,
+                    &ctx.root,
+                    &ctx.store(),
+                    &profile.id,
+                )
+            })?;
+            #[cfg(not(target_os = "linux"))]
             auth::run(ctx.root_user, || ctx.engine.disconnect(profile))?;
             stopped.push(profile.name.clone());
         }
@@ -274,6 +315,10 @@ pub fn down(ctx: &Ctx, target: Option<&str>, all: bool) -> Result<Output, String
 mod tests {
     use super::*;
     use crate::linux::{compat, route};
+    use net_manager_core::daemon_protocol::{
+        feature, XrayConnectParams, XrayConnectResult, XrayDisconnectResult, XrayProfileParams,
+        XrayStatusResult,
+    };
     use net_manager_core::daemon_protocol::{method, HelloResult, PROTOCOL_VERSION};
     use net_manager_core::helper_client::HelperError;
     use net_manager_core::models::{PolicyRoute, TunnelRole};
@@ -288,8 +333,104 @@ mod tests {
         calls: Mutex<Vec<String>>,
         /// What the handshake answers; a current, complete daemon by default.
         hello: Option<HelloResult>,
+        xray: Option<Mutex<XrayRuntime>>,
     }
 
+    #[derive(Clone, Copy)]
+    enum DisconnectFailure {
+        Stopped,
+        Failed,
+        Running,
+        Unknown,
+    }
+
+    #[derive(Default)]
+    struct XrayRuntime {
+        active: Option<(String, String)>,
+        failed: Option<String>,
+        reject_once: Option<String>,
+        reject_all: bool,
+        disconnect_failure: Option<DisconnectFailure>,
+        status_unknown: bool,
+        connection_identity: u64,
+    }
+
+    impl XrayRuntime {
+        fn status(&self, profile_id: String) -> XrayStatusResult {
+            let running = self
+                .active
+                .as_ref()
+                .is_some_and(|(id, _)| *id == profile_id);
+            XrayStatusResult {
+                profile_id: profile_id.clone(),
+                state: if running {
+                    TunnelState::Running
+                } else if self.failed.as_deref() == Some(profile_id.as_str()) {
+                    TunnelState::Failed
+                } else {
+                    TunnelState::Stopped
+                },
+                interface_name: running.then(|| "xray0".into()),
+                dns_applied: running,
+                ipv4_covered: running,
+                ipv6_covered: running,
+                rx_bytes: None,
+                tx_bytes: None,
+                failover: None,
+                watchdog: None,
+                proxy_exits: Vec::new(),
+            }
+        }
+
+        fn request(&mut self, method: &str, params: Value) -> Value {
+            match method {
+                method::XRAY_CONNECT => {
+                    let request: XrayConnectParams = serde_json::from_value(params).unwrap();
+                    let config: Value = serde_json::from_str(&request.config).unwrap();
+                    let endpoint = config["outbounds"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find_map(|outbound| outbound["settings"]["vnext"][0]["address"].as_str())
+                        .expect("generated VLESS config must contain its endpoint")
+                        .to_string();
+                    let rejected_once = self.reject_once.as_deref() == Some(endpoint.as_str());
+                    if self.reject_all || rejected_once {
+                        if rejected_once {
+                            self.reject_once = None;
+                        }
+                        self.active = None;
+                        self.failed = Some(request.profile_id.clone());
+                    } else {
+                        self.active = Some((request.profile_id.clone(), endpoint));
+                        self.failed = None;
+                        self.connection_identity += 1;
+                    }
+                    serde_json::to_value(XrayConnectResult {
+                        status: self.status(request.profile_id),
+                    })
+                    .unwrap()
+                }
+                method::XRAY_DISCONNECT => {
+                    let request: XrayProfileParams = serde_json::from_value(params).unwrap();
+                    if self
+                        .active
+                        .as_ref()
+                        .is_some_and(|(id, _)| *id == request.profile_id)
+                    {
+                        self.active = None;
+                    }
+                    self.failed = None;
+                    serde_json::to_value(XrayDisconnectResult { stopped: true }).unwrap()
+                }
+                method::XRAY_STATUS => {
+                    let request: XrayProfileParams = serde_json::from_value(params).unwrap();
+                    serde_json::to_value(self.status(request.profile_id)).unwrap()
+                }
+                _ => unreachable!("only Xray lifecycle calls enter the stateful provider"),
+            }
+        }
+    }
     impl Privileged for FakeDaemon {
         fn hello(&self) -> Result<HelloResult, HelperError> {
             Ok(self.hello.clone().unwrap_or_else(|| HelloResult {
@@ -298,13 +439,46 @@ mod tests {
                 uid: 1000,
                 capabilities: net_manager_engine::linux_compat::REQUIRED_METHODS
                     .iter()
-                    .map(|name| name.to_string())
+                    .copied()
+                    .chain(std::iter::once(feature::XRAY_TUN_IPV6))
+                    .map(str::to_string)
                     .collect(),
                 tools: Default::default(),
             }))
         }
-        fn call_raw(&self, method: &str, _: Value) -> Result<Value, HelperError> {
+        fn call_raw(&self, method: &str, params: Value) -> Result<Value, HelperError> {
             self.calls.lock().unwrap().push(method.into());
+            if let Some(runtime) = &self.xray {
+                if matches!(
+                    method,
+                    method::XRAY_CONNECT | method::XRAY_DISCONNECT | method::XRAY_STATUS
+                ) {
+                    let mut runtime = runtime.lock().unwrap();
+                    if method == method::XRAY_DISCONNECT {
+                        if let Some(failure) = runtime.disconnect_failure.take() {
+                            let request: XrayProfileParams =
+                                serde_json::from_value(params).unwrap();
+                            match failure {
+                                DisconnectFailure::Stopped => {
+                                    runtime.active = None;
+                                    runtime.failed = None;
+                                }
+                                DisconnectFailure::Failed => {
+                                    runtime.active = None;
+                                    runtime.failed = Some(request.profile_id);
+                                }
+                                DisconnectFailure::Running => {}
+                                DisconnectFailure::Unknown => runtime.status_unknown = true,
+                            }
+                            return Err(HelperError::Protocol("fixture teardown failure".into()));
+                        }
+                    }
+                    if method == method::XRAY_STATUS && runtime.status_unknown {
+                        return Err(HelperError::Protocol("fixture status unavailable".into()));
+                    }
+                    return Ok(runtime.request(method, params));
+                }
+            }
             self.replies
                 .get(method)
                 .cloned()
@@ -516,35 +690,42 @@ mod tests {
         assert_eq!(ctx.profiles().unwrap().len(), 2);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
-    fn up_imports_a_link_first_then_connects_it() {
+    fn up_imports_a_link_first_then_connects_its_actual_endpoint() {
         let (_dir, ctx, daemon) = setup(FakeDaemon {
-            replies: HashMap::from([(
-                method::XRAY_CONNECT,
-                json!({"status": {"profileId": "x", "state": "running", "interfaceName": "xray0",
-                    "message": null, "warnings": []}}),
-            )]),
+            xray: Some(Mutex::new(XrayRuntime::default())),
             ..Default::default()
         });
-        let args = UpArgs {
-            target: LINK.into(),
-            name: None,
-            endpoint: None,
-            foreground: false,
-            auth_stdin: false,
-            passphrase_stdin: false,
-        };
-        // The synthetic reply may not match the daemon's schema; what matters
-        // is that the profile was saved and the daemon was asked.
-        let _ = up(&ctx, &args);
+        let (value, text) = up(
+            &ctx,
+            &UpArgs {
+                target: LINK.into(),
+                name: None,
+                endpoint: None,
+                foreground: false,
+                auth_stdin: false,
+                passphrase_stdin: false,
+            },
+        )
+        .unwrap();
+        let profile = ctx.find(value["id"].as_str().unwrap()).unwrap();
+        assert_eq!(profile.backend, TunnelBackend::Xray);
+        assert!(ctx
+            .vault()
+            .is_managed_profile_path(&profile.id, &profile.config_path));
+        assert!(profile.config_path.is_file());
         assert_eq!(ctx.profiles().unwrap().len(), 3);
-        if !cfg!(target_os = "linux") {
-            return; // Xray runs as a local proxy by default off Linux.
-        }
         assert_eq!(
-            daemon.calls.lock().unwrap().as_slice(),
-            [method::XRAY_CONNECT]
+            ctx.engine.status(&profile).unwrap().state,
+            TunnelState::Running
         );
+        let runtime = daemon.xray.as_ref().unwrap().lock().unwrap();
+        assert_eq!(
+            runtime.active,
+            Some((profile.id.clone(), "node.test".into()))
+        );
+        assert!(!text.contains(LINK) && !value.to_string().contains("node.test"));
     }
 
     #[test]
@@ -580,9 +761,12 @@ mod tests {
             replies: HashMap::from([(method::WIREGUARD_STATUS, wg_status("running"))]),
             ..Default::default()
         });
-        let error = library::rm(&ctx, "wg1").unwrap_err();
-        assert!(error.contains("netorch down"), "{error}");
-        assert_eq!(ctx.profiles().unwrap().len(), 2);
+        let before = ctx.profiles().unwrap();
+        let config = ctx.find("wg1").unwrap().config_path;
+        let config_before = std::fs::read(&config).unwrap();
+        assert!(library::rm(&ctx, "wg1").is_err());
+        assert_eq!(ctx.profiles().unwrap(), before);
+        assert_eq!(std::fs::read(config).unwrap(), config_before);
     }
 
     #[test]
@@ -672,64 +856,203 @@ mod tests {
     #[test]
     fn use_refuses_while_connected_and_switch_reconnects() {
         let (_dir, ctx, daemon) = subscription_setup(FakeDaemon {
-            replies: HashMap::from([
-                (method::XRAY_STATUS, xray_status("running")),
-                (method::XRAY_DISCONNECT, json!({"stopped": true})),
-                (
-                    method::XRAY_CONNECT,
-                    json!({"status": xray_status("running")}),
-                ),
-            ]),
+            xray: Some(Mutex::new(XrayRuntime {
+                active: Some(("sub1".into(), "a.test".into())),
+                ..Default::default()
+            })),
             ..Default::default()
         });
         let error = endpoints::use_endpoint(&ctx, "sub1", Some("beta")).unwrap_err();
         assert!(error.contains("netorch switch"), "{error}");
         assert_eq!(server_of(&ctx), "Alpha DE");
-        daemon.calls.lock().unwrap().clear();
         let (value, text) = endpoints::switch(&ctx, "sub1", Some("beta")).unwrap();
         assert_eq!(value["connected"], true);
         assert!(text.contains("reconnected"));
         assert_eq!(server_of(&ctx), "Beta NL");
         assert_eq!(
-            daemon.calls.lock().unwrap().as_slice(),
-            [
-                method::XRAY_STATUS,
-                method::XRAY_DISCONNECT,
-                method::XRAY_CONNECT
-            ]
+            ctx.engine.status(&ctx.find("sub1").unwrap()).unwrap().state,
+            TunnelState::Running
+        );
+        assert_eq!(
+            daemon.xray.as_ref().unwrap().lock().unwrap().active,
+            Some(("sub1".into(), "b.test".into()))
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
-    fn a_failed_switch_restores_the_previous_server_and_connection() {
+    fn failed_switch_preserves_previous_profile_and_config_when_reconnect_fails() {
         let (_dir, ctx, daemon) = subscription_setup(FakeDaemon {
-            replies: HashMap::from([
-                (method::XRAY_STATUS, xray_status("running")),
-                (method::XRAY_DISCONNECT, json!({"stopped": true})),
-                (
-                    method::XRAY_CONNECT,
-                    json!({"status": xray_status("failed")}),
-                ),
-            ]),
+            xray: Some(Mutex::new(XrayRuntime {
+                active: Some(("sub1".into(), "a.test".into())),
+                reject_all: true,
+                ..Default::default()
+            })),
             ..Default::default()
         });
-        let error = endpoints::switch(&ctx, "sub1", Some("beta")).unwrap_err();
-        assert!(error.contains("previous server was restored"), "{error}");
+        let before = ctx.find("sub1").unwrap();
+        let config_before = std::fs::read(&before.config_path).unwrap();
+        let endpoints_before = ctx.vault().read_subscription_endpoints("sub1").unwrap();
+        assert!(endpoints::switch(&ctx, "sub1", Some("beta")).is_err());
+        assert_eq!(ctx.find("sub1").unwrap(), before);
+        assert_eq!(std::fs::read(&before.config_path).unwrap(), config_before);
+        assert_eq!(
+            ctx.vault().read_subscription_endpoints("sub1").unwrap(),
+            endpoints_before
+        );
         assert_eq!(server_of(&ctx), "Alpha DE");
-        // status, disconnect, failed connect, then the reconnect of the old one.
-        assert_eq!(daemon.calls.lock().unwrap().len(), 4);
+        assert_eq!(
+            ctx.engine.status(&before).unwrap().state,
+            TunnelState::Failed
+        );
+        assert!(daemon
+            .xray
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .active
+            .is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_new_endpoint_restores_the_running_previous_endpoint() {
+        let (_dir, ctx, daemon) = subscription_setup(FakeDaemon {
+            xray: Some(Mutex::new(XrayRuntime {
+                active: Some(("sub1".into(), "a.test".into())),
+                reject_once: Some("b.test".into()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        });
+        let before = ctx.find("sub1").unwrap();
+        let config_before = std::fs::read(&before.config_path).unwrap();
+        assert!(endpoints::switch(&ctx, "sub1", Some("beta")).is_err());
+        assert_eq!(ctx.find("sub1").unwrap(), before);
+        assert_eq!(std::fs::read(&before.config_path).unwrap(), config_before);
+        assert_eq!(server_of(&ctx), "Alpha DE");
+        assert_eq!(
+            ctx.engine.status(&before).unwrap().state,
+            TunnelState::Running
+        );
+        let runtime = daemon.xray.as_ref().unwrap().lock().unwrap();
+        assert_eq!(runtime.active, Some(("sub1".into(), "a.test".into())));
+        assert!(
+            runtime.reject_once.is_none(),
+            "the replacement endpoint failure must actually occur"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn switch_teardown_error_restores_known_inactive_original_connection() {
+        for failure in [DisconnectFailure::Stopped, DisconnectFailure::Failed] {
+            let (_dir, ctx, daemon) = subscription_setup(FakeDaemon {
+                xray: Some(Mutex::new(XrayRuntime {
+                    active: Some(("sub1".into(), "a.test".into())),
+                    disconnect_failure: Some(failure),
+                    reject_once: Some("b.test".into()),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            });
+            let before = ctx.find("sub1").unwrap();
+            let config_before = std::fs::read(&before.config_path).unwrap();
+            let error = endpoints::switch(&ctx, "sub1", Some("beta")).unwrap_err();
+            assert_eq!(ctx.find("sub1").unwrap(), before);
+            assert_eq!(std::fs::read(&before.config_path).unwrap(), config_before);
+            assert_eq!(server_of(&ctx), "Alpha DE");
+            assert_eq!(
+                ctx.engine.status(&before).unwrap().state,
+                TunnelState::Running
+            );
+            let runtime = daemon.xray.as_ref().unwrap().lock().unwrap();
+            assert_eq!(runtime.active, Some(("sub1".into(), "a.test".into())));
+            assert!(error.contains("restored"), "{error}");
+            assert_eq!(
+                runtime.reject_once.as_deref(),
+                Some("b.test"),
+                "The replacement must never start after teardown failed"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn switch_teardown_error_preserves_still_running_original_connection() {
+        let (_dir, ctx, daemon) = subscription_setup(FakeDaemon {
+            xray: Some(Mutex::new(XrayRuntime {
+                active: Some(("sub1".into(), "a.test".into())),
+                disconnect_failure: Some(DisconnectFailure::Running),
+                reject_once: Some("b.test".into()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        });
+        let before = ctx.find("sub1").unwrap();
+        let config_before = std::fs::read(&before.config_path).unwrap();
+        let identity = daemon
+            .xray
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .connection_identity;
+        assert!(endpoints::switch(&ctx, "sub1", Some("beta")).is_err());
+        assert_eq!(ctx.find("sub1").unwrap(), before);
+        assert_eq!(std::fs::read(&before.config_path).unwrap(), config_before);
+        assert_eq!(
+            ctx.engine.status(&before).unwrap().state,
+            TunnelState::Running
+        );
+        let runtime = daemon.xray.as_ref().unwrap().lock().unwrap();
+        assert_eq!(runtime.active, Some(("sub1".into(), "a.test".into())));
+        assert_eq!(
+            runtime.connection_identity, identity,
+            "The healthy original must not restart"
+        );
+        assert_eq!(runtime.reject_once.as_deref(), Some("b.test"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn switch_teardown_error_with_unknown_status_does_not_blindly_reconnect() {
+        let (_dir, ctx, daemon) = subscription_setup(FakeDaemon {
+            xray: Some(Mutex::new(XrayRuntime {
+                active: Some(("sub1".into(), "a.test".into())),
+                disconnect_failure: Some(DisconnectFailure::Unknown),
+                reject_once: Some("b.test".into()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        });
+        let before = ctx.find("sub1").unwrap();
+        let config_before = std::fs::read(&before.config_path).unwrap();
+        let identity = daemon
+            .xray
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .connection_identity;
+        assert!(endpoints::switch(&ctx, "sub1", Some("beta")).is_err());
+        assert_eq!(ctx.find("sub1").unwrap(), before);
+        assert_eq!(std::fs::read(&before.config_path).unwrap(), config_before);
+        assert!(ctx.engine.status(&before).is_err());
+        let runtime = daemon.xray.as_ref().unwrap().lock().unwrap();
+        assert_eq!(runtime.active, Some(("sub1".into(), "a.test".into())));
+        assert_eq!(
+            runtime.connection_identity, identity,
+            "Unknown status must not trigger a restart"
+        );
+        assert_eq!(runtime.reject_once.as_deref(), Some("b.test"));
     }
 
     #[test]
     fn up_with_a_server_picks_it_first() {
         let (_dir, ctx, daemon) = subscription_setup(FakeDaemon {
-            replies: HashMap::from([
-                (method::XRAY_STATUS, xray_status("stopped")),
-                (
-                    method::XRAY_CONNECT,
-                    json!({"status": xray_status("running")}),
-                ),
-            ]),
+            xray: Some(Mutex::new(XrayRuntime::default())),
             ..Default::default()
         });
         let args = UpArgs {
@@ -742,11 +1065,14 @@ mod tests {
         };
         let (_, text) = up(&ctx, &args).unwrap();
         assert!(text.contains("via Gamma DE"), "{text}");
-        assert!(daemon
-            .calls
-            .lock()
-            .unwrap()
-            .contains(&method::XRAY_CONNECT.to_string()));
+        assert_eq!(
+            ctx.engine.status(&ctx.find("sub1").unwrap()).unwrap().state,
+            TunnelState::Running
+        );
+        assert_eq!(
+            daemon.xray.as_ref().unwrap().lock().unwrap().active,
+            Some(("sub1".into(), "c.test".into()))
+        );
     }
 
     fn backup_command(

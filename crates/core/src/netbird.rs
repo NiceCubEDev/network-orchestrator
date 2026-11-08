@@ -35,6 +35,7 @@ const DOWN_TIMEOUT: Duration = Duration::from_secs(20);
 struct Pending {
     child: Child,
     key_file: Option<PathBuf>,
+    socket: PathBuf,
 }
 
 static PENDING: Mutex<Option<Pending>> = Mutex::new(None);
@@ -186,8 +187,17 @@ fn pending_alive() -> bool {
     }
 }
 
-fn cancel_pending() {
-    let taken = PENDING.lock().unwrap_or_else(|e| e.into_inner()).take();
+fn cancel_pending_for(socket: Option<&Path>) {
+    let mut guard = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    if socket.is_some_and(|socket| {
+        guard
+            .as_ref()
+            .is_some_and(|pending| pending.socket != socket)
+    }) {
+        return;
+    }
+    let taken = guard.take();
+    drop(guard);
     if let Some(mut pending) = taken {
         let _ = pending.child.kill();
         let _ = pending.child.wait();
@@ -195,6 +205,20 @@ fn cancel_pending() {
             let _ = std::fs::remove_file(file);
         }
     }
+}
+
+#[cfg(test)]
+fn cancel_pending() {
+    cancel_pending_for(None);
+}
+
+fn pending_for(socket: &Path) -> bool {
+    let matches = PENDING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|pending| pending.socket == socket);
+    matches && pending_alive()
 }
 
 impl NetBird {
@@ -210,7 +234,7 @@ impl NetBird {
         command.args(["status", "--json"]);
         match run_with_timeout(command, STATUS_TIMEOUT) {
             Ok((true, text)) => match serde_json::from_str::<Value>(&text) {
-                Ok(raw) => summarize(&raw, pending_alive()),
+                Ok(raw) => summarize(&raw, pending_for(&self.socket)),
                 Err(_) => json!({"installed": true, "state": "unavailable"}),
             },
             _ => json!({"installed": true, "state": "unavailable"}),
@@ -235,27 +259,50 @@ impl NetBird {
         if let Some(key) = setup_key {
             validate_setup_key(key)?;
         }
-        cancel_pending();
-        let dir = runtime.join("netbird");
-        std::fs::create_dir_all(&dir)
+        let dir = secure_runtime(runtime)
             .map_err(|_| "NetBird state could not be prepared".to_string())?;
-        set_mode(&dir, 0o700);
+        let _lock =
+            control_lock(&dir).map_err(|_| "NetBird state could not be locked".to_string())?;
+        #[cfg(target_os = "linux")]
+        {
+            if read_pending(runtime).is_some_and(|saved| {
+                saved.socket != self.socket
+                    && process_identity(saved.identity.pid)
+                        .is_some_and(|live| live == saved.identity)
+            }) {
+                return Err(
+                    "Another NetBird provider has a pending login in this data directory".into(),
+                );
+            }
+            cancel_pending_in(runtime, &self.socket)?;
+        }
+        cancel_pending_for(Some(&self.socket));
+        #[cfg(not(target_os = "linux"))]
         let mut key_file = None;
+        #[cfg(target_os = "linux")]
+        let key_file = None;
+        #[cfg(target_os = "linux")]
+        let mut key_handle = None;
         let mut command = self.command(&cli);
         if let Some(url) = management_url {
             command.arg("--management-url").arg(url);
         }
         if let Some(key) = setup_key {
-            // Never on the command line: other processes can read argv.
-            let path = dir.join("setup-key");
-            write_private(&path, key.as_bytes())
-                .map_err(|_| "The setup key could not be prepared".to_string())?;
-            command.arg("--setup-key-file").arg(&path);
-            key_file = Some(path);
+            #[cfg(target_os = "linux")]
+            {
+                key_handle = Some(attach_setup_key(&mut command, key)?);
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let path = dir.join("setup-key");
+                write_private(&path, key.as_bytes())
+                    .map_err(|_| "The setup key could not be prepared".to_string())?;
+                command.arg("--setup-key-file").arg(&path);
+                key_file = Some(path);
+            }
         }
-        let log = std::fs::File::create(dir.join("up.log"))
+        let log = private_file(&dir.join("up.log"), true)
             .map_err(|_| "NetBird state could not be prepared".to_string())?;
-        set_mode(&dir.join("up.log"), 0o600);
         command
             .arg("up")
             .stdout(Stdio::from(
@@ -263,27 +310,71 @@ impl NetBird {
                     .map_err(|_| "NetBird could not be started".to_string())?,
             ))
             .stderr(Stdio::from(log));
-        let child = command.spawn().map_err(|_| {
+        let mut child = command.spawn().map_err(|_| {
             if let Some(file) = &key_file {
                 let _ = std::fs::remove_file(file);
             }
             "NetBird could not be started".to_string()
         })?;
-        *PENDING.lock().unwrap_or_else(|e| e.into_inner()) = Some(Pending { child, key_file });
-        Ok(self.status())
+        #[cfg(target_os = "linux")]
+        {
+            drop(key_handle);
+            if let Some(identity) = process_identity(child.id()) {
+                if write_pending(runtime, &identity, &self.socket).is_err() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err("NetBird pending state could not be saved".into());
+                }
+            }
+        }
+        *PENDING.lock().unwrap_or_else(|e| e.into_inner()) = Some(Pending {
+            child,
+            key_file,
+            socket: self.socket.clone(),
+        });
+        Ok(self.status_in(runtime))
     }
 
     pub fn down(&self) -> Result<Value, String> {
         let cli = self.cli.clone().ok_or("NetBird is not installed")?;
-        cancel_pending();
+        cancel_pending_for(Some(&self.socket));
         if !self.socket.exists() {
             return Ok(self.status());
         }
         let mut command = self.command(&cli);
         command.arg("down");
-        run_with_timeout(command, DOWN_TIMEOUT)
+        let (success, _) = run_with_timeout(command, DOWN_TIMEOUT)
             .map_err(|_| "NetBird could not be disconnected".to_string())?;
+        if !success {
+            return Err("NetBird could not be disconnected".into());
+        }
         Ok(self.status())
+    }
+
+    pub fn status_in(&self, runtime: &Path) -> Value {
+        let mut status = self.status();
+        #[cfg(target_os = "linux")]
+        if pending_in(runtime, &self.socket)
+            && matches!(
+                status["state"].as_str(),
+                Some("needsLogin" | "disconnected")
+            )
+        {
+            status["state"] = json!("connecting");
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = runtime;
+        status
+    }
+
+    pub fn down_in(&self, runtime: &Path) -> Result<Value, String> {
+        let dir = secure_runtime(runtime)
+            .map_err(|_| "NetBird state could not be prepared".to_string())?;
+        let _lock =
+            control_lock(&dir).map_err(|_| "NetBird state could not be locked".to_string())?;
+        #[cfg(target_os = "linux")]
+        cancel_pending_in(runtime, &self.socket)?;
+        self.down()
     }
 }
 
@@ -319,11 +410,227 @@ fn validate_setup_key(key: &str) -> Result<(), String> {
     }
 }
 
-fn set_mode(path: &Path, mode: u32) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+fn secure_runtime(runtime: &Path) -> std::io::Result<PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    let invalid = || std::io::Error::other("invalid NetBird runtime");
+    #[cfg(target_os = "linux")]
+    for path in runtime.ancestors() {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if !metadata.file_type().is_dir() => return Err(invalid()),
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
+            _ => {}
+        }
+    }
+    for path in [runtime.to_path_buf(), runtime.join("netbird")] {
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                // Legacy callers pass an application runtime parent; only the
+                // netbird child contains private state, but neither may be writable by others.
+                let forbidden = if path.as_path() == runtime {
+                    0o022
+                } else {
+                    0o077
+                };
+                if !metadata.file_type().is_dir()
+                    || metadata.uid() != unsafe { libc::geteuid() }
+                    || metadata.permissions().mode() & forbidden != 0
+                {
+                    return Err(invalid());
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(&path)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(runtime.join("netbird"))
 }
 
+fn private_file(path: &Path, truncate: bool) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err(std::io::Error::other("invalid NetBird file"));
+    }
+    if truncate {
+        file.set_len(0)?;
+    }
+    Ok(file)
+}
+
+fn control_lock(dir: &Path) -> std::io::Result<std::fs::File> {
+    let file = private_file(&dir.join("control.lock"), false)?;
+    file.lock()?;
+    Ok(file)
+}
+
+#[cfg(target_os = "linux")]
+fn attach_setup_key(command: &mut Command, key: &str) -> Result<std::fs::File, String> {
+    use std::io::{Seek, Write};
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::process::CommandExt;
+    // An inherited anonymous file disappears when the provider exits, even if
+    // the initiating CLI is already gone; no plaintext pathname needs cleanup.
+    let fd = unsafe { libc::memfd_create(c"netorch-netbird-key".as_ptr(), libc::MFD_CLOEXEC) };
+    if fd < 0 {
+        return Err("The setup key could not be prepared".into());
+    }
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    if unsafe { libc::fchmod(fd, 0o600) } < 0 {
+        return Err("The setup key could not be protected".into());
+    }
+    file.write_all(key.as_bytes())
+        .and_then(|_| file.rewind())
+        .map_err(|_| "The setup key could not be prepared")?;
+    let raw = file.as_raw_fd();
+    command
+        .arg("--setup-key-file")
+        .arg(format!("/proc/self/fd/{raw}"));
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fcntl(raw, libc::F_SETFD, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    Ok(file)
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct PendingIdentity {
+    pid: u32,
+    start: u64,
+    executable_device: u64,
+    executable_inode: u64,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PendingRecord {
+    identity: PendingIdentity,
+    socket: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+fn process_identity(pid: u32) -> Option<PendingIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    let dir = PathBuf::from(format!("/proc/{pid}"));
+    if std::fs::metadata(&dir).ok()?.uid() != unsafe { libc::geteuid() } {
+        return None;
+    }
+    let stat = std::fs::read_to_string(dir.join("stat")).ok()?;
+    let mut fields = stat.rsplit_once(')')?.1.split_whitespace();
+    if matches!(fields.next(), Some("Z" | "X")) {
+        return None;
+    }
+    let start = fields.nth(18)?.parse().ok()?;
+    let executable = std::fs::metadata(dir.join("exe")).ok()?;
+    Some(PendingIdentity {
+        pid,
+        start,
+        executable_device: executable.dev(),
+        executable_inode: executable.ino(),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn write_pending(runtime: &Path, identity: &PendingIdentity, socket: &Path) -> std::io::Result<()> {
+    use std::io::Write;
+    let dir = secure_runtime(runtime)?;
+    let temporary = dir.join(format!("pending-{}.tmp", std::process::id()));
+    let mut file = private_file(&temporary, true)?;
+    let record = PendingRecord {
+        identity: *identity,
+        socket: socket.to_path_buf(),
+    };
+    let bytes = serde_json::to_vec(&record).map_err(std::io::Error::other)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    std::fs::rename(temporary, dir.join("pending.json"))
+}
+
+#[cfg(target_os = "linux")]
+fn read_pending(runtime: &Path) -> Option<PendingRecord> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    // Querying status must remain read-only, including when invoked by root.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(runtime.join("netbird/pending.json"))
+        .ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o077 != 0
+        || metadata.len() > 1024
+    {
+        return None;
+    }
+    serde_json::from_reader(file.take(1025)).ok()
+}
+
+#[cfg(target_os = "linux")]
+fn pending_in(runtime: &Path, socket: &Path) -> bool {
+    read_pending(runtime).is_some_and(|saved| {
+        saved.socket == socket
+            && process_identity(saved.identity.pid).is_some_and(|live| live == saved.identity)
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn cancel_pending_in(runtime: &Path, socket: &Path) -> Result<(), String> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    if let Some(saved) = read_pending(runtime) {
+        if saved.socket != socket {
+            return Ok(());
+        }
+        // Pin the task before checking its birth time; PID reuse cannot target
+        // an unrelated process between validation and signaling.
+        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, saved.identity.pid, 0) } as i32;
+        if raw >= 0 {
+            let pidfd = unsafe { std::fs::File::from_raw_fd(raw) };
+            if process_identity(saved.identity.pid).is_some_and(|live| live == saved.identity)
+                && unsafe {
+                    libc::syscall(
+                        libc::SYS_pidfd_send_signal,
+                        pidfd.as_raw_fd(),
+                        libc::SIGKILL,
+                        std::ptr::null::<libc::siginfo_t>(),
+                        0,
+                    )
+                } < 0
+            {
+                return Err("NetBird login could not be cancelled".into());
+            }
+        } else if process_identity(saved.identity.pid).is_some_and(|live| live == saved.identity) {
+            return Err("NetBird login cancellation is unavailable on this kernel".into());
+        }
+    }
+    match std::fs::remove_file(runtime.join("netbird/pending.json")) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err("NetBird pending state could not be removed".into()),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
 fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
@@ -530,6 +837,162 @@ mod tests {
         assert!(nb.up(dir.path(), Some("javascript:x"), None).is_err());
         assert!(nb.up(dir.path(), None, Some("bad key!")).is_err());
         assert!(calls(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn down_rejects_unsuccessful_provider_exit_without_exposing_output() {
+        let _turn = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        cancel_pending();
+        let dir = tempfile::tempdir().unwrap();
+        let nb = fake_cli(dir.path(), STATUS, "0");
+        std::fs::write(
+            nb.cli.as_ref().unwrap(),
+            "#!/bin/sh\necho secret-provider-body\nexit 7\n",
+        )
+        .unwrap();
+        let error = nb.down().unwrap_err();
+        assert!(!error.contains("secret-provider-body"));
+    }
+
+    #[test]
+    fn up_rejects_symlinked_runtime_and_log_without_touching_targets() {
+        use std::os::unix::fs::symlink;
+        let _turn = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        cancel_pending();
+        let dir = tempfile::tempdir().unwrap();
+        let nb = fake_cli(dir.path(), STATUS, "0");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let runtime = dir.path().join("runtime");
+        std::fs::create_dir(&runtime).unwrap();
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+        symlink(&outside, runtime.join("netbird")).unwrap();
+        assert!(nb.up(&runtime, None, Some("ABCD-1234-EFGH")).is_err());
+        assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
+        std::fs::remove_file(runtime.join("netbird")).unwrap();
+        std::fs::create_dir(runtime.join("netbird")).unwrap();
+        std::fs::set_permissions(
+            runtime.join("netbird"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        let target = outside.join("unchanged");
+        std::fs::write(&target, "unchanged").unwrap();
+        symlink(&target, runtime.join("netbird/up.log")).unwrap();
+        assert!(nb.up(&runtime, None, None).is_err());
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "unchanged");
+    }
+
+    #[test]
+    fn existing_nonwritable_runtime_parent_keeps_legacy_provider_compatibility() {
+        let _turn = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        cancel_pending();
+        let dir = tempfile::tempdir().unwrap();
+        let nb = fake_cli(dir.path(), STATUS, "0");
+        let runtime = dir.path().join("runtime");
+        std::fs::create_dir(&runtime).unwrap();
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o755)).unwrap();
+        nb.up(&runtime, None, None).unwrap();
+        assert_eq!(
+            std::fs::metadata(runtime.join("netbird"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        nb.down_in(&runtime).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn setup_key_has_no_persistent_path_while_login_remains_pending() {
+        let _turn = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        cancel_pending();
+        let dir = tempfile::tempdir().unwrap();
+        let nb = fake_cli(dir.path(), STATUS, "30");
+        let runtime = dir.path().join("runtime");
+        nb.up(&runtime, None, Some("ABCD-1234-EFGH")).unwrap();
+        assert!(!runtime.join("netbird/setup-key").exists());
+        nb.down().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shared_pending_identity_rejects_reused_or_foreign_pids() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        let current = process_identity(std::process::id()).unwrap();
+        let forged = PendingIdentity {
+            start: current.start + 1,
+            ..current
+        };
+        let socket = Path::new("/test/netbird.sock");
+        write_pending(&runtime, &forged, socket).unwrap();
+        assert!(!pending_in(&runtime, socket));
+        cancel_pending_in(&runtime, socket).unwrap();
+        assert!(!runtime.join("netbird/pending.json").exists());
+        assert!(process_identity(std::process::id()).is_some());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn down_does_not_cancel_pending_login_for_a_different_provider_socket() {
+        let _turn = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        cancel_pending();
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let owner = fake_cli(first.path(), r#"{"daemonStatus":"NeedsLogin"}"#, "2");
+        let foreign = fake_cli(second.path(), STATUS, "0");
+        let runtime = first.path().join("runtime");
+        owner.up(&runtime, None, None).unwrap();
+        let identity = read_pending(&runtime).unwrap();
+        foreign.down_in(&runtime).unwrap();
+        assert!(process_identity(identity.identity.pid).is_some());
+        assert_eq!(owner.status_in(&runtime)["state"], "connecting");
+        owner.down_in(&runtime).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pending_login_survives_initiator_exit_and_is_cancelled_by_next_process() {
+        const CHILD_ROOT: &str = "NETORCH_TEST_NETBIRD_CROSSPROCESS";
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            let root = PathBuf::from(root);
+            let nb = NetBird {
+                cli: Some(root.join("netbird")),
+                socket: root.join("nb.sock"),
+            };
+            assert_eq!(
+                nb.up(&root.join("runtime"), None, Some("ABCD-1234-EFGH"))
+                    .unwrap()["state"],
+                "connecting"
+            );
+            return;
+        }
+        let _turn = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        cancel_pending();
+        let dir = tempfile::tempdir().unwrap();
+        let nb = fake_cli(dir.path(), r#"{"daemonStatus":"NeedsLogin"}"#, "2");
+        let result = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "netbird::tests::pending_login_survives_initiator_exit_and_is_cancelled_by_next_process", "--nocapture"])
+            .env(CHILD_ROOT, dir.path()).status().unwrap();
+        assert!(result.success());
+        let runtime = dir.path().join("runtime");
+        let identity =
+            read_pending(&runtime).expect("pending login must survive the initiating process");
+        assert_eq!(nb.status_in(&runtime)["state"], "connecting");
+        assert!(!runtime.join("netbird/setup-key").exists());
+        nb.down_in(&runtime).unwrap();
+        for _ in 0..100 {
+            if process_identity(identity.identity.pid).is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(process_identity(identity.identity.pid).is_none());
+        assert!(!runtime.join("netbird/pending.json").exists());
+        assert!(!calls(dir.path()).contains("ABCD-1234-EFGH"));
     }
 
     #[test]

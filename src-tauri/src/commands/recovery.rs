@@ -1,348 +1,216 @@
-use crate::commands::diagnostics::applied_route_present;
-#[cfg(not(target_os = "linux"))]
-use crate::lifecycle::cleanup_all;
 use crate::state::AppState;
-use net_manager_core::explorer;
 use net_manager_core::models::*;
+#[cfg(test)]
 use net_manager_core::system_proxy::ProxyOwnership;
+#[cfg(target_os = "linux")]
+use net_manager_engine::linux_diagnostics as shared;
+#[cfg(all(target_os = "linux", test))]
+use shared::{build_recovery_report, cleanup_request, linux_leftover_owners};
 use tauri::{Emitter, State};
 
 #[cfg(target_os = "linux")]
-fn daemon_owned_profile(profile: &Profile) -> bool {
-    matches!(
-        profile.backend,
-        TunnelBackend::WireGuard | TunnelBackend::OpenVpn
-    ) || (profile.backend == TunnelBackend::Xray && profile.xray_mode == XrayMode::Tun)
-}
-
-/// Owners that are leftovers rather than healthy state: non-applied journal
-/// entries, static owners without a profile or with missing routes, and
-/// daemon tunnels whose status failed. Newest first, like daemon teardown.
-#[cfg(target_os = "linux")]
-fn linux_leftover_owners(
-    entries: &[net_manager_core::daemon_protocol::OwnedEntry],
-    profiles: &[Profile],
-    statuses: &[(String, Result<TunnelStatus, String>)],
-    os_routes: &[RouteEntry],
-) -> Vec<String> {
-    use net_manager_core::daemon_protocol::{OwnedResource, OwnedState};
-
-    let mut owners: Vec<String> = entries
-        .iter()
-        .rev()
-        .filter(|entry| {
-            if crate::route_runtime::daemon_managed_owner(&entry.owner) {
-                return false;
-            }
-            let tunnel = crate::route_runtime::TUNNEL_OWNER_PREFIXES
-                .iter()
-                .any(|prefix| entry.owner.starts_with(prefix));
-            entry.state != OwnedState::Applied
-                || (!tunnel
-                    && (!profiles.iter().any(|p| p.id == entry.owner)
-                        || profiles.iter().any(|profile| {
-                            profile.id == entry.owner
-                                && profile.backend == TunnelBackend::Xray
-                                && profile.xray_mode == XrayMode::Socks
-                                && statuses.iter().any(|(id, status)| {
-                                    id == &profile.id
-                                        && status.as_ref().is_ok_and(|status| {
-                                            status.state != TunnelState::Running
-                                        })
-                                })
-                        })
-                        || entry.resources.iter().any(|resource| {
-                            matches!(resource, OwnedResource::Route(route)
-                                if !os_routes.iter().any(|e| applied_route_present(route, e)))
-                        })))
-        })
-        .map(|entry| entry.owner.clone())
-        .collect();
-    for (profile_id, status) in statuses {
-        if !status
-            .as_ref()
-            .is_ok_and(|status| status.state == TunnelState::Failed)
-        {
-            continue;
-        }
-        let Some(profile) = profiles
-            .iter()
-            .find(|p| &p.id == profile_id && daemon_owned_profile(p))
-        else {
-            continue;
-        };
-        if let Some(owner) = crate::auto_connect::daemon_owner(profile) {
-            if !owners.contains(&owner) {
-                owners.push(owner);
-            }
-        }
-    }
-    owners
-}
-
-/// The per-owner daemon method that removes `owner`. Probe owners have no
-/// per-owner method; the daemon clears them on its own restart.
-#[cfg(target_os = "linux")]
-fn cleanup_request(owner: &str) -> Option<(&'static str, serde_json::Value)> {
-    use net_manager_core::daemon_protocol::method;
-    use serde_json::json;
-
-    if owner.starts_with("ovpn-probe:") {
-        return None;
-    }
-    for (prefix, method) in [
-        ("wg:", method::WIREGUARD_DISCONNECT),
-        ("ovpn:", method::OPENVPN_DISCONNECT),
-        ("xray:", method::XRAY_DISCONNECT),
-    ] {
-        if let Some(profile_id) = owner.strip_prefix(prefix) {
-            return Some((method, json!({ "profileId": profile_id })));
-        }
-    }
-    Some((method::ROUTES_REMOVE, json!({ "owner": owner })))
-}
-
-pub(crate) fn build_recovery_report(
-    profiles: &[Profile],
-    statuses: &[(String, TunnelStatus)],
-    ownership: &[AppliedProfileRoutes],
-    os_routes: &[RouteEntry],
-    proxy_ownership: Option<&ProxyOwnership>,
-) -> RecoveryReport {
-    let mut issues = Vec::new();
-    if let Some(owner) = proxy_ownership {
-        issues.push(RecoveryIssue {
-            kind: RecoveryIssueKind::ProxyOwnership,
-            profile_id: Some(owner.profile_id.clone()),
-            message: format!(
-                "system proxy settings owned by profile '{}' are still applied",
-                owner.profile_id
-            ),
-        });
-    }
-    for (profile_id, status) in statuses {
-        let Some(profile) = profiles.iter().find(|p| &p.id == profile_id) else {
-            continue;
-        };
-        #[cfg(target_os = "linux")]
-        if !daemon_owned_profile(profile) {
-            continue;
-        }
-        #[cfg(not(target_os = "linux"))]
-        if profile.backend != TunnelBackend::WireGuard {
-            continue;
-        }
-        match status.state {
-            TunnelState::Running => {
-                #[cfg(not(target_os = "linux"))]
-                issues.push(RecoveryIssue {
-                    kind: RecoveryIssueKind::SurvivingWireGuardService,
-                    profile_id: Some(profile_id.clone()),
-                    message: format!(
-                        "WireGuard tunnel service for profile '{}' ('{}') may still be installed",
-                        profile.id, profile.name
-                    ),
-                });
-            }
-            TunnelState::Failed => issues.push(RecoveryIssue {
-                kind: RecoveryIssueKind::StatusCheckFailed,
-                profile_id: Some(profile_id.clone()),
-                message: format!(
-                    "status check failed for profile '{}' ('{}'): {}",
-                    profile.id,
-                    profile.name,
-                    status.message.as_deref().unwrap_or("unknown error")
-                ),
-            }),
-            TunnelState::Stopped => {}
-        }
-    }
-    for record in ownership {
-        if !profiles.iter().any(|p| p.id == record.profile_id) {
-            issues.push(RecoveryIssue {
-                kind: RecoveryIssueKind::OrphanRouteOwnership,
-                profile_id: Some(record.profile_id.clone()),
-                message: format!(
-                    "route ownership is recorded for profile '{}' but the profile no longer exists",
-                    record.profile_id
-                ),
-            });
-            continue;
-        }
-        let missing: Vec<String> = record
-            .routes
-            .iter()
-            .filter(|r| !os_routes.iter().any(|e| applied_route_present(r, e)))
-            .map(|r| r.destination.to_string())
-            .collect();
-        if !record.routes.is_empty() && missing.is_empty() {
-            issues.push(RecoveryIssue {
-                kind: RecoveryIssueKind::OwnedRoutes,
-                profile_id: Some(record.profile_id.clone()),
-                message: format!(
-                    "{} route(s) owned by profile '{}' are still present in the route table",
-                    record.routes.len(),
-                    record.profile_id
-                ),
-            });
+async fn run_shared(state: &AppState, cleanup: bool) -> Result<RecoveryReport, String> {
+    let root = state.data_dir().to_path_buf();
+    tauri::async_runtime::spawn_blocking(move || {
+        let engine = net_manager_engine::linux_engine::LinuxEngine::new("net-manager-app")
+            .with_data_root(root.clone());
+        let vault = net_manager_core::config_vault::ConfigVault::new(root.join("configs"));
+        let store = net_manager_core::profiles::ProfileStore::new(root.join("profiles.json"));
+        let runtime = tokio::runtime::Runtime::new().map_err(|_| "Cannot start recovery worker")?;
+        if cleanup {
+            runtime.block_on(shared::cleanup_recovery(&engine, &root, &vault, &store))
         } else {
-            let detail = if missing.is_empty() {
-                format!("{} route(s)", record.routes.len())
-            } else {
-                missing.join(", ")
-            };
-            issues.push(RecoveryIssue {
-                kind: RecoveryIssueKind::MissingOwnedRoutes,
-                profile_id: Some(record.profile_id.clone()),
-                message: format!(
-                    "route(s) owned by profile '{}' are missing from the route table: {detail}",
-                    record.profile_id
-                ),
-            });
+            runtime.block_on(shared::recovery_report(&engine, &root, &vault, &store))
         }
-    }
-    RecoveryReport {
-        requires_elevation: !issues.is_empty(),
-        issues,
-    }
+    })
+    .await
+    .map_err(|_| "Recovery worker failed")?
 }
-
-async fn collect_report(state: &AppState) -> Result<RecoveryReport, String> {
-    collect(state).await.map(|(report, _)| report)
-}
-
-/// The recovery report plus, on Linux, the daemon owners that are leftovers.
-async fn collect(state: &AppState) -> Result<(RecoveryReport, Vec<String>), String> {
-    let profiles = state.profiles.load().map_err(|e| e.to_string())?.profiles;
-    let os_routes = explorer::list_routes().await.map_err(|e| e.to_string())?;
-    #[cfg(target_os = "linux")]
-    let mut statuses: Vec<(String, Result<TunnelStatus, String>)> =
-        Vec::with_capacity(profiles.len());
-    #[cfg(target_os = "linux")]
-    let client = crate::daemon_client::DaemonClient::system();
-    #[cfg(target_os = "linux")]
-    for profile in &profiles {
-        let result = crate::commands::tunnels::linux_profile_status(&client, state, profile).await;
-        statuses.push((profile.id.clone(), result));
-    }
-    #[cfg(not(target_os = "linux"))]
-    let mut runtime = state.runtime.lock().await;
-    #[cfg(not(target_os = "linux"))]
-    let statuses: Vec<(String, TunnelStatus)> = profiles
-        .iter()
-        .map(|p| (p.id.clone(), runtime.tunnels.status(p)))
-        .collect();
-    #[cfg(not(target_os = "linux"))]
-    let (ownership, leftovers) = (runtime.routes.snapshot().await?, Vec::new());
-    #[cfg(not(target_os = "linux"))]
-    drop(runtime);
-    let proxy_ownership = state
-        .proxy_ownership()
-        .await
-        .map_err(|error| error.to_string())?;
-    #[cfg(target_os = "linux")]
-    let (ownership, leftovers) = {
-        use net_manager_core::daemon_protocol::{method, OwnedListResult};
-
-        let mut owned: OwnedListResult = client
-            .request(method::OWNED_LIST, serde_json::Value::Null)
-            .await
-            .map_err(|e| crate::daemon_client::user_message(&e))?;
-        let leftovers = linux_leftover_owners(&owned.owners, &profiles, &statuses, &os_routes);
-        owned
-            .owners
-            .retain(|entry| leftovers.contains(&entry.owner));
-        (
-            crate::route_runtime::static_route_snapshot(owned),
-            leftovers,
-        )
-    };
-    #[cfg(target_os = "linux")]
-    let statuses: Vec<_> = statuses
-        .into_iter()
-        .map(|(profile_id, result)| {
-            let status = result.unwrap_or_else(|err| TunnelStatus {
-                profile_id: profile_id.clone(),
-                state: TunnelState::Failed,
-                message: Some(err),
-                interface_name: None,
-                failover: None,
-                watchdog: None,
-            });
-            (profile_id, status)
-        })
-        .collect();
-    #[cfg(target_os = "linux")]
-    let proxy_ownership = proxy_ownership.filter(|owner| {
-        !statuses
-            .iter()
-            .any(|(id, status)| *id == owner.profile_id && status.state == TunnelState::Running)
-    });
-    Ok((
-        build_recovery_report(
-            &profiles,
-            &statuses,
-            &ownership,
-            &os_routes,
-            proxy_ownership.as_ref(),
-        ),
-        leftovers,
-    ))
-}
-
+#[cfg(target_os = "linux")]
 #[tauri::command]
 pub(crate) async fn get_recovery_report(
     state: State<'_, AppState>,
 ) -> Result<RecoveryReport, String> {
-    collect_report(&state).await
+    run_shared(&state, false).await
 }
-
+#[cfg(target_os = "linux")]
 #[tauri::command]
 pub(crate) async fn cleanup_recovery(
     state: State<'_, AppState>,
     app: tauri::AppHandle,
 ) -> Result<RecoveryReport, String> {
-    // Linux: remove only leftover daemon owners; healthy tunnels, static
-    // routes and always-on state stay untouched.
-    #[cfg(target_os = "linux")]
-    {
-        let client = crate::daemon_client::DaemonClient::system();
-        let root = state.data_dir().to_path_buf();
-        client
-            .engine_request(move |engine| engine.with_data_root(root).recover_local_proxy())
-            .await?;
-        let (_, leftovers) = collect(&state).await?;
-        let mut failed = 0;
-        for (method, params) in leftovers.iter().filter_map(|owner| cleanup_request(owner)) {
-            if client
-                .request::<_, serde_json::Value>(method, params)
-                .await
-                .is_err()
-            {
-                failed += 1;
+    let result = run_shared(&state, true).await;
+    let _ = app.emit("route-changed", ());
+    result
+}
+#[cfg(not(target_os = "linux"))]
+pub(crate) use non_linux::*;
+#[cfg(not(target_os = "linux"))]
+mod non_linux {
+    use crate::commands::diagnostics::applied_route_present;
+    #[cfg(not(target_os = "linux"))]
+    use crate::lifecycle::cleanup_all;
+    use crate::state::AppState;
+    use net_manager_core::explorer;
+    use net_manager_core::models::*;
+    use net_manager_core::system_proxy::ProxyOwnership;
+    use tauri::{Emitter, State};
+
+    pub(crate) fn build_recovery_report(
+        profiles: &[Profile],
+        statuses: &[(String, TunnelStatus)],
+        ownership: &[AppliedProfileRoutes],
+        os_routes: &[RouteEntry],
+        proxy_ownership: Option<&ProxyOwnership>,
+    ) -> RecoveryReport {
+        let mut issues = Vec::new();
+        if let Some(owner) = proxy_ownership {
+            issues.push(RecoveryIssue {
+                kind: RecoveryIssueKind::ProxyOwnership,
+                profile_id: Some(owner.profile_id.clone()),
+                message: format!(
+                    "system proxy settings owned by profile '{}' are still applied",
+                    owner.profile_id
+                ),
+            });
+        }
+        for (profile_id, status) in statuses {
+            let Some(profile) = profiles.iter().find(|p| &p.id == profile_id) else {
+                continue;
+            };
+            #[cfg(not(target_os = "linux"))]
+            if profile.backend != TunnelBackend::WireGuard {
+                continue;
+            }
+            match status.state {
+                TunnelState::Running => {
+                    #[cfg(not(target_os = "linux"))]
+                    issues.push(RecoveryIssue {
+                        kind: RecoveryIssueKind::SurvivingWireGuardService,
+                        profile_id: Some(profile_id.clone()),
+                        message: format!(
+                        "WireGuard tunnel service for profile '{}' ('{}') may still be installed",
+                        profile.id, profile.name
+                    ),
+                    });
+                }
+                TunnelState::Failed => issues.push(RecoveryIssue {
+                    kind: RecoveryIssueKind::StatusCheckFailed,
+                    profile_id: Some(profile_id.clone()),
+                    message: format!(
+                        "status check failed for profile '{}' ('{}'): {}",
+                        profile.id,
+                        profile.name,
+                        status.message.as_deref().unwrap_or("unknown error")
+                    ),
+                }),
+                TunnelState::Stopped => {}
             }
         }
-        let _ = app.emit("route-changed", ());
-        if failed > 0 {
-            return Err(format!("daemon could not clean up {failed} owner(s)"));
-        }
-        if !leftovers.is_empty() {
-            crate::commands::logs::record_log(
-                &state,
-                crate::commands::logs::LogLevel::Warn,
-                format!(
-                    "recovery cleanup removed {} leftover owner(s)",
-                    leftovers.len()
+        for record in ownership {
+            if !profiles.iter().any(|p| p.id == record.profile_id) {
+                issues.push(RecoveryIssue {
+                    kind: RecoveryIssueKind::OrphanRouteOwnership,
+                    profile_id: Some(record.profile_id.clone()),
+                    message: format!(
+                    "route ownership is recorded for profile '{}' but the profile no longer exists",
+                    record.profile_id
                 ),
-            );
+                });
+                continue;
+            }
+            let missing: Vec<String> = record
+                .routes
+                .iter()
+                .filter(|r| !os_routes.iter().any(|e| applied_route_present(r, e)))
+                .map(|r| r.destination.to_string())
+                .collect();
+            if !record.routes.is_empty() && missing.is_empty() {
+                issues.push(RecoveryIssue {
+                    kind: RecoveryIssueKind::OwnedRoutes,
+                    profile_id: Some(record.profile_id.clone()),
+                    message: format!(
+                        "{} route(s) owned by profile '{}' are still present in the route table",
+                        record.routes.len(),
+                        record.profile_id
+                    ),
+                });
+            } else {
+                let detail = if missing.is_empty() {
+                    format!("{} route(s)", record.routes.len())
+                } else {
+                    missing.join(", ")
+                };
+                issues.push(RecoveryIssue {
+                    kind: RecoveryIssueKind::MissingOwnedRoutes,
+                    profile_id: Some(record.profile_id.clone()),
+                    message: format!(
+                        "route(s) owned by profile '{}' are missing from the route table: {detail}",
+                        record.profile_id
+                    ),
+                });
+            }
+        }
+        RecoveryReport {
+            requires_elevation: !issues.is_empty(),
+            issues,
         }
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        cleanup_all(&state).await?;
-        let _ = app.emit("route-changed", ());
+
+    async fn collect_report(state: &AppState) -> Result<RecoveryReport, String> {
+        collect(state).await.map(|(report, _)| report)
     }
-    collect_report(&state).await
+
+    /// The recovery report plus, on Linux, the daemon owners that are leftovers.
+    async fn collect(state: &AppState) -> Result<(RecoveryReport, Vec<String>), String> {
+        let profiles = state.profiles.load().map_err(|e| e.to_string())?.profiles;
+        let os_routes = explorer::list_routes().await.map_err(|e| e.to_string())?;
+        #[cfg(not(target_os = "linux"))]
+        let mut runtime = state.runtime.lock().await;
+        #[cfg(not(target_os = "linux"))]
+        let statuses: Vec<(String, TunnelStatus)> = profiles
+            .iter()
+            .map(|p| (p.id.clone(), runtime.tunnels.status(p)))
+            .collect();
+        #[cfg(not(target_os = "linux"))]
+        let (ownership, leftovers) = (runtime.routes.snapshot().await?, Vec::new());
+        #[cfg(not(target_os = "linux"))]
+        drop(runtime);
+        let proxy_ownership = state
+            .proxy_ownership()
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok((
+            build_recovery_report(
+                &profiles,
+                &statuses,
+                &ownership,
+                &os_routes,
+                proxy_ownership.as_ref(),
+            ),
+            leftovers,
+        ))
+    }
+
+    #[tauri::command]
+    pub(crate) async fn get_recovery_report(
+        state: State<'_, AppState>,
+    ) -> Result<RecoveryReport, String> {
+        collect_report(&state).await
+    }
+
+    #[tauri::command]
+    pub(crate) async fn cleanup_recovery(
+        state: State<'_, AppState>,
+        app: tauri::AppHandle,
+    ) -> Result<RecoveryReport, String> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            cleanup_all(&state).await?;
+            let _ = app.emit("route-changed", ());
+        }
+        collect_report(&state).await
+    }
 }
 
 #[cfg(test)]
