@@ -10,6 +10,10 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+## [0.10.3] - 2026-11-08
+
+Core 0.16.0.
+
 ### Changed
 
 - Refresh the shared localization catalog for profile-edit conflict feedback.
