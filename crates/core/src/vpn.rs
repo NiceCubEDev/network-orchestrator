@@ -1422,14 +1422,22 @@ impl TunnelManager {
         failures: &mut HashMap<String, String>,
         profile: &Profile,
     ) -> io::Result<TunnelStatus> {
-        let mut child = children.remove(&profile.id).ok_or_else(|| {
-            io::Error::new(
+        if let Some(child) = children.get_mut(&profile.id) {
+            if child.try_wait()?.is_none() {
+                if let Err(cause) = child.kill() {
+                    if child.try_wait()?.is_none() {
+                        return Err(cause);
+                    }
+                }
+                child.wait()?;
+            }
+            children.remove(&profile.id);
+        } else if !failures.contains_key(&profile.id) {
+            return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("profile '{}' is not running", profile.id),
-            )
-        })?;
-        child.kill()?;
-        child.wait()?;
+            ));
+        }
         failures.remove(&profile.id);
         Ok(status_for(&profile.id, TunnelState::Stopped, None))
     }
@@ -1494,7 +1502,6 @@ impl TunnelManager {
                 }
                 Err(err) => {
                     let message = format!("failed to query {name} process: {err}");
-                    children.remove(profile_id);
                     failures.insert(profile_id.to_string(), message.clone());
                     return status_for(profile_id, TunnelState::Failed, Some(message));
                 }
@@ -1544,6 +1551,55 @@ mod tests {
         ));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn disconnect_clears_reaped_failed_child_and_already_exited_child() {
+        for backend in [TunnelBackend::Xray, TunnelBackend::OpenVpn] {
+            for health_polled in [false, true] {
+                let profile = Profile {
+                    id: "child".into(),
+                    backend,
+                    ..Default::default()
+                };
+                let child = Command::new("/bin/sh")
+                    .args(["-c", "exit 7"])
+                    .spawn()
+                    .unwrap();
+                let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                assert_eq!(
+                    unsafe {
+                        libc::waitid(
+                            libc::P_PID,
+                            child.id(),
+                            &mut info,
+                            libc::WEXITED | libc::WNOWAIT,
+                        )
+                    },
+                    0
+                );
+                let mut manager = TunnelManager::new();
+                match backend {
+                    TunnelBackend::Xray => &mut manager.xray_children,
+                    TunnelBackend::OpenVpn => &mut manager.openvpn_children,
+                    _ => unreachable!(),
+                }
+                .insert(profile.id.clone(), child);
+                if health_polled {
+                    assert_eq!(manager.status(&profile).state, TunnelState::Failed);
+                }
+                assert_eq!(
+                    manager.disconnect(&profile).unwrap().state,
+                    TunnelState::Stopped
+                );
+                assert_eq!(manager.status(&profile).state, TunnelState::Stopped);
+                assert_eq!(
+                    manager.disconnect(&profile).unwrap_err().kind(),
+                    io::ErrorKind::NotFound
+                );
+            }
+        }
     }
 
     #[cfg(target_os = "linux")]

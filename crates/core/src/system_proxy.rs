@@ -159,6 +159,12 @@ impl SystemProxyManager {
         self.ownership.as_ref()
     }
 
+    /// Reload persisted ownership while the caller holds its cross-process proxy lock.
+    pub fn reload_ownership(&mut self) -> io::Result<()> {
+        self.ownership = load_document(&self.path)?.ownership;
+        Ok(())
+    }
+
     pub fn apply(&mut self, profile_id: &str, port: u16, bypass: &[String]) -> io::Result<()> {
         self.apply_server(profile_id, format!("socks=127.0.0.1:{port}"), bypass)
     }
@@ -222,6 +228,12 @@ impl SystemProxyManager {
                 Ok(()) => {
                     self.ownership = None;
                     if let Err(persist_err) = self.persist() {
+                        self.ownership = Some(ProxyOwnership {
+                            profile_id: profile_id.to_string(),
+                            snapshot,
+                            applied_server: server,
+                            applied_override,
+                        });
                         message
                             .push_str(&format!("; ownership record cleanup failed: {persist_err}"));
                     }
@@ -250,7 +262,11 @@ impl SystemProxyManager {
         }
         self.adapter.restore(&ownership.snapshot)?;
         self.ownership = None;
-        self.persist()
+        if let Err(err) = self.persist() {
+            self.ownership = Some(ownership);
+            return Err(err);
+        }
+        Ok(())
     }
 
     pub fn restore_any(&mut self) -> io::Result<()> {
@@ -259,7 +275,11 @@ impl SystemProxyManager {
         };
         self.adapter.restore(&ownership.snapshot)?;
         self.ownership = None;
-        self.persist()
+        if let Err(err) = self.persist() {
+            self.ownership = Some(ownership);
+            return Err(err);
+        }
+        Ok(())
     }
 
     fn persist(&self) -> io::Result<()> {
@@ -1776,6 +1796,31 @@ mod tests {
 
         let err = mgr.restore("p1").unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn restore_persistence_failure_keeps_ownership_for_retry() {
+        let dir = unique_dir("restore-persist");
+        let (mut mgr, _) = manager(&dir, FakeAdapter::default());
+        mgr.apply("p1", 10808, &[]).unwrap();
+        let moved = dir.with_extension("moved");
+        fs::rename(&dir, &moved).unwrap();
+        fs::write(&dir, b"not a directory").unwrap();
+
+        assert!(mgr.restore_any().is_err());
+        assert_eq!(mgr.ownership().unwrap().profile_id, "p1");
+        assert_eq!(
+            super::load_ownership(&moved.join("proxy-state.json"))
+                .unwrap()
+                .unwrap()
+                .profile_id,
+            "p1"
+        );
+        fs::remove_file(&dir).unwrap();
+        fs::rename(&moved, &dir).unwrap();
+        mgr.restore_any().unwrap();
+        assert!(mgr.ownership().is_none());
         fs::remove_dir_all(&dir).unwrap();
     }
 
