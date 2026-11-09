@@ -1454,34 +1454,37 @@ export default function ProfileManager() {
     profiles[0] ??
     null;
 
-  // Tunnel-kind interfaces that no running managed tunnel owns — raised by
-  // wg-quick, other VPN apps, etc. tailscaled has its own service row.
-  const isTailscaleIface = (i: NetworkInterface) =>
-    i.name.toLowerCase().startsWith("tailscale") ||
-    (typeof i.kind === "object" && i.kind.other === "Tailscale");
-  const isTunnelIface = (i: NetworkInterface) => i.category === "vpn";
-  const managedIfaces = new Set(
-    profiles
+  const interfaceNamesForAddresses = (addresses: readonly string[]) => {
+    const ips = new Set(
+      addresses.map((address) => address.split("/")[0].toLowerCase()).filter(Boolean),
+    );
+    return interfaces
+      .filter(
+        (iface) =>
+          iface.category === "vpn" &&
+          iface.addresses.some((address) => ips.has(address.address.toLowerCase())),
+      )
+      .map((iface) => iface.name);
+  };
+  const serviceInterfaces = {
+    tailscale: interfaceNamesForAddresses(tailscale?.available ? tailscale.selfIps : []),
+    netbird: interfaceNamesForAddresses(
+      netbird.state?.installed && netbird.state.ip ? [netbird.state.ip] : [],
+    ),
+  };
+  // Profiles, NetworkManager and services already represent their owned interfaces.
+  const ownedIfaces = new Set([
+    ...profiles
       .filter((p) => statusFor(p.id).state === "running")
-      .flatMap((p) => [p.interfaceName, statusFor(p.id).interfaceName ?? ""])
-      .filter((name) => name !== ""),
-  );
-  // Interfaces already owned by a NetworkManager connection live in the NM
-  // group — showing them under "detected" too would list the same tunnel
-  // twice.
-  const nmIfaces = new Set(
-    (nm?.connections ?? [])
-      .map((c) => c.interfaceName)
-      .filter((n): n is string => n !== null),
-  );
+      .flatMap((p) => [p.interfaceName, statusFor(p.id).interfaceName ?? ""]),
+    ...(nm?.connections ?? []).flatMap((c) => c.interfaceName ? [c.interfaceName] : []),
+    ...Object.values(serviceInterfaces).flat(),
+  ].filter(Boolean));
   const externalTunnels = interfaces.filter(
     (i) =>
-      isTunnelIface(i) &&
-      !isTailscaleIface(i) &&
-      !managedIfaces.has(i.name) &&
-      !managedIfaces.has(i.friendlyName) &&
-      !nmIfaces.has(i.name) &&
-      !nmIfaces.has(i.friendlyName),
+      i.category === "vpn" &&
+      !ownedIfaces.has(i.name) &&
+      !ownedIfaces.has(i.friendlyName),
   );
   const externalNames = new Set(
     externalTunnels.flatMap((i) => [i.name, i.friendlyName]),
@@ -1921,6 +1924,11 @@ export default function ProfileManager() {
                 <TailscaleIcon size={14} />
               </span>
               <span className="profile-row-name">Tailscale</span>
+              {serviceInterfaces.tailscale.length > 0 && (
+                <span className="profile-row-meta">
+                  {serviceInterfaces.tailscale.join(", ")}
+                </span>
+              )}
               <ToggleSwitch
                 checked={tsRunning}
                 onChange={() => void onToggleTailscale()}
@@ -1940,7 +1948,7 @@ export default function ProfileManager() {
               />
             </div>
             )}
-            <NetBirdRow netbird={netbird} />
+            <NetBirdRow netbird={netbird} interfaceNames={serviceInterfaces.netbird} />
           </div>
         </div>
       )}

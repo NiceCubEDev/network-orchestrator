@@ -10,6 +10,11 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+### Fixed
+
+- Match service-owned tunnel interfaces by reported addresses rather than device
+  name prefixes, keeping unrelated external tunnels visible.
+
 ## [0.10.4] - 2026-11-08
 
 Core 0.16.1.

@@ -10,6 +10,12 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+### Fixed
+
+- Associate NetBird and Tailscale service rows with their tunnel interfaces by
+  reported addresses, showing the interface names without duplicate external
+  rows. Keep unrelated tunnels and interfaces with unknown ownership visible.
+
 ## [0.16.2] - 2026-11-08
 
 Core 0.16.1.

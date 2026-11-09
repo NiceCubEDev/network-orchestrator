@@ -101,7 +101,13 @@ function subtitle(state: NetBirdState, t: ReturnType<typeof useT>): string {
 }
 
 /** A service row for the user's own NetBird daemon; nothing when it is absent. */
-export default function NetBirdRow({ netbird }: { netbird: NetBirdController }) {
+export default function NetBirdRow({
+  netbird,
+  interfaceNames,
+}: {
+  netbird: NetBirdController;
+  interfaceNames: readonly string[];
+}) {
   const t = useT();
   const [setupOpen, setSetupOpen] = useState(false);
   const { state, busy, isOn, toggle } = netbird;
@@ -112,6 +118,7 @@ export default function NetBirdRow({ netbird }: { netbird: NetBirdController }) 
     : state.state === "needsLogin"
       ? "failed"
       : "stopped";
+  const details = [...interfaceNames, subtitle(state, t)].filter(Boolean).join(" · ");
 
   return (
     <>
@@ -123,8 +130,9 @@ export default function NetBirdRow({ netbird }: { netbird: NetBirdController }) 
         <span className="profile-row-name">NetBird</span>
         <span
           className={`profile-row-meta${state.state === "needsLogin" ? " warn" : ""}`}
+          title={details}
         >
-          {subtitle(state, t)}
+          {details}
         </span>
         <OverflowMenu
           items={[
