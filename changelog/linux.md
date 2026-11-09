@@ -10,6 +10,10 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+## [0.16.3] - 2026-11-09
+
+Core 0.16.1.
+
 ### Fixed
 
 - Associate NetBird and Tailscale service rows with their tunnel interfaces by
