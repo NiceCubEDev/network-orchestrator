@@ -17,10 +17,14 @@ version by hand elsewhere:
 
 ```bash
 python3 scripts/versions.py get linux          # print a version
-python3 scripts/versions.py set linux 0.11.0   # change it and sync the crates and configs
+python3 scripts/versions.py prepare linux=0.16.4 --dry-run  # preview a release
+python3 scripts/versions.py prepare linux=0.16.4            # update and run checks
 python3 scripts/versions.py check              # fail if anything drifted (part of the quality gate)
 python3 scripts/versions.py affected main...HEAD   # which lines a branch touches
 ```
+
+Use `prepare` for releases. `set` and `sync` remain low-level synchronization
+commands; they do not prepare changelogs, refresh Cargo.lock or run the gate.
 
 `sync` writes the version into the `Cargo.toml` of every crate that belongs to
 one line and into `src-tauri/tauri.<linux|windows>.conf.json`, which Tauri
@@ -144,21 +148,43 @@ Rules:
   prefix; with **merge** or **fast-forward** every commit of the branch is
   read, so each one needs its own prefix.
 
-## Release steps (per line)
+## Release preparation
 
 A version bump happens after a group of related commits, not in every commit.
-For the line `L` (`core`, `macos`, `linux` or `windows`):
+The project skill is [prepare-release](../.agents/skills/prepare-release/SKILL.md).
 
-1. Move the entries under `## [Unreleased]` in `changelog/L.md` to a new
-   `## [X.Y.Z] - YYYY-MM-DD` section
-   ([Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format). A product
-   line also notes the core version it ships.
-2. `python3 scripts/versions.py set L X.Y.Z`, then refresh `Cargo.lock`
-   (`cargo check --workspace`).
-3. Run the quality gate from `AGENTS.md`.
-4. Commit only the bump and the changelog: `chore(release): L X.Y.Z`.
-5. Create an annotated tag `L-vX.Y.Z` (`core-v0.11.0`, `linux-v0.10.1`):
-   `git tag -a linux-v0.10.1 -m "Network Orchestrator Linux 0.10.1"`.
+1. Finish and commit the feature/fix and its notes under `## [Unreleased]` in each
+   selected `changelog/<line>.md`. Applying a release requires a clean Git
+   checkout, Git, Cargo (rustfmt and Clippy), npm and the normal build dependencies.
+2. Choose the target SemVer values. Preview one or several release lines without
+   writes or subprocess checks, then apply the same selection:
+
+   ```bash
+   python3 scripts/versions.py prepare linux=0.16.4 windows=0.10.6 --dry-run
+   python3 scripts/versions.py prepare linux=0.16.4 windows=0.10.6
+   ```
+
+   All selected lines are validated before writing. Versions must advance;
+   missing/empty Unreleased sections and existing release sections are rejected.
+   The command synchronizes versions, promotes the notes into dated sections,
+   records the selected core version in product changelogs, refreshes Cargo.lock
+   through Cargo and runs the repository quality gate. Pass `core=...` in the same
+   invocation as product updates when their changelogs should name that new core.
+3. Review the changes. The gate validates the current host; non-macOS hosts exclude
+   native macOS crates. Native checks for other products remain required before
+   shipping them. A failed check returns nonzero and leaves the metadata edits
+   uncommitted for inspection; there is no automatic reset, commit, tag or push.
+   Fix the failure and run the failed and remaining quality-gate commands from
+   `AGENTS.md`. Preparing the same version again is rejected to protect history.
+4. Commit only the version/changelog/lockfile changes:
+   `chore(release): <line> X.Y.Z`. Keep independent lines in separate commits;
+   multi-line preparation may require partial staging of `versions.toml`.
+5. Merge through the normal review workflow. Create annotated release tags from
+   main only, for example
+   `git tag -a linux-v0.16.4 -m "Network Orchestrator Linux 0.16.4"`.
+
+The command does not build installer packages or update an installed application.
+Preparation is not publication.
 
 Tags are pushed only together with the release branch after review; never push
 directly to `main`. The tags `v0.1.2` … `v0.9.1` belong to the time of a single

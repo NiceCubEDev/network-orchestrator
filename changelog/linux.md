@@ -10,6 +10,11 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+### Added
+
+- `versions.py prepare` automates release metadata, changelog promotion, lockfile
+  refresh and the host quality gate, with a no-write preview and a project skill.
+
 ## [0.16.3] - 2026-11-09
 
 Core 0.16.1.

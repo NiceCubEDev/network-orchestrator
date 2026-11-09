@@ -8,10 +8,15 @@ versions.toml holds one version per line: core, macos, linux, windows.
   versions.py sync                    write the versions into the crates and configs
   versions.py check                   exit 1 if any crate or config drifted
   versions.py affected [<git-range>]  lines touched by the changed files
+  versions.py prepare LINE=VERSION [LINE=VERSION ...] [--dry-run]
+                                     prepare changelogs, versions, lockfile and checks
 """
+import argparse
+from datetime import date
 import json
 import pathlib
 import re
+import shutil
 import subprocess
 import sys
 
@@ -58,6 +63,21 @@ PATH_LINES = [
 SEMVER = re.compile(r"^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$")
 
 
+def version_key(version):
+    base, _, prerelease = version.partition("-")
+    numbers = base.split(".")
+    prerelease_ids = prerelease.split(".") if prerelease else []
+    if any(not re.fullmatch(r"0|[1-9][0-9]*", item) for item in numbers) or any(
+        not item or (item.isdigit() and len(item) > 1 and item.startswith("0"))
+        for item in prerelease_ids
+    ):
+        raise SystemExit(f"Invalid release version: {version!r}")
+    identifiers = tuple(
+        (0, int(item)) if item.isdigit() else (1, item) for item in prerelease_ids
+    )
+    return tuple(map(int, numbers)), not prerelease, identifiers
+
+
 class Repo:
     def __init__(self, root):
         self.root = pathlib.Path(root)
@@ -65,7 +85,8 @@ class Repo:
     def versions(self):
         # versions.toml is [line] / version = "x" only, so no TOML library
         # (the system Python on macOS is too old to have one).
-        data, section = {}, None
+        data: dict[str, dict[str, str]] = {}
+        section = None
         for raw in (self.root / "versions.toml").read_text().splitlines():
             text = raw.split("#", 1)[0].strip()
             header = re.fullmatch(r"\[([a-z]+)\]", text)
@@ -155,6 +176,47 @@ class Repo:
         path.write_text(new)
         return self.sync()
 
+    def prepare(self, updates, release_date, dry_run=False):
+        """Plan every selected line before changing any version or changelog."""
+        current = self.versions()
+        if not updates:
+            raise SystemExit("Select at least one release line")
+        proposed = dict(current, **updates)
+        changelogs = {}
+        for line, version in updates.items():
+            if line not in LINES or not SEMVER.fullmatch(version):
+                raise SystemExit(f"Invalid release: {line}={version}")
+            if version_key(version) <= version_key(current[line]):
+                raise SystemExit(f"{line}: release version must be newer than {current[line]}")
+            path = self.root / f"changelog/{line}.md"
+            text = path.read_text()
+            sections = list(re.finditer(r"(?m)^## \[Unreleased\][ \t]*$", text))
+            if len(sections) != 1:
+                raise SystemExit(f"{path.name}: expected one Unreleased section")
+            if re.search(rf"(?m)^## \[{re.escape(version)}\](?:[ \t]|$)", text):
+                raise SystemExit(f"{path.name}: version {version} is already documented")
+            section = sections[0]
+            following = re.search(r"(?m)^## ", text[section.end():])
+            end = section.end() + following.start() if following else len(text)
+            notes = text[section.end():end].strip()
+            if not notes:
+                raise SystemExit(f"{path.name}: Unreleased has no notes")
+            core = "" if line == "core" else f"Core {proposed['core']}.\n\n"
+            changelogs[line] = (
+                f"{text[:section.end()]}\n\n## [{version}] - {release_date}\n\n"
+                f"{core}{notes}\n\n{text[end:]}"
+            )
+        if not dry_run:
+            for line in LINES:
+                if line in updates:
+                    self.set_version(line, updates[line])
+            for line, text in changelogs.items():
+                (self.root / f"changelog/{line}.md").write_text(text)
+        return [
+            f"{line}: {current[line]} -> {updates[line]} ({release_date})"
+            for line in LINES if line in updates
+        ]
+
 
 def lines_for(path):
     for prefix, lines in PATH_LINES:
@@ -169,6 +231,61 @@ def affected(paths):
     for path in paths:
         found.update(lines_for(path))
     return [line for line in LINES if line in found]
+
+
+def prepare_release(repo, argv):
+    parser = argparse.ArgumentParser(prog="versions.py prepare")
+    parser.add_argument("releases", nargs="+", metavar="LINE=VERSION")
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args(argv)
+    updates = {}
+    for release in args.releases:
+        line, separator, version = release.partition("=")
+        if not separator or line in updates:
+            parser.error("Use distinct LINE=VERSION arguments")
+        updates[line] = version
+    release_date = date.today().isoformat()
+    for item in repo.prepare(updates, release_date, dry_run=True):
+        print("would prepare" if args.dry_run else "prepare", item, flush=True)
+    if args.dry_run:
+        return 0
+    programs: dict[str, str] = {}
+    for name in ("git", "cargo", "npm"):
+        executable = shutil.which(name)
+        if executable is None:
+            raise SystemExit(f"Install required tool before preparing: {name}")
+        programs[name] = executable
+    dirty = subprocess.check_output(
+        [programs["git"], "status", "--porcelain"], cwd=repo.root, text=True
+    )
+    if dirty:
+        raise SystemExit("Commit or stash existing changes before preparing a release")
+    try:
+        repo.prepare(updates, release_date)
+        excluded = [] if sys.platform == "darwin" else [
+            "--exclude", "net-manager-macos-bridge",
+            "--exclude", "network-orchestrator-macos-helper",
+        ]
+        cargo = programs["cargo"]
+        commands = [
+            [sys.executable, "scripts/versions.py", "check"],
+            [sys.executable, "-m", "unittest", "scripts/test_versions.py"],
+            [cargo, "fmt", "--all", "--", "--check"],
+            [cargo, "check", "--workspace", "--all-targets", *excluded],
+            [cargo, "clippy", "--workspace", "--all-targets", *excluded, "--", "-D", "warnings"],
+            [cargo, "test", "--workspace", *excluded],
+            [programs["npm"], "run", "build"],
+        ]
+        for command in commands:
+            print("+", *command, flush=True)
+            subprocess.run(command, cwd=repo.root, check=True)
+    except (OSError, subprocess.CalledProcessError) as error:
+        print(f"Release preparation failed: {error}", file=sys.stderr)
+        print("Review retained edits; no commits, tags or pushes were made.", file=sys.stderr)
+        return 1
+    print(f"Release preparation passed the {sys.platform} host quality gate.")
+    print("Review the edits before committing; other platforms still need native validation.")
+    return 0
 
 
 def main(argv):
@@ -196,6 +313,8 @@ def main(argv):
             ["git", "-C", str(repo.root), "diff", "--name-only", span], text=True
         ).split()
         print(" ".join(affected(files)))
+    elif command == "prepare":
+        return prepare_release(repo, rest)
     else:
         print(__doc__)
         return 2
