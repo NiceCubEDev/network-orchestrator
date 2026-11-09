@@ -1177,10 +1177,18 @@ pub fn logs(root: &Path) -> Result<Vec<LogEvent>, String> {
     read_events(&directory.join("events.json"))
 }
 
-fn update_logs(root: &Path, update: impl FnOnce(&mut Vec<LogEvent>)) -> Result<(), String> {
+fn update_logs(
+    root: &Path,
+    blocking: bool,
+    update: impl FnOnce(&mut Vec<LogEvent>),
+) -> Result<(), String> {
     let directory = log_directory(root, true)?;
     let lock = private_file(&directory.join("store.lock"), true)?;
-    lock.lock().map_err(|_| store_error())?;
+    if blocking {
+        lock.lock().map_err(|_| store_error())?;
+    } else {
+        lock.try_lock().map_err(|_| store_error())?;
+    }
     let path = directory.join("events.json");
     let mut events = read_events(&path)?;
     update(&mut events);
@@ -1189,7 +1197,32 @@ fn update_logs(root: &Path, update: impl FnOnce(&mut Vec<LogEvent>)) -> Result<(
 }
 
 pub fn record_log(root: &Path, level: LogLevel, message: &str) -> Result<(), String> {
-    update_logs(root, |events| {
+    append_log(root, true, level, message)
+}
+
+/// Best-effort diagnostics must not stall recovery behind another client's lock.
+pub fn try_record_log(root: &Path, level: LogLevel, message: &str) -> Result<(), String> {
+    let result = append_log(root, false, level, message);
+    if result.is_err() {
+        // CLI stderr is a machine-readable JSON error channel under --json.
+        let priority = match level {
+            LogLevel::Info => 6,
+            LogLevel::Warn => 4,
+            LogLevel::Error => 3,
+        };
+        let _ = std::os::unix::net::UnixDatagram::unbound().and_then(|socket| {
+            socket.set_nonblocking(true)?;
+            socket.send_to(
+                format!("PRIORITY={priority}\nSYSLOG_IDENTIFIER=netorch\nMESSAGE=diagnostic_store_unavailable {}\n", safe_message(message)).as_bytes(),
+                "/run/systemd/journal/socket",
+            )
+        });
+    }
+    result
+}
+
+fn append_log(root: &Path, blocking: bool, level: LogLevel, message: &str) -> Result<(), String> {
+    update_logs(root, blocking, |events| {
         if events.len() == LOG_CAPACITY {
             events.remove(0);
         }
@@ -1203,7 +1236,7 @@ pub fn record_log(root: &Path, level: LogLevel, message: &str) -> Result<(), Str
 }
 
 pub fn clear_logs(root: &Path) -> Result<(), String> {
-    update_logs(root, Vec::clear)
+    update_logs(root, true, Vec::clear)
 }
 
 pub fn filtered_logs(
@@ -2334,6 +2367,19 @@ pub async fn cleanup_recovery(
     store: &ProfileStore,
 ) -> Result<RecoveryReport, String> {
     let (report, leftovers) = collect_recovery(engine, root, store).await?;
+    let _ = record_log(
+        root,
+        LogLevel::Warn,
+        &format!(
+            "recovery cleanup begin pid={} reason=explicit_request targets={} proxy_owned={}",
+            std::process::id(),
+            leftovers.len(),
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.kind == RecoveryIssueKind::ProxyOwnership)
+        ),
+    );
     if report
         .issues
         .iter()
@@ -2364,13 +2410,8 @@ pub async fn cleanup_recovery(
             unsupported_probes += 1;
         }
     }
-    if removed > 0 {
-        let _ = record_log(
-            root,
-            LogLevel::Warn,
-            &format!("recovery cleanup removed {removed} leftover owner(s)"),
-        );
-    }
+    let _ = record_log(root, if failed > 0 || unsupported_probes > 0 { LogLevel::Error } else { LogLevel::Warn },
+        &format!("recovery cleanup end pid={} removed={removed} failed={failed} unsupported={unsupported_probes}", std::process::id()));
     if failed > 0 {
         return Err(format!("Daemon could not clean up {failed} owner(s)"));
     }

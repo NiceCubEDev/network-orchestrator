@@ -2288,8 +2288,16 @@ impl DaemonCore {
                     .map(|failover| failover.probe_url.clone())
             }),
         };
-        if let Ok(watchdog) = crate::watchdog::WatchdogSupervisor::spawn(spec, network) {
-            self.watchdogs.insert(key, watchdog);
+        match crate::watchdog::WatchdogSupervisor::spawn(spec, network) {
+            Ok(watchdog) => {
+                self.watchdogs.insert(key, watchdog);
+            }
+            Err(err) => eprintln!(
+                "network-orchestrator-daemon: watchdog spawn failed uid={} kind={:?} os_code={:?}",
+                key.0,
+                err.kind(),
+                err.raw_os_error()
+            ),
         }
     }
 
@@ -2375,6 +2383,7 @@ impl DaemonCore {
         let runner = self.xray.as_mut().ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotConnected, "Xray executor is unavailable")
         })?;
+        eprintln!("network-orchestrator-daemon: xray restart uid={uid} cause=explicit_reload");
         runner
             .reload(uid, &plan.name, &plan.config, plan.geo_assets.as_ref())
             .map_err(|err| xray_stage("reload", err))?;
@@ -2772,6 +2781,9 @@ impl DaemonCore {
     }
 
     pub fn disconnect_xray(&mut self, uid: u32, profile_id: &str) -> io::Result<()> {
+        eprintln!(
+            "network-orchestrator-daemon: teardown uid={uid} tunnel=xray cause=explicit_disconnect"
+        );
         let owner = format!("xray:{profile_id}");
         let Some(index) = self.position(uid, &owner) else {
             if self.tunnel_failed.remove(&(uid, owner)) {
@@ -3180,6 +3192,7 @@ impl DaemonCore {
     }
 
     pub fn disconnect_openvpn(&mut self, uid: u32, profile_id: &str) -> io::Result<()> {
+        eprintln!("network-orchestrator-daemon: teardown uid={uid} tunnel=openvpn cause=explicit_disconnect");
         let owner = format!("ovpn:{profile_id}");
         let key = (uid, owner.clone());
         let Some(index) = self.position(uid, &owner) else {
@@ -3428,7 +3441,7 @@ impl DaemonCore {
         let mut first_error = None;
         for (uid, owner) in owners {
             if let Err(err) = self.reconcile_openvpn_owner(uid, &owner) {
-                eprintln!("network-orchestrator-daemon: OpenVPN reconcile failed: {err}");
+                eprintln!("network-orchestrator-daemon: openvpn reconcile failed uid={uid} kind={:?} os_code={:?}", err.kind(), err.raw_os_error());
                 first_error.get_or_insert(err);
             }
         }
@@ -4049,6 +4062,7 @@ impl DaemonCore {
     }
 
     pub fn disconnect_wireguard(&mut self, uid: u32, profile_id: &str) -> io::Result<()> {
+        eprintln!("network-orchestrator-daemon: teardown uid={uid} tunnel=wireguard cause=explicit_disconnect");
         let owner = wireguard_owner(profile_id)?;
         let Some(index) = self.position(uid, &owner) else {
             if self.tunnel_failed.remove(&(uid, owner)) {
@@ -4322,7 +4336,9 @@ impl DaemonCore {
                             }
                             match self.heal_xray(index, false) {
                                 Ok(true) => self.restore_owned_network(index, observed),
-                                Ok(false) | Err(_) => {
+                                Ok(false) => Err(io::Error::other("tunnel transport is gone")),
+                                Err(err) => {
+                                    eprintln!("network-orchestrator-daemon: xray recovery failed uid={} cause=transport_lost kind={:?} os_code={:?}", key.0, err.kind(), err.raw_os_error());
                                     Err(io::Error::other("tunnel transport is gone"))
                                 }
                             }
@@ -4336,13 +4352,16 @@ impl DaemonCore {
                         let requested = self
                             .watchdogs
                             .get(&key)
-                            .and_then(|watchdog| watchdog.take_request())
-                            .is_some();
-                        if requested {
+                            .and_then(|watchdog| watchdog.take_request());
+                        if let Some(reason) = requested {
+                            eprintln!("network-orchestrator-daemon: xray watchdog restart uid={} reason={reason:?}", key.0);
                             match self.heal_xray(index, true) {
                                 Ok(true) => {}
                                 Ok(false) | Err(_) => {
-                                    let _ = self.teardown_entry(index);
+                                    eprintln!("network-orchestrator-daemon: xray teardown uid={} cause=watchdog_restart_failed", key.0);
+                                    if let Err(err) = self.teardown_entry(index) {
+                                        eprintln!("network-orchestrator-daemon: teardown failed uid={} kind={:?} os_code={:?}", key.0, err.kind(), err.raw_os_error());
+                                    }
                                     self.persist();
                                     self.tunnel_failed.insert(key.clone());
                                     changed.push(key);
@@ -4359,14 +4378,15 @@ impl DaemonCore {
                 Ok(false) => {}
                 Ok(true) => changed.push(key),
                 Err(err) => {
-                    eprintln!(
-                        "network-orchestrator-daemon: network reconcile failed an owner: {}",
-                        err.kind()
-                    );
+                    eprintln!("network-orchestrator-daemon: network reconcile teardown uid={} kind={:?} os_code={:?}", key.0, err.kind(), err.raw_os_error());
                     if key.1.starts_with("ovpn:") {
-                        let _ = self.fail_openvpn(key.0, &key.1);
+                        if let Err(err) = self.fail_openvpn(key.0, &key.1) {
+                            eprintln!("network-orchestrator-daemon: openvpn failure cleanup failed uid={} kind={:?} os_code={:?}", key.0, err.kind(), err.raw_os_error());
+                        }
                     } else {
-                        let _ = self.teardown_entry(index);
+                        if let Err(err) = self.teardown_entry(index) {
+                            eprintln!("network-orchestrator-daemon: teardown failed uid={} kind={:?} os_code={:?}", key.0, err.kind(), err.raw_os_error());
+                        }
                         self.persist();
                         self.tunnel_failed.insert(key.clone());
                     }
@@ -4437,11 +4457,13 @@ impl DaemonCore {
             })?;
         let attempts = self.xray_restarts.get(&key).copied().unwrap_or(0);
         if !intentional && attempts >= MAX_XRAY_RESPAWNS {
+            eprintln!("network-orchestrator-daemon: xray restart budget exhausted uid={} attempts={attempts} budget={MAX_XRAY_RESPAWNS}", key.0);
             return Ok(false);
         }
         // The attempt counts even when the respawn itself fails: a flapping
         // child must not loop forever.
         let uid = key.0;
+        eprintln!("network-orchestrator-daemon: xray restart uid={uid} cause={} attempt={} budget={MAX_XRAY_RESPAWNS}", if intentional { "watchdog" } else { "transport_lost" }, if intentional { attempts } else { attempts + 1 });
         // A respawn resets Xray's override. Stop the old controller before
         // replacing the child, then start with fresh health observations.
         self.failovers.remove(&key);
@@ -4469,8 +4491,12 @@ impl DaemonCore {
         }
         self.ensure_watchdog(index);
         eprintln!(
-            "network-orchestrator-daemon: respawned xray child for {}",
-            self.journal.entries[index].owner
+            "network-orchestrator-daemon: xray restart complete uid={uid} cause={}",
+            if intentional {
+                "watchdog"
+            } else {
+                "transport_lost"
+            }
         );
         Ok(true)
     }
@@ -6300,6 +6326,7 @@ impl DaemonCore {
     }
 
     pub fn cleanup_uid(&mut self, uid: u32) -> io::Result<CleanupResult> {
+        eprintln!("network-orchestrator-daemon: cleanup requested uid={uid}");
         self.tunnel_failed
             .retain(|(owner_uid, _)| *owner_uid != uid);
         self.teardown(|entry| entry.uid == uid)
@@ -6307,6 +6334,7 @@ impl DaemonCore {
 
     /// Tear down every owner of every uid, newest first (SIGTERM path).
     pub fn shutdown(&mut self) -> io::Result<CleanupResult> {
+        eprintln!("network-orchestrator-daemon: cleanup requested cause=shutdown");
         self.teardown(|_| true)
     }
 
@@ -6375,7 +6403,15 @@ impl DaemonCore {
             let owner = self.journal.entries[index].owner.clone();
             match self.teardown_entry(index) {
                 Ok(()) => result.removed_owners.push(owner),
-                Err(_) => result.failed.push(owner),
+                Err(err) => {
+                    eprintln!(
+                        "network-orchestrator-daemon: cleanup failed uid={} kind={:?} os_code={:?}",
+                        self.journal.entries[index].uid,
+                        err.kind(),
+                        err.raw_os_error()
+                    );
+                    result.failed.push(owner);
+                }
             }
         }
         self.store.save(&self.journal)?;
@@ -6433,10 +6469,7 @@ impl DaemonCore {
                 _ => Ok(()),
             };
             if let Err(err) = result {
-                eprintln!(
-                    "network-orchestrator-daemon: teardown of {} failed: {err}",
-                    self.journal.entries[index].owner
-                );
+                eprintln!("network-orchestrator-daemon: resource teardown failed uid={} kind={:?} os_code={:?}", self.journal.entries[index].uid, err.kind(), err.raw_os_error());
                 failed.push(resource.clone());
             }
         }
@@ -6563,10 +6596,13 @@ impl DaemonCore {
                     "unexpected Xray journal resource",
                 )),
             };
-            let removed = match result {
+            let removed = match &result {
                 Ok(()) => true,
-                Err(ref e) if e.kind() == io::ErrorKind::NotFound => true,
-                Err(_) => false,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => true,
+                Err(err) => {
+                    eprintln!("network-orchestrator-daemon: xray resource cleanup failed uid={} kind={:?} os_code={:?}", entry.uid, err.kind(), err.raw_os_error());
+                    false
+                }
             };
             if !removed
                 || matches!(resource, OwnedResource::XrayProcess(_))
@@ -6766,7 +6802,10 @@ impl DaemonCore {
             let removed = match result {
                 Ok(()) => true,
                 Err(err) if err.kind() == io::ErrorKind::NotFound => true,
-                Err(_) => false,
+                Err(err) => {
+                    eprintln!("network-orchestrator-daemon: wireguard resource cleanup failed kind={:?} os_code={:?}", err.kind(), err.raw_os_error());
+                    false
+                }
             };
             if !removed {
                 failed.push(resource.clone());

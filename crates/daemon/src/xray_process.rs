@@ -15,6 +15,8 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 #[cfg(target_os = "linux")]
+use std::os::unix::process::ExitStatusExt;
+#[cfg(target_os = "linux")]
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::process::{Child, Command, Stdio};
@@ -35,8 +37,6 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(2);
 /// Bounded slice of `xray.log` surfaced in errors / the daemon journal.
 #[cfg(target_os = "linux")]
 const LOG_TAIL_BYTES: u64 = 4 * 1024;
-#[cfg(target_os = "linux")]
-const LOG_JOURNAL_LINES: usize = 20;
 
 pub trait XrayProcessRunner: Send {
     fn verify_binary(&self) -> io::Result<()>;
@@ -137,7 +137,18 @@ impl TrustedXrayProcess {
             .stderr(Stdio::from(log))
             .current_dir(directory)
             .spawn()
-            .map_err(|_| io::Error::other("Xray launch failed"))?;
+            .map_err(|err| {
+                eprintln!(
+                    "network-orchestrator-daemon: xray spawn failed kind={:?} os_code={:?}",
+                    err.kind(),
+                    err.raw_os_error()
+                );
+                io::Error::other("Xray launch failed")
+            })?;
+        eprintln!(
+            "network-orchestrator-daemon: xray spawned pid={}",
+            child.id()
+        );
         let started = (|| {
             let starttime = read_starttime(child.id())?;
             rewrite_private_file(
@@ -146,11 +157,11 @@ impl TrustedXrayProcess {
             )?;
             let deadline = Instant::now() + LINK_TIMEOUT;
             loop {
-                if child
+                if let Some(status) = child
                     .try_wait()
                     .map_err(|_| io::Error::other("Xray child check failed"))?
-                    .is_some()
                 {
+                    eprintln!("network-orchestrator-daemon: xray unexpected exit phase=start pid={} code={:?} signal={:?}", child.id(), status.code(), status.signal());
                     return Err(io::Error::new(
                         io::ErrorKind::NotConnected,
                         "Xray exited before interface appeared",
@@ -359,11 +370,20 @@ impl XrayProcessRunner for TrustedXrayProcess {
             .children
             .get_mut(name)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Xray child is not tracked"))?;
-        Ok(child
-            .try_wait()
-            .map_err(|_| io::Error::other("Xray child check failed"))?
-            .is_none()
-            && self.link_index(name)?.is_some())
+        let status = child.try_wait().map_err(|err| {
+            eprintln!("network-orchestrator-daemon: xray child check failed pid={} kind={:?} os_code={:?}", child.id(), err.kind(), err.raw_os_error());
+            io::Error::other("Xray child check failed")
+        })?;
+        if let Some(status) = status {
+            eprintln!(
+                "network-orchestrator-daemon: xray unexpected exit pid={} code={:?} signal={:?}",
+                child.id(),
+                status.code(),
+                status.signal()
+            );
+            return Ok(false);
+        }
+        Ok(self.link_index(name)?.is_some())
     }
 
     fn query_stats(&mut self, name: &str, api_port: u16) -> io::Result<(u64, u64)> {
@@ -386,6 +406,10 @@ impl XrayProcessRunner for TrustedXrayProcess {
             .children
             .get_mut(name)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Xray child is not tracked"))?;
+        eprintln!(
+            "network-orchestrator-daemon: xray terminating pid={} cause=stop_or_restart",
+            child.id()
+        );
         terminate_child(child)?;
         self.children.remove(name);
         Ok(())
@@ -407,15 +431,6 @@ impl XrayProcessRunner for TrustedXrayProcess {
             recover_child(uid, name)?;
         }
         ensure_runtime_root()?;
-        // Preserve the last log lines in the daemon journal before the
-        // staging directory (and its xray.log) is removed.
-        let log_path = runtime_root()
-            .join(uid.to_string())
-            .join(name)
-            .join("xray.log");
-        for line in log_tail(&log_path).lines().take(LOG_JOURNAL_LINES) {
-            eprintln!("network-orchestrator-daemon: xray[{name}] {line}");
-        }
         cleanup_stage_at(runtime_root().as_path(), uid, name)
     }
 }
@@ -1283,6 +1298,10 @@ fn terminate_child(child: &mut Child) -> io::Result<()> {
         }
         thread::sleep(Duration::from_millis(25));
     }
+    eprintln!(
+        "network-orchestrator-daemon: xray termination escalating pid={} signal=SIGKILL",
+        child.id()
+    );
     signal_pidfd(&pidfd, libc::SIGKILL)?;
     // A child wedged in an uninterruptible syscall survives SIGKILL; keep
     // the reaper bounded too so `stop` never blocks a core task forever.
@@ -1309,6 +1328,10 @@ fn terminate_child(child: &mut Child) -> io::Result<()> {
 fn open_pidfd(pid: u32) -> io::Result<OwnedFd> {
     let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
     if raw < 0 {
+        eprintln!(
+            "network-orchestrator-daemon: xray pidfd open failed pid={pid} os_code={:?}",
+            io::Error::last_os_error().raw_os_error()
+        );
         return Err(io::Error::other("Xray pidfd unavailable"));
     }
     Ok(unsafe { OwnedFd::from_raw_fd(raw as i32) })
@@ -1326,6 +1349,10 @@ fn signal_pidfd(pidfd: &OwnedFd, signal: i32) -> io::Result<()> {
         )
     };
     if result < 0 {
+        eprintln!(
+            "network-orchestrator-daemon: xray signal failed signal={signal} os_code={:?}",
+            io::Error::last_os_error().raw_os_error()
+        );
         return Err(io::Error::other("Xray process signal failed"));
     }
     Ok(())
@@ -1351,6 +1378,39 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
+
+    #[test]
+    fn unexpected_child_exit_reports_code_and_signal() {
+        const CHILD: &str = "NETORCH_DIAGNOSTIC_CHILD_TEST";
+        if let Ok(mode) = std::env::var(CHILD) {
+            let command = if mode == "code" {
+                "exit 23"
+            } else {
+                "kill -TERM $$"
+            };
+            let mut child = Command::new("sh").args(["-c", command]).spawn().unwrap();
+            child.wait().unwrap();
+            let mut runner = TrustedXrayProcess::new();
+            runner.children.insert("xray-test".into(), (1000, child));
+            assert!(!runner.health("xray-test").unwrap());
+            return;
+        }
+        for (mode, expected) in [("code", "code=Some(23)"), ("signal", "signal=Some(15)")] {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "xray_process::tests::unexpected_child_exit_reports_code_and_signal",
+                    "--nocapture",
+                ])
+                .env(CHILD, mode)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert!(stderr.contains("unexpected"), "{stderr}");
+            assert!(stderr.contains(expected), "{stderr}");
+        }
+    }
 
     fn temp_root() -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!(

@@ -120,6 +120,17 @@ pub fn watch(ctx: &Ctx, target: Option<&str>, json_mode: bool) -> Result<Output,
     };
     let engine = observation_engine(ctx);
     let mut available = subscription.is_some();
+    #[cfg(target_os = "linux")]
+    if !available && !ctx.root_user {
+        let _ = net_manager_engine::linux_diagnostics::try_record_log(
+            &ctx.root,
+            net_manager_engine::linux_diagnostics::LogLevel::Warn,
+            &format!(
+                "daemon event stream pid={} state=unavailable reason=initial_connect",
+                std::process::id()
+            ),
+        );
+    }
     let mut previous = rows(ctx, &engine, id.as_deref(), available)?;
     let stdout = io::stdout();
     let mut output = stdout.lock();
@@ -160,6 +171,18 @@ pub fn watch(ctx: &Ctx, target: Option<&str>, json_mode: bool) -> Result<Output,
                 Err(EventError::Unavailable) => {}
                 Err(error) => return Err(watch_error(error)),
             }
+        }
+        #[cfg(target_os = "linux")]
+        if !ctx.root_user && matches!(reason, Some("disconnected" | "reconnected" | "resync")) {
+            let _ = net_manager_engine::linux_diagnostics::try_record_log(
+                &ctx.root,
+                net_manager_engine::linux_diagnostics::LogLevel::Warn,
+                &format!(
+                    "daemon event stream pid={} state={}",
+                    std::process::id(),
+                    reason.unwrap_or("unknown")
+                ),
+            );
         }
         let current = rows(ctx, &engine, id.as_deref(), available)?;
         if reason.is_some() || current != previous {

@@ -91,6 +91,37 @@ pub fn main() -> ExitCode {
     let json = cli.json;
     let recovery_cleanup = matches!(&cli.command, Command::Recover { cleanup: true });
     let watch = matches!(&cli.command, Command::Watch { .. });
+    #[cfg(target_os = "linux")]
+    let operation = match &cli.command {
+        Command::Up(_) => Some("up"),
+        Command::Down { .. } => Some("down"),
+        Command::Reload { .. } => Some("reload"),
+        Command::Recover { cleanup: true } => Some("recover_cleanup"),
+        Command::Add(_) => Some("add"),
+        Command::Rm { .. } => Some("remove"),
+        Command::Rename { .. } => Some("rename"),
+        Command::Use { .. } => Some("use"),
+        Command::Switch { .. } => Some("switch"),
+        Command::Refresh { .. } => Some("refresh"),
+        Command::Sets(_) => Some("sets"),
+        Command::Profile(_) => Some("profile"),
+        Command::Subscription(_) => Some("subscription"),
+        Command::Net(_) => Some("net"),
+        Command::Service(_) => Some("service"),
+        Command::AlwaysOn(_) => Some("always_on"),
+        Command::Condition(_) => Some("condition"),
+        Command::System(_) => Some("system"),
+        Command::Backend(_) => Some("backend"),
+        Command::Openvpn(_) => Some("openvpn"),
+        Command::Route(_) => Some("route"),
+        Command::Backup(_) => Some("backup"),
+        Command::Migrate(_) => Some("migrate"),
+        Command::Checks(_) => Some("checks"),
+        Command::Proxy(_) => Some("proxy"),
+        _ => None,
+    };
+    #[cfg(target_os = "linux")]
+    let started = std::time::Instant::now();
     let result = cli
         .data_dir
         .clone()
@@ -105,7 +136,38 @@ pub fn main() -> ExitCode {
                 )),
             )
         })
-        .and_then(|ctx| run(&ctx, cli.command, json));
+        .and_then(|ctx| {
+            #[cfg(target_os = "linux")]
+            if let Some(operation) = operation.filter(|_| !ctx.root_user) {
+                let _ = net_manager_engine::linux_diagnostics::try_record_log(
+                    &ctx.root,
+                    net_manager_engine::linux_diagnostics::LogLevel::Info,
+                    &format!("cli begin pid={} method={operation}", std::process::id()),
+                );
+            }
+            let result = run(&ctx, cli.command, json);
+            #[cfg(target_os = "linux")]
+            if !ctx.root_user && (operation.is_some() || result.is_err()) {
+                use net_manager_engine::linux_diagnostics::{try_record_log, LogLevel};
+                let level = if result.is_ok() {
+                    LogLevel::Info
+                } else {
+                    LogLevel::Error
+                };
+                let _ = try_record_log(
+                    &ctx.root,
+                    level,
+                    &format!(
+                        "cli end pid={} method={} elapsed_ms={} outcome={}",
+                        std::process::id(),
+                        operation.unwrap_or("read"),
+                        started.elapsed().as_millis(),
+                        if result.is_ok() { "ok" } else { "failed" }
+                    ),
+                );
+            }
+            result
+        });
     match result {
         Ok((value, text)) => {
             if !(value.is_null() && text.is_empty()) {

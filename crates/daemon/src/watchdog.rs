@@ -252,9 +252,11 @@ impl WatchdogSupervisor {
             thread::Builder::new()
                 .name("xray-watchdog".into())
                 .spawn(move || {
-                    if run(&spec, &network, &stop, &authorized, &shared).is_err()
-                        && !stop.load(Ordering::Relaxed)
-                    {
+                    if let Err(err) = run(&spec, &network, &stop, &authorized, &shared) {
+                        if stop.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        eprintln!("network-orchestrator-daemon: watchdog stopped uid={} kind={:?} os_code={:?}", spec.uid, err.kind(), err.raw_os_error());
                         authorized.store(false, Ordering::Relaxed);
                         if let Ok(mut state) = shared.lock() {
                             state.status.uplink = None;
@@ -616,10 +618,11 @@ fn run(
             let udp_sockets = resources.as_ref().map(|report| report.udp_sockets);
             state.observe(https_result, dns_result, node_reachable, resources);
             if let Ok(mut published) = shared.lock() {
-                if published.request.as_ref().is_some_and(|reason| {
-                    state.cancel_cleared_request(reason, https_result, udp_sockets)
-                }) {
-                    published.request = None;
+                if let Some(reason) = published.request.as_ref() {
+                    if state.cancel_cleared_request(reason, https_result, udp_sockets) {
+                        eprintln!("network-orchestrator-daemon: watchdog recovery cancelled uid={} reason={reason:?}", spec.uid);
+                        published.request = None;
+                    }
                 }
             }
             rotation = rotation.wrapping_add(1);
@@ -637,6 +640,9 @@ fn run(
             shared.status = state.status.clone();
             if shared.request.is_none() && authorized.load(Ordering::Relaxed) {
                 shared.request = state.recovery(Instant::now());
+                if let Some(reason) = &shared.request {
+                    eprintln!("network-orchestrator-daemon: watchdog recovery requested uid={} reason={reason:?}", spec.uid);
+                }
             }
         }
         thread::sleep(Duration::from_millis(100));

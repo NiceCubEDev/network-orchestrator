@@ -155,7 +155,11 @@ where
     };
     let uid = peer.uid;
     if let Err(err) = serve_connection(stream, peer, ctx).await {
-        eprintln!("network-orchestrator-daemon: connection of uid {uid} failed: {err}");
+        eprintln!(
+            "network-orchestrator-daemon: connection failed uid={uid} kind={:?} os_code={:?}",
+            err.kind(),
+            err.raw_os_error()
+        );
     }
 }
 
@@ -223,6 +227,11 @@ where
         let response = match serde_json::from_slice::<RequestFrame>(&frame) {
             Ok(request) => {
                 let id = request.id;
+                let safe_method = method::CAPABILITIES
+                    .iter()
+                    .copied()
+                    .find(|known| *known == request.method)
+                    .unwrap_or("unknown");
                 if request.method == method::SUBSCRIBE && subscription.is_none() {
                     subscription = Some(ctx.events.subscribe());
                 }
@@ -233,7 +242,7 @@ where
                     Ok(response) => response,
                     Err(_) => {
                         eprintln!(
-                            "network-orchestrator-daemon: request {id} timed out after {DISPATCH_TIMEOUT:?}"
+                            "network-orchestrator-daemon: request timed out uid={} id={id} method={safe_method} duration_ms={}", peer.uid, DISPATCH_TIMEOUT.as_millis()
                         );
                         ResponseFrame::error(id, ErrorCode::Internal, "request timed out")
                     }
@@ -322,17 +331,21 @@ async fn dispatch<A: Authorizer>(
 ) -> ResponseFrame {
     let id = request.id;
     let method_name = request.method.clone();
+    let started = Instant::now();
+    let safe_method = method::CAPABILITIES
+        .iter()
+        .copied()
+        .find(|known| *known == method_name)
+        .unwrap_or("unknown");
     let result = handle(request, peer, ctx).await;
-    if let Some(action) = required_action(&method_name) {
+    if result.is_err() || required_action(&method_name).is_some() {
         let outcome = match &result {
             Ok(_) => "ok".to_string(),
             Err((code, _)) => format!("{code:?}"),
         };
         eprintln!(
-            "network-orchestrator-daemon: uid {} {} ({}): {outcome}",
-            peer.uid,
-            method_name,
-            action.polkit_id()
+            "network-orchestrator-daemon: request uid={} id={id} method={safe_method} outcome={outcome} duration_ms={}",
+            peer.uid, started.elapsed().as_millis()
         );
     }
     match result {
@@ -1176,10 +1189,14 @@ pub async fn eval_conditional<A: Authorizer>(ctx: &ServerContext<A>) {
             }
         }
         Ok(Err(err)) => {
-            eprintln!("network-orchestrator-daemon: conditional rule evaluation failed: {err}")
+            eprintln!("network-orchestrator-daemon: conditional rule evaluation failed kind={:?} os_code={:?}", err.kind(), err.raw_os_error())
         }
         Err(err) => {
-            eprintln!("network-orchestrator-daemon: conditional rule evaluation task failed: {err}")
+            eprintln!(
+                "network-orchestrator-daemon: conditional rule task failed panic={} cancelled={}",
+                err.is_panic(),
+                err.is_cancelled()
+            )
         }
     }
 }
@@ -1314,7 +1331,11 @@ mod listener {
             let stream = match listener.accept().await {
                 Ok((stream, _)) => stream,
                 Err(err) => {
-                    eprintln!("network-orchestrator-daemon: accept failed: {err}");
+                    eprintln!(
+                        "network-orchestrator-daemon: accept failed kind={:?} os_code={:?}",
+                        err.kind(),
+                        err.raw_os_error()
+                    );
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     continue;
                 }
@@ -1323,7 +1344,11 @@ mod listener {
                 Ok(peer) => {
                     tokio::spawn(serve_accepted(stream, peer, ctx.clone()));
                 }
-                Err(err) => eprintln!("network-orchestrator-daemon: unidentified peer: {err}"),
+                Err(err) => eprintln!(
+                    "network-orchestrator-daemon: unidentified peer kind={:?} os_code={:?}",
+                    err.kind(),
+                    err.raw_os_error()
+                ),
             }
         }
     }

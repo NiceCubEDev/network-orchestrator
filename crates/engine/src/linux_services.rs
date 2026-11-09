@@ -1,5 +1,5 @@
 //! Linux provider and enrollment operations shared by CLI and GUI adapters.
-use crate::linux_engine::{daemon_error, LinuxEngine};
+use crate::linux_engine::LinuxEngine;
 use net_manager_core::config_vault::ConfigVault;
 use net_manager_core::daemon_protocol::*;
 use net_manager_core::models::{Profile, TunnelBackend};
@@ -7,48 +7,36 @@ use serde_json::Value;
 use std::path::Path;
 
 pub fn nm_list(engine: &LinuxEngine) -> Result<NmListResult, String> {
-    engine
-        .privileged()
-        .call(method::NM_LIST, Value::Null)
-        .map_err(daemon_error)
+    engine.ask(method::NM_LIST, Value::Null)
 }
 
 pub fn nm_set_active(engine: &LinuxEngine, uuid: &str, active: bool) -> Result<(), String> {
-    let _: Value = engine
-        .privileged()
-        .call(
-            method::NM_SET_ACTIVE,
-            NmSetActiveParams {
-                uuid: uuid.into(),
-                active,
-            },
-        )
-        .map_err(daemon_error)?;
+    let _: Value = engine.ask(
+        method::NM_SET_ACTIVE,
+        NmSetActiveParams {
+            uuid: uuid.into(),
+            active,
+        },
+    )?;
     Ok(())
 }
 
 pub fn tailscale_status(engine: &LinuxEngine) -> Result<TailscaleStatusResult, String> {
-    engine
-        .privileged()
-        .call(method::TAILSCALE_STATUS, Value::Null)
-        .map_err(daemon_error)
+    engine.ask(method::TAILSCALE_STATUS, Value::Null)
 }
 
 pub fn tailscale_set_running(
     engine: &LinuxEngine,
     running: bool,
 ) -> Result<TailscaleStatusResult, String> {
-    engine
-        .privileged()
-        .call(
-            if running {
-                method::TAILSCALE_UP
-            } else {
-                method::TAILSCALE_DOWN
-            },
-            Value::Null,
-        )
-        .map_err(daemon_error)
+    engine.ask(
+        if running {
+            method::TAILSCALE_UP
+        } else {
+            method::TAILSCALE_DOWN
+        },
+        Value::Null,
+    )
 }
 
 fn public_netbird(mut status: Value) -> Value {
@@ -191,10 +179,7 @@ fn build_definition(vault: &ConfigVault, profile: &Profile) -> Result<AlwaysOnDe
 }
 
 pub fn always_on_list(engine: &LinuxEngine) -> Result<AlwaysOnListResult, String> {
-    engine
-        .privileged()
-        .call(method::ALWAYS_ON_LIST, Value::Null)
-        .map_err(daemon_error)
+    engine.ask(method::ALWAYS_ON_LIST, Value::Null)
 }
 
 pub fn always_on_set(
@@ -203,10 +188,7 @@ pub fn always_on_set(
     profile: &Profile,
 ) -> Result<AlwaysOnSetResult, String> {
     let definition = build_definition(vault, profile)?;
-    engine
-        .privileged()
-        .call(method::ALWAYS_ON_SET, AlwaysOnSetParams { definition })
-        .map_err(daemon_error)
+    engine.ask(method::ALWAYS_ON_SET, AlwaysOnSetParams { definition })
 }
 
 pub fn always_on_remove(
@@ -214,23 +196,17 @@ pub fn always_on_remove(
     kind: AlwaysOnKind,
     profile_id: &str,
 ) -> Result<AlwaysOnRemoveResult, String> {
-    engine
-        .privileged()
-        .call(
-            method::ALWAYS_ON_REMOVE,
-            AlwaysOnRemoveParams {
-                kind,
-                profile_id: profile_id.into(),
-            },
-        )
-        .map_err(daemon_error)
+    engine.ask(
+        method::ALWAYS_ON_REMOVE,
+        AlwaysOnRemoveParams {
+            kind,
+            profile_id: profile_id.into(),
+        },
+    )
 }
 
 pub fn always_on_resume(engine: &LinuxEngine) -> Result<AlwaysOnResumeResult, String> {
-    engine
-        .privileged()
-        .call(method::ALWAYS_ON_RESUME, Value::Null)
-        .map_err(daemon_error)
+    engine.ask(method::ALWAYS_ON_RESUME, Value::Null)
 }
 
 pub fn ensure_not_enrolled(engine: &LinuxEngine, profile: &Profile) -> Result<(), String> {
@@ -251,35 +227,26 @@ pub fn ensure_not_enrolled(engine: &LinuxEngine, profile: &Profile) -> Result<()
 }
 
 pub fn condition_list(engine: &LinuxEngine) -> Result<CondRulesListResult, String> {
-    engine
-        .privileged()
-        .call(method::COND_RULES_LIST, Value::Null)
-        .map_err(daemon_error)
+    engine.ask(method::COND_RULES_LIST, Value::Null)
 }
 
 pub fn condition_put(
     engine: &LinuxEngine,
     rule: ConditionalRouteRule,
 ) -> Result<CondRulesPutResult, String> {
-    engine
-        .privileged()
-        .call(method::COND_RULES_PUT, CondRulesPutParams { rule })
-        .map_err(daemon_error)
+    engine.ask(method::COND_RULES_PUT, CondRulesPutParams { rule })
 }
 
 pub fn condition_remove(
     engine: &LinuxEngine,
     rule_id: &str,
 ) -> Result<CondRulesRemoveResult, String> {
-    engine
-        .privileged()
-        .call(
-            method::COND_RULES_REMOVE,
-            CondRulesRemoveParams {
-                rule_id: rule_id.into(),
-            },
-        )
-        .map_err(daemon_error)
+    engine.ask(
+        method::COND_RULES_REMOVE,
+        CondRulesRemoveParams {
+            rule_id: rule_id.into(),
+        },
+    )
 }
 
 #[cfg(test)]

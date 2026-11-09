@@ -67,6 +67,30 @@ mod linux {
     }
 
     pub fn main() -> ExitCode {
+        std::panic::set_hook(Box::new(|info| {
+            if let Some(location) = info.location() {
+                let file = std::path::Path::new(location.file())
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("unknown");
+                eprintln!(
+                    "network-orchestrator-daemon: panic pid={} location={file}:{}:{}",
+                    std::process::id(),
+                    location.line(),
+                    location.column()
+                );
+            } else {
+                eprintln!(
+                    "network-orchestrator-daemon: panic pid={} location=unknown",
+                    std::process::id()
+                );
+            }
+        }));
+        eprintln!(
+            "network-orchestrator-daemon: starting version={} pid={}",
+            env!("CARGO_PKG_VERSION"),
+            std::process::id()
+        );
         let args = std::env::args().skip(1).collect();
         let options = match parse_args(args, std::env::var(SOCKET_ENV).ok()) {
             Ok(options) => options,
@@ -82,7 +106,7 @@ mod linux {
         match result {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
-                eprintln!("network-orchestrator-daemon: {err}");
+                eprintln!("network-orchestrator-daemon: startup or shutdown failed kind={:?} os_code={:?}", err.kind(), err.raw_os_error());
                 ExitCode::FAILURE
             }
         }
@@ -132,7 +156,7 @@ mod linux {
                     report.started, report.already_active, report.blocked, report.failed
                 ),
                 Err(err) => {
-                    eprintln!("network-orchestrator-daemon: always-on replay skipped: {err}")
+                    eprintln!("network-orchestrator-daemon: always-on replay skipped kind={:?} os_code={:?}", err.kind(), err.raw_os_error())
                 }
             }
             Ok::<_, io::Error>(core)
@@ -156,12 +180,13 @@ mod linux {
             loop {
                 interval.tick().await;
                 let core = dns_core.clone();
-                let _ = tokio::task::spawn_blocking(move || {
+                let result = tokio::task::spawn_blocking(move || {
                     core.lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .reapply_dns()
                 })
                 .await;
+                report_background("dns_reconcile", result);
             }
         });
         let openvpn_core = ctx.core.clone();
@@ -170,12 +195,13 @@ mod linux {
             loop {
                 interval.tick().await;
                 let core = openvpn_core.clone();
-                let _ = tokio::task::spawn_blocking(move || {
+                let result = tokio::task::spawn_blocking(move || {
                     core.lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .reconcile_openvpn()
                 })
                 .await;
+                report_background("openvpn_reconcile", result);
             }
         });
         let always_on_core = ctx.core.clone();
@@ -187,7 +213,7 @@ mod linux {
                 let core = always_on_core.clone();
                 let store = always_on_store.clone();
                 let netlink = reconcile_netlink.clone();
-                let _ = tokio::task::spawn_blocking(move || {
+                let result = tokio::task::spawn_blocking(move || {
                     let store = store
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -198,6 +224,7 @@ mod linux {
                     always_on::replay(&mut core, &store)
                 })
                 .await;
+                report_background("always_on_reconcile", result);
             }
         });
         // Uplink changes (link, address, route, rule) wake an early pass; the
@@ -206,7 +233,7 @@ mod linux {
         let watcher_wake = network_wake.clone();
         let network_watch = watch_network_changes(move || watcher_wake.notify_one())
             .map_err(|err| {
-                eprintln!("network-orchestrator-daemon: network change watch unavailable: {err}")
+                eprintln!("network-orchestrator-daemon: network change watch unavailable kind={:?} os_code={:?}", err.kind(), err.raw_os_error())
             })
             .ok();
         // Suspend/resume can leave no netlink trace at all (the links and
@@ -235,10 +262,16 @@ mod linux {
                     Ok::<_, io::Error>(core.reconcile_network(&observed))
                 })
                 .await;
-                if let Ok(Ok(changed)) = changed {
-                    for (uid, owner) in changed {
-                        let _ = network_events.send(OwnerEvent { uid, owner });
+                match changed {
+                    Ok(Ok(changed)) => {
+                        for (uid, owner) in changed {
+                            let _ = network_events.send(OwnerEvent { uid, owner });
+                        }
                     }
+                    other => report_background(
+                        "network_reconcile",
+                        other.map(|result| result.map(|_| ())),
+                    ),
                 }
                 // Conditional rules react to the same wake-up; failures are
                 // logged inside and never stop the reconcile loop.
@@ -246,13 +279,13 @@ mod linux {
             }
         });
         eprintln!(
-            "network-orchestrator-daemon: listening on {}",
-            options.socket.display()
+            "network-orchestrator-daemon: listening pid={}",
+            std::process::id()
         );
         tokio::select! {
-            () = serve(listener, ctx.clone()) => {}
-            _ = sigterm.recv() => {}
-            _ = sigint.recv() => {}
+            () = serve(listener, ctx.clone()) => eprintln!("network-orchestrator-daemon: shutdown cause=server_stopped"),
+            _ = sigterm.recv() => eprintln!("network-orchestrator-daemon: shutdown cause=SIGTERM"),
+            _ = sigint.recv() => eprintln!("network-orchestrator-daemon: shutdown cause=SIGINT"),
         }
         dns_reconcile.abort();
         let _ = dns_reconcile.await;
@@ -283,6 +316,17 @@ mod linux {
             result.failed.len()
         );
         shutdown_result(&result)
+    }
+
+    fn report_background<T>(
+        operation: &str,
+        result: Result<io::Result<T>, tokio::task::JoinError>,
+    ) {
+        match result {
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) => eprintln!("network-orchestrator-daemon: background operation={operation} failed kind={:?} os_code={:?}", err.kind(), err.raw_os_error()),
+            Err(err) => eprintln!("network-orchestrator-daemon: background operation={operation} task_failed panic={} cancelled={}", err.is_panic(), err.is_cancelled()),
+        }
     }
 
     /// Follow logind's `PrepareForSleep`: on wake, give the network a moment

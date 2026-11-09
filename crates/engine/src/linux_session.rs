@@ -23,6 +23,12 @@ use std::time::{Duration, Instant};
 const MAX_FRAME: u64 = 1024 * 1024;
 const PREPARED_CONNECTIONS_VERSION: u32 = 1;
 static STOP: AtomicBool = AtomicBool::new(false);
+static STOP_SIGNAL: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+static NEXT_REQUEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn session_log(root: &Path, level: crate::linux_diagnostics::LogLevel, message: &str) {
+    let _ = crate::linux_diagnostics::try_record_log(root, level, message);
+}
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "camelCase", deny_unknown_fields)]
@@ -334,6 +340,21 @@ fn start_service(root: &Path, daemon: &Path, directory: &Path) -> io::Result<()>
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()?;
+    use std::os::unix::process::ExitStatusExt;
+    session_log(
+        root,
+        if status.success() {
+            crate::linux_diagnostics::LogLevel::Info
+        } else {
+            crate::linux_diagnostics::LogLevel::Error
+        },
+        &format!(
+            "local runtime launcher pid={} exit_code={:?} signal={:?}",
+            std::process::id(),
+            status.code(),
+            status.signal()
+        ),
+    );
     if !status.success() {
         return Err(error("Cannot start the netorch user service; check systemd --user, or run netorch serve in another terminal"));
     }
@@ -354,6 +375,28 @@ fn send_request(
     request: Option<&Request>,
     encoded: Option<&[u8]>,
 ) -> Result<Response, String> {
+    use crate::linux_diagnostics::LogLevel;
+    let name = match request {
+        None | Some(Request::ConnectPrepared { .. }) => "connect",
+        Some(Request::Capabilities) => "capabilities",
+        Some(Request::Disconnect { .. }) => "disconnect",
+        Some(Request::Status { .. }) => "status",
+        Some(Request::Cleanup) => "cleanup",
+        Some(Request::RecoverProxy) => "recover_proxy",
+    };
+    let mutation = !matches!(name, "status" | "capabilities");
+    let request_id = NEXT_REQUEST.fetch_add(1, Ordering::Relaxed);
+    let started = Instant::now();
+    if mutation {
+        session_log(
+            root,
+            LogLevel::Info,
+            &format!(
+                "local runtime request begin pid={} request={request_id} method={name}",
+                std::process::id()
+            ),
+        );
+    }
     let operation = || -> io::Result<Response> {
         let directory = session_directory(root, daemon)?;
         let socket = directory.join("runtime.sock");
@@ -388,6 +431,7 @@ fn send_request(
                 match UnixStream::connect(&socket) {
                     Ok(stream) => stream,
                     Err(_) => {
+                        session_log(root, LogLevel::Info, &format!("local runtime service start pid={} request={request_id} reason=socket_unavailable", std::process::id()));
                         start_service(root, daemon, &directory)?;
                         let deadline = Instant::now() + Duration::from_secs(10);
                         loop {
@@ -428,7 +472,24 @@ fn send_request(
             .map_err(|_| error("Invalid local runtime response"))?;
         result.map_err(|message| error(&message))
     };
-    operation().map_err(|cause| match cause.kind() {
+    let result = operation();
+    if mutation || result.is_err() {
+        let (level, outcome) = match &result {
+            Ok(_) => (LogLevel::Info, "ok".to_string()),
+            Err(cause) => (
+                LogLevel::Error,
+                format!(
+                    "error kind={:?} os_code={}",
+                    cause.kind(),
+                    cause
+                        .raw_os_error()
+                        .map_or_else(|| "none".into(), |code| code.to_string())
+                ),
+            ),
+        };
+        session_log(root, level, &format!("local runtime request end pid={} request={request_id} method={name} elapsed_ms={} outcome={outcome}", std::process::id(), started.elapsed().as_millis()));
+    }
+    result.map_err(|cause| match cause.kind() {
         io::ErrorKind::Other => cause.to_string(),
         _ => "Local Xray runtime operation failed".into(),
     })
@@ -503,6 +564,7 @@ struct Runtime {
     root: PathBuf,
     tunnels: TunnelManager,
     active: HashMap<String, Profile>,
+    failed_children: std::collections::HashSet<String>,
     proxy: SystemProxyManager,
     proxy_lock: Option<ProxyLock>,
     proxy_lock_root: PathBuf,
@@ -514,6 +576,7 @@ impl Runtime {
             tunnels: TunnelManager::with_log_dir(root.join("logs")),
             root,
             active: HashMap::new(),
+            failed_children: std::collections::HashSet::new(),
             proxy,
             proxy_lock: None,
             proxy_lock_root,
@@ -599,6 +662,7 @@ impl Runtime {
                 .disconnect(profile)
                 .map_err(|_| "Cannot stop local Xray".to_string())?;
             self.active.remove(id);
+            self.failed_children.remove(id);
             Ok(status)
         } else {
             Ok(stopped(id))
@@ -728,6 +792,16 @@ impl Runtime {
                 .map(|profile| self.tunnels.status(profile))
                 .unwrap_or_else(|| stopped(&id))),
             Request::Cleanup => {
+                let count = self.active.len();
+                session_log(
+                    &self.root,
+                    crate::linux_diagnostics::LogLevel::Info,
+                    &format!(
+                        "local runtime cleanup begin pid={} targets={count} proxy_owned={}",
+                        std::process::id(),
+                        self.proxy.ownership().is_some()
+                    ),
+                );
                 let mut errors = Vec::new();
                 for id in self.active.keys().cloned().collect::<Vec<_>>() {
                     if let Err(error) = self.disconnect(&id) {
@@ -737,6 +811,20 @@ impl Runtime {
                 if self.active.is_empty() && self.restore_proxy().is_err() {
                     errors.push("Cannot restore the previous system proxy".into());
                 }
+                session_log(
+                    &self.root,
+                    if errors.is_empty() {
+                        crate::linux_diagnostics::LogLevel::Info
+                    } else {
+                        crate::linux_diagnostics::LogLevel::Error
+                    },
+                    &format!(
+                        "local runtime cleanup end pid={} targets={count} failed={} remaining={}",
+                        std::process::id(),
+                        errors.len(),
+                        self.active.len()
+                    ),
+                );
                 if errors.is_empty() {
                     Ok(stopped(""))
                 } else {
@@ -761,26 +849,67 @@ impl Runtime {
         Ok(Response::status(status))
     }
     fn check_child_health(&mut self) {
-        let restore = self.active.iter().any(|(id, profile)| {
-            self.tunnels.status(profile).state != TunnelState::Running
-                && self
+        let mut restore = false;
+        for (id, profile) in &self.active {
+            let failed = self.tunnels.status(profile).state != TunnelState::Running;
+            if failed {
+                if self.failed_children.insert(id.clone()) {
+                    let hash = Sha256::digest(id.as_bytes());
+                    session_log(&self.root, crate::linux_diagnostics::LogLevel::Warn,
+                        &format!("local child pid={} profile_hash={:02x}{:02x}{:02x}{:02x} reason=not_running", std::process::id(), hash[0], hash[1], hash[2], hash[3]));
+                }
+                restore |= self
                     .proxy
                     .ownership()
-                    .is_some_and(|owner| owner.profile_id == *id)
-        });
-        if restore && !self.proxy_cleanup_failed && self.restore_proxy().is_err() {
-            self.proxy_cleanup_failed = true;
-            eprintln!("netorch: system proxy cleanup failed; ownership kept for recovery");
+                    .is_some_and(|owner| owner.profile_id == *id);
+            } else if self.failed_children.remove(id) {
+                session_log(
+                    &self.root,
+                    crate::linux_diagnostics::LogLevel::Info,
+                    &format!(
+                        "local child pid={} reason=running_again",
+                        std::process::id()
+                    ),
+                );
+            }
+        }
+        if restore && !self.proxy_cleanup_failed {
+            let result = self.restore_proxy();
+            session_log(
+                &self.root,
+                if result.is_ok() {
+                    crate::linux_diagnostics::LogLevel::Warn
+                } else {
+                    crate::linux_diagnostics::LogLevel::Error
+                },
+                &format!(
+                    "local child pid={} reason=not_running proxy_restore={}",
+                    std::process::id(),
+                    if result.is_ok() { "ok" } else { "failed" }
+                ),
+            );
+            if result.is_err() {
+                self.proxy_cleanup_failed = true;
+                eprintln!("netorch: system proxy cleanup failed; ownership kept for recovery");
+            }
         }
     }
 }
-extern "C" fn on_signal(_: libc::c_int) {
+extern "C" fn on_signal(signal: libc::c_int) {
+    STOP_SIGNAL.store(signal, Ordering::Relaxed);
     STOP.store(true, Ordering::Relaxed);
 }
 
 /// The long-lived, unprivileged backend used by both frontends. It never
 /// writes routes/interfaces/DNS or executes configuration-supplied commands.
 pub fn serve(root: PathBuf, daemon: PathBuf) -> Result<(), String> {
+    use crate::linux_diagnostics::LogLevel;
+    let started = Instant::now();
+    session_log(
+        &root,
+        LogLevel::Info,
+        &format!("local runtime server begin pid={}", std::process::id()),
+    );
     let run = || -> io::Result<()> {
         let directory = session_directory(&root, &daemon)?;
         private_directory(&runtime_root()?)?;
@@ -799,7 +928,7 @@ pub fn serve(root: PathBuf, daemon: PathBuf) -> Result<(), String> {
         let state = std::env::var_os("XDG_STATE_HOME").map(PathBuf::from);
         let home = std::env::var_os("HOME").map(PathBuf::from);
         let proxy_root = proxy_state_root(state.as_deref(), home.as_deref())?;
-        let mut runtime = Runtime::new(root, proxy, proxy_root)?;
+        let mut runtime = Runtime::new(root.clone(), proxy, proxy_root)?;
         let listener = UnixListener::bind(&socket)?;
         fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
         listener.set_nonblocking(true)?;
@@ -845,13 +974,51 @@ pub fn serve(root: PathBuf, daemon: PathBuf) -> Result<(), String> {
                 break;
             }
         }
+        session_log(
+            &root,
+            LogLevel::Info,
+            &format!(
+                "local runtime server teardown pid={} reason={} signal={} targets={}",
+                std::process::id(),
+                if STOP.load(Ordering::Relaxed) {
+                    "signal"
+                } else {
+                    "idle"
+                },
+                STOP_SIGNAL.load(Ordering::Relaxed),
+                runtime.active.len()
+            ),
+        );
         let cleanup = runtime
             .handle(Request::Cleanup)
             .map_err(|message| error(&message));
         let _ = fs::remove_file(socket);
         cleanup.map(|_| ())
     };
-    run().map_err(|cause| {
+    let result = run();
+    let (level, outcome) = match &result {
+        Ok(()) => (LogLevel::Info, "ok".to_string()),
+        Err(cause) => (
+            LogLevel::Error,
+            format!(
+                "error kind={:?} os_code={}",
+                cause.kind(),
+                cause
+                    .raw_os_error()
+                    .map_or_else(|| "none".into(), |code| code.to_string())
+            ),
+        ),
+    };
+    session_log(
+        &root,
+        level,
+        &format!(
+            "local runtime server end pid={} elapsed_ms={} outcome={outcome}",
+            std::process::id(),
+            started.elapsed().as_millis()
+        ),
+    );
+    result.map_err(|cause| {
         if cause.kind() == io::ErrorKind::Other {
             cause.to_string()
         } else {
@@ -1009,6 +1176,15 @@ mod tests {
         assert!(runtime.proxy.ownership().is_none());
         assert_eq!(state.lock().unwrap().restored.len(), 1);
         assert!(runtime.active.contains_key("failed"));
+        let events = crate::linux_diagnostics::logs(&root).unwrap();
+        assert!(events.iter().any(|event| {
+            event.message.contains("child")
+                && event.message.contains("reason=not_running")
+                && event.message.contains("proxy")
+        }));
+        let count = events.len();
+        runtime.check_child_health();
+        assert_eq!(crate::linux_diagnostics::logs(&root).unwrap().len(), count);
     }
 
     #[test]
@@ -1358,6 +1534,7 @@ mod tests {
             proxy: SystemProxyManager::new(root.join("proxy-state.json")).unwrap(),
             root,
             active: HashMap::new(),
+            failed_children: std::collections::HashSet::new(),
             proxy_lock: None,
             proxy_cleanup_failed: false,
             proxy_lock_root: directory.path().join("runtime"),

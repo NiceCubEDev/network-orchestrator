@@ -18,6 +18,8 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
   leases, serialized operations, owned-child recovery and durable proxy restoration.
 - Shared connection-set storage with atomic, insert-only native legacy migration
   that preserves existing sets, missing references and full legacy names.
+- Shared Linux lifecycle and IPC diagnostics with bounded private logs, safe
+  error categories and nonblocking diagnostic writes during proxy recovery.
 
 ### Changed
 

@@ -1,5 +1,5 @@
 //! Linux system settings and caller-authorized managed backend installation.
-use crate::linux_engine::{daemon_error, LinuxEngine};
+use crate::linux_engine::LinuxEngine;
 use crate::linux_session::{coordination_directory, lock_file};
 use net_manager_core::backend_settings::{BackendSettingsDocument, BackendSettingsStore};
 use net_manager_core::daemon_protocol::{self as protocol, method, VpnAuthMode};
@@ -179,23 +179,18 @@ pub fn platform_capabilities() -> PlatformCapabilities {
 }
 
 pub fn vpn_auth_mode(engine: &LinuxEngine) -> Result<Option<VpnAuthMode>, String> {
-    let result: protocol::SettingsResult = engine
-        .privileged()
-        .call(method::SETTINGS_GET, serde_json::Value::Null)
-        .map_err(daemon_error)?;
+    let result: protocol::SettingsResult =
+        engine.ask(method::SETTINGS_GET, serde_json::Value::Null)?;
     Ok(Some(result.vpn_auth_mode))
 }
 
 pub fn set_vpn_auth_mode(engine: &LinuxEngine, mode: VpnAuthMode) -> Result<(), String> {
-    let _: protocol::SettingsResult = engine
-        .privileged()
-        .call(
-            method::SETTINGS_SET,
-            protocol::SettingsSetParams {
-                vpn_auth_mode: mode,
-            },
-        )
-        .map_err(daemon_error)?;
+    let _: protocol::SettingsResult = engine.ask(
+        method::SETTINGS_SET,
+        protocol::SettingsSetParams {
+            vpn_auth_mode: mode,
+        },
+    )?;
     Ok(())
 }
 
@@ -597,10 +592,7 @@ pub fn managed_xray_offer() -> ManagedXrayOffer {
 }
 
 fn remove_via_daemon(engine: &LinuxEngine) -> Result<(), String> {
-    let _: protocol::XrayRemoveResult = engine
-        .privileged()
-        .call(method::XRAY_REMOVE, serde_json::Value::Null)
-        .map_err(daemon_error)?;
+    let _: protocol::XrayRemoveResult = engine.ask(method::XRAY_REMOVE, serde_json::Value::Null)?;
     Ok(())
 }
 
@@ -685,13 +677,10 @@ pub async fn install_managed_xray(
     drop(archive);
     // This synchronous daemon call deliberately runs in the initiating frontend:
     // polkit must authorize that caller, not an unprivileged user-service deputy.
-    let installed: protocol::XrayInstallResult = engine
-        .privileged()
-        .call(
-            method::XRAY_INSTALL,
-            protocol::XrayInstallParams { archive_b64 },
-        )
-        .map_err(daemon_error)?;
+    let installed: protocol::XrayInstallResult = engine.ask(
+        method::XRAY_INSTALL,
+        protocol::XrayInstallParams { archive_b64 },
+    )?;
     let selection = guard.commit(|| {
         ensure_stopped(engine, store, TunnelBackend::Xray)?;
         let setting = BackendExecutableSetting {

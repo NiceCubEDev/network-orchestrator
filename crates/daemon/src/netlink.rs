@@ -1056,6 +1056,34 @@ enum Command {
     },
 }
 
+impl Command {
+    fn operation(&self) -> &'static str {
+        match self {
+            Self::Route { .. } => "route",
+            Self::OwnedRoutesSnapshot { .. } => "owned_routes_snapshot",
+            Self::NetTablesDump { .. } => "net_tables_dump",
+            Self::SystemRoute { .. } => "system_route",
+            Self::SystemRule { .. } => "system_rule",
+            Self::RouteLookup { .. } => "route_lookup",
+            Self::DefaultGateways { .. } => "default_gateways",
+            Self::OnLinkNetworks { .. } => "on_link_networks",
+            Self::RulesSnapshot { .. } => "rules_snapshot",
+            Self::Rule { .. } => "rule",
+            Self::TableInUse { .. } => "table_in_use",
+            Self::RulePresent { .. } => "rule_present",
+            Self::Link { .. } => "link_set",
+            Self::LinkDel { .. } => "link_delete",
+            Self::InterfaceAddrs { .. } => "interface_addrs",
+            Self::WgCreate { .. } => "wireguard_create",
+            Self::WgDelete { .. } => "wireguard_delete",
+            Self::WgOwned { .. } => "wireguard_owned",
+            Self::WgPresent { .. } => "wireguard_present",
+            Self::WgAddress { .. } => "wireguard_address",
+            Self::WgMtu { .. } => "wireguard_mtu",
+        }
+    }
+}
+
 /// Handle to the netlink actor thread. Cloneable; every call blocks the
 /// calling (non-async) thread until the kernel answers or times out.
 #[derive(Clone)]
@@ -1108,12 +1136,25 @@ impl NetlinkExecutor {
         command: impl FnOnce(mpsc::Sender<io::Result<()>>) -> Command,
     ) -> io::Result<()> {
         let (reply_tx, reply_rx) = mpsc::channel();
-        self.tx.send(command(reply_tx)).map_err(|_| actor_gone())?;
+        let command = command(reply_tx);
+        let operation = command.operation();
+        self.tx.send(command).map_err(|_| {
+            eprintln!(
+                "network-orchestrator-daemon: netlink actor unavailable operation={operation}"
+            );
+            actor_gone()
+        })?;
         // An unbounded recv here wedges every caller forever once the actor
         // stalls (e.g. a dead rtnetlink connection task); fail instead.
         reply_rx
             .recv_timeout(self.reply_timeout)
-            .map_err(|_| actor_gone())?
+            .map_err(|err| {
+                eprintln!("network-orchestrator-daemon: netlink reply failed operation={operation} reason={err:?}");
+                actor_gone()
+            })?
+            .inspect_err(|err| {
+                eprintln!("network-orchestrator-daemon: netlink operation failed operation={operation} kind={:?} os_code={:?}", err.kind(), err.raw_os_error());
+            })
     }
 
     fn call_with<T>(
@@ -1121,10 +1162,23 @@ impl NetlinkExecutor {
         command: impl FnOnce(mpsc::Sender<io::Result<T>>) -> Command,
     ) -> io::Result<T> {
         let (reply_tx, reply_rx) = mpsc::channel();
-        self.tx.send(command(reply_tx)).map_err(|_| actor_gone())?;
+        let command = command(reply_tx);
+        let operation = command.operation();
+        self.tx.send(command).map_err(|_| {
+            eprintln!(
+                "network-orchestrator-daemon: netlink actor unavailable operation={operation}"
+            );
+            actor_gone()
+        })?;
         reply_rx
             .recv_timeout(self.reply_timeout)
-            .map_err(|_| actor_gone())?
+            .map_err(|err| {
+                eprintln!("network-orchestrator-daemon: netlink reply failed operation={operation} reason={err:?}");
+                actor_gone()
+            })?
+            .inspect_err(|err| {
+                eprintln!("network-orchestrator-daemon: netlink operation failed operation={operation} kind={:?} os_code={:?}", err.kind(), err.raw_os_error());
+            })
     }
 
     pub fn owned_routes_snapshot(&self) -> io::Result<Vec<AppliedRoute>> {
@@ -1303,6 +1357,7 @@ async fn get_rules(handle: &rtnetlink::Handle) -> io::Result<Vec<RuleMessage>> {
 
 async fn run_actor(handle: rtnetlink::Handle, mut rx: async_mpsc::UnboundedReceiver<Command>) {
     while let Some(command) = rx.recv().await {
+        let operation = command.operation();
         // A netlink request whose reply never arrives (e.g. the connection
         // task died) would otherwise pin the actor and every queued caller
         // forever; abort the stuck command — dropping the arm's `reply`
@@ -1672,7 +1727,9 @@ async fn run_actor(handle: rtnetlink::Handle, mut rx: async_mpsc::UnboundedRecei
         })
         .await;
         if executed.is_err() {
-            eprintln!("network-orchestrator-daemon: netlink command timed out, skipping");
+            eprintln!(
+                "network-orchestrator-daemon: netlink command timed out operation={operation}"
+            );
         }
     }
 }

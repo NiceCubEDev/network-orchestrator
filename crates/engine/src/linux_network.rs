@@ -1,5 +1,5 @@
 //! Shared Linux network inventory, daemon-authorized edits and offline routing tools.
-use crate::linux_engine::{daemon_error, LinuxEngine};
+use crate::linux_engine::LinuxEngine;
 use net_manager_core::daemon_protocol::*;
 use net_manager_core::explorer;
 use net_manager_core::happ_routing::HappRoutingImport;
@@ -18,10 +18,7 @@ fn request<P: Serialize, T: serde::de::DeserializeOwned>(
     method: &str,
     params: P,
 ) -> Result<T, String> {
-    engine
-        .privileged()
-        .call(method, params)
-        .map_err(daemon_error)
+    engine.ask(method, params)
 }
 
 pub fn interfaces() -> Result<Vec<NetworkInterface>, String> {

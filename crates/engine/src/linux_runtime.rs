@@ -48,10 +48,13 @@ pub fn connect_with_credentials(
     let Context {
         root, vault, store, ..
     } = *context;
+    let operation = Lifecycle::begin(root, "connect", profile_id);
+    let mut stage = "validation";
     let result = (|| {
         if remember && credential_store.is_none() {
             return Err("Remembered credentials are unavailable for this caller".into());
         }
+        stage = "load_profile";
         let mut profiles = store
             .load()
             .map_err(|_| "Profiles could not be loaded")?
@@ -62,9 +65,11 @@ pub fn connect_with_credentials(
             .cloned()
             .ok_or("Profile not found")?;
         profile.check_role()?;
+        operation.backend(profile.backend);
         if supplied.is_some() && profile.backend != TunnelBackend::OpenVpn {
             return Err("Credentials require an OpenVPN profile".into());
         }
+        stage = "listener_preparation";
         let notice = prepare_listener_ports(
             vault,
             store,
@@ -72,6 +77,7 @@ pub fn connect_with_credentials(
             &mut profiles,
             unsafe { libc::geteuid() } == 0,
         )?;
+        stage = "connection_preparation";
         let prepared = prepare_connection(
             context,
             &profile,
@@ -81,10 +87,12 @@ pub fn connect_with_credentials(
             remember,
             false,
         )?;
+        stage = "backend_execution";
         let mut status = execute_prepared(context, &prepared, credential_store)?;
         append_notice(&mut status, notice.as_deref());
         Ok(status)
     })();
+    operation.finish(stage, &result);
     record_lifecycle(root, "connect", profile_id, &result);
     result
 }
@@ -322,7 +330,9 @@ pub fn disconnect_profile_with_root(
     root: &Path,
     profile: &Profile,
 ) -> Result<TunnelStatus, String> {
+    let operation = Lifecycle::begin(root, "disconnect", &profile.id);
     let result = engine.disconnect(profile);
+    operation.finish("backend_execution", &result);
     record_lifecycle(root, "disconnect", &profile.id, &result);
     result
 }
@@ -363,8 +373,13 @@ pub fn reload(
     vault: &ConfigVault,
     profile: &Profile,
 ) -> Result<TunnelStatus, String> {
+    let root = vault.root().parent();
+    let operation = root.map(|root| Lifecycle::begin(root, "reload", &profile.id));
     let result = engine.reload_xray(vault, profile);
-    if let Some(root) = vault.root().parent() {
+    if let Some(operation) = operation {
+        operation.finish("backend_execution", &result);
+    }
+    if let Some(root) = root {
         record_lifecycle(root, "reload", &profile.id, &result);
     }
     result
@@ -429,6 +444,59 @@ fn require_openvpn(profile: &Profile) -> Result<(), String> {
     }
 }
 
+struct Lifecycle<'a> {
+    root: &'a Path,
+    action: &'static str,
+    request: u64,
+    started: std::time::Instant,
+}
+
+impl<'a> Lifecycle<'a> {
+    fn begin(root: &'a Path, action: &'static str, id: &str) -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let operation = Self {
+            root,
+            action,
+            request: NEXT.fetch_add(1, Ordering::Relaxed),
+            started: std::time::Instant::now(),
+        };
+        if unsafe { libc::geteuid() } != 0 {
+            use sha2::{Digest, Sha256};
+            let hash = Sha256::digest(id.as_bytes());
+            let _ = crate::linux_diagnostics::try_record_log(root, crate::linux_diagnostics::LogLevel::Info,
+                &format!("lifecycle begin pid={} request={} method={action} profile_hash={:02x}{:02x}{:02x}{:02x}", std::process::id(), operation.request, hash[0], hash[1], hash[2], hash[3]));
+        }
+        operation
+    }
+
+    fn backend(&self, backend: TunnelBackend) {
+        if unsafe { libc::geteuid() } != 0 {
+            let _ = crate::linux_diagnostics::try_record_log(
+                self.root,
+                crate::linux_diagnostics::LogLevel::Info,
+                &format!(
+                    "lifecycle backend pid={} request={} backend={backend:?}",
+                    std::process::id(),
+                    self.request
+                ),
+            );
+        }
+    }
+
+    fn finish(&self, stage: &str, result: &Result<TunnelStatus, String>) {
+        if unsafe { libc::geteuid() } != 0 {
+            use crate::linux_diagnostics::{try_record_log, LogLevel};
+            let (level, outcome) = if result.is_ok() {
+                (LogLevel::Info, "ok")
+            } else {
+                (LogLevel::Error, "failed")
+            };
+            let _ = try_record_log(self.root, level, &format!("lifecycle end pid={} request={} method={} stage={stage} elapsed_ms={} outcome={outcome}", std::process::id(), self.request, self.action, self.started.elapsed().as_millis()));
+        }
+    }
+}
+
 pub(crate) fn record_lifecycle(
     root: &Path,
     action: &str,
@@ -438,13 +506,15 @@ pub(crate) fn record_lifecycle(
     if unsafe { libc::geteuid() } == 0 {
         return;
     }
-    use crate::linux_diagnostics::{record_log, LogLevel};
+    use crate::linux_diagnostics::{try_record_log, LogLevel};
     let (level, outcome) = if result.is_ok() {
         (LogLevel::Info, "succeeded")
     } else {
         (LogLevel::Error, "failed")
     };
-    let _ = record_log(root, level, &format!("{action} profile {id}: {outcome}"));
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(id.as_bytes());
+    let _ = try_record_log(root, level, &format!("lifecycle pid={} method={action} profile_hash={:02x}{:02x}{:02x}{:02x} outcome={outcome}", std::process::id(), hash[0], hash[1], hash[2], hash[3]));
 }
 
 pub fn daemon_owner(profile: &Profile) -> Option<String> {

@@ -14,6 +14,10 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 - `versions.py prepare` automates release metadata, changelog promotion, lockfile
   refresh and the host quality gate, with a no-write preview and a project skill.
+- Failure diagnostics across GUI/CLI, shared engine, user runtime and daemon:
+  lifecycle and IPC outcomes, safe frontend/Rust panic context, child exit
+  codes/signals, watchdog restart reasons, netlink failures and cleanup results.
+  Persist bounded client logs and omit raw configs, credentials and traffic tails.
 
 ## [0.16.3] - 2026-11-09
 

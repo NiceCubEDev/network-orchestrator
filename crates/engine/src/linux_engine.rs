@@ -24,7 +24,42 @@ use net_manager_core::daemon_protocol::{
 use net_manager_core::helper_client::{HelperClient, HelperError};
 use net_manager_core::models::{Profile, TunnelBackend, TunnelState, TunnelStatus, XrayMode};
 use std::path::PathBuf;
+#[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+#[cfg(target_os = "linux")]
+static NEXT_DIAGNOSTIC_REQUEST: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(target_os = "linux")]
+fn diagnostic_method(name: &str) -> &str {
+    if method::CAPABILITIES.contains(&name) || name == method::HELLO {
+        name
+    } else {
+        "other"
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn diagnostic_read_method(name: &str) -> bool {
+    matches!(
+        name,
+        method::HELLO
+            | method::OWNED_LIST
+            | method::WIREGUARD_STATUS
+            | method::OPENVPN_STATUS
+            | method::XRAY_STATUS
+            | method::OPENVPN_PLAN
+            | method::TAILSCALE_STATUS
+            | method::ALWAYS_ON_LIST
+            | method::SETTINGS_GET
+            | method::COND_RULES_LIST
+            | method::NM_LIST
+            | method::NET_TABLES
+            | method::NET_EXPLAIN
+            | method::NET_DNS_STATUS
+            | method::NET_INTENT_LIST
+    )
+}
 
 /// Text the client matches to ask the user for OpenVPN credentials.
 pub const CREDENTIALS_REQUIRED: &str = "OpenVPN credentials required";
@@ -241,9 +276,65 @@ impl LinuxEngine {
         method_name: &str,
         params: P,
     ) -> Result<R, String> {
-        self.privileged()
-            .call(method_name, params)
+        self.traced_daemon_call(method_name, || self.privileged().call(method_name, params))
             .map_err(daemon_error)
+    }
+
+    fn traced_daemon_call<R>(
+        &self,
+        method_name: &str,
+        call: impl FnOnce() -> Result<R, HelperError>,
+    ) -> Result<R, HelperError> {
+        #[cfg(target_os = "linux")]
+        let (request, started, method_name, mutation) = (
+            NEXT_DIAGNOSTIC_REQUEST.fetch_add(1, Ordering::Relaxed),
+            std::time::Instant::now(),
+            diagnostic_method(method_name),
+            !diagnostic_read_method(method_name),
+        );
+        #[cfg(not(target_os = "linux"))]
+        let _ = method_name;
+        #[cfg(target_os = "linux")]
+        if mutation {
+            if let Some(root) = &self.data_root {
+                let _ = crate::linux_diagnostics::try_record_log(
+                    root,
+                    crate::linux_diagnostics::LogLevel::Info,
+                    &format!(
+                        "daemon request begin pid={} request={} method={method_name}",
+                        std::process::id(),
+                        request
+                    ),
+                );
+            }
+        }
+        let result = call();
+        #[cfg(target_os = "linux")]
+        if mutation || result.is_err() {
+            if let Some(root) = &self.data_root {
+                use crate::linux_diagnostics::{try_record_log, LogLevel};
+                let (level, category) = match &result {
+                    Ok(_) => (LogLevel::Info, "ok".to_string()),
+                    Err(HelperError::Unreachable(error)) => (
+                        LogLevel::Error,
+                        format!(
+                            "unreachable os_code={}",
+                            error
+                                .raw_os_error()
+                                .map_or_else(|| "none".into(), |code| code.to_string())
+                        ),
+                    ),
+                    Err(HelperError::Rejected(body)) => {
+                        (LogLevel::Error, format!("rejected code={:?}", body.code))
+                    }
+                    Err(HelperError::Protocol(_)) => (LogLevel::Error, "protocol".into()),
+                };
+                let _ = try_record_log(root, level, &format!(
+                    "daemon request end pid={} request={} method={method_name} elapsed_ms={} outcome={category}",
+                    std::process::id(), request, started.elapsed().as_millis()));
+            }
+        }
+        result
     }
 
     /// Reconfigure diagnostics only; never reload the child or alter routing.
@@ -373,7 +464,9 @@ impl LinuxEngine {
                     .any(|route| route.destination.addr().is_ipv6())
                     || params.dns_servers.iter().any(|server| server.is_ipv6())
                 {
-                    let hello = self.privileged().hello().map_err(daemon_error)?;
+                    let hello = self
+                        .traced_daemon_call(method::HELLO, || self.privileged().hello())
+                        .map_err(daemon_error)?;
                     net_manager_core::helper_client::require_capability(
                         &hello,
                         feature::XRAY_TUN_IPV6,
@@ -515,9 +608,11 @@ impl LinuxEngine {
             .any(|route| route.destination.addr().is_ipv6())
             || params.dns_servers.iter().any(|server| server.is_ipv6());
         let result: XrayConnectResult = if needs_ipv6 {
-            self.privileged()
-                .call_with_capability(method_name, params, feature::XRAY_TUN_IPV6)
-                .map_err(daemon_error)?
+            self.traced_daemon_call(method_name, || {
+                self.privileged()
+                    .call_with_capability(method_name, params, feature::XRAY_TUN_IPV6)
+            })
+            .map_err(daemon_error)?
         } else {
             self.ask(method_name, params)?
         };
@@ -714,6 +809,59 @@ mod tests {
         fn log_dir(&self) -> PathBuf {
             PathBuf::new()
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn daemon_transport_failure_is_persisted_without_request_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = LinuxEngine::for_socket(dir.path().join("missing.sock"), "test")
+            .with_data_root(dir.path().to_path_buf());
+        let result: Result<Value, String> =
+            engine.ask(method::ROUTES_APPLY, json!({"password": "secret-marker"}));
+        assert!(result.is_err());
+        let events = crate::linux_diagnostics::logs(dir.path()).unwrap();
+        assert!(events.iter().any(|event| {
+            event.message.contains(method::ROUTES_APPLY)
+                && event.message.contains("unreachable")
+                && event.message.contains("pid=")
+        }));
+        let stored = std::fs::read_to_string(dir.path().join("app-logs/events.json")).unwrap();
+        assert!(!stored.contains("secret-marker"));
+        assert!(!stored.contains("missing.sock"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn diagnostic_contention_does_not_block_engine_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::linux_diagnostics::record_log(
+            dir.path(),
+            crate::linux_diagnostics::LogLevel::Info,
+            "before",
+        )
+        .unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.path().join("app-logs/store.lock"))
+            .unwrap();
+        lock.lock().unwrap();
+        let engine = LinuxEngine::for_socket(dir.path().join("missing.sock"), "test")
+            .with_data_root(dir.path().to_path_buf());
+        let (send, receive) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result: Result<Value, String> = engine.ask(method::ROUTES_APPLY, Value::Null);
+            send.send(result.is_err()).unwrap();
+        });
+        let completed = receive.recv_timeout(std::time::Duration::from_millis(500));
+        drop(lock);
+        worker.join().unwrap();
+        assert_eq!(
+            completed,
+            Ok(true),
+            "diagnostics blocked the engine operation"
+        );
     }
 
     #[cfg(target_os = "linux")]

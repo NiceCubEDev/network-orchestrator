@@ -5,6 +5,7 @@ mod commands;
 mod daemon_client;
 #[cfg(target_os = "linux")]
 mod daemon_watcher;
+mod diagnostics;
 mod elevation;
 mod lifecycle;
 #[cfg(target_os = "linux")]
@@ -46,6 +47,8 @@ fn get_auto_connect_result() -> Option<serde_json::Value> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(target_os = "linux")]
+    diagnostics::install();
     tauri::Builder::default()
         // Must be first: a second launch exits here and focuses the running UI
         // before setup starts auto-connect, refresh loops or the tray again.
@@ -69,7 +72,10 @@ pub fn run() {
             let data_dir = app.path().app_data_dir()?;
             #[cfg(target_os = "linux")]
             let profile_path = data_dir.join("profiles.json");
-            app.manage(state::build_state(data_dir)?);
+            let state = state::build_state(data_dir)?;
+            #[cfg(target_os = "linux")]
+            diagnostics::initialize(state.data_dir());
+            app.manage(state);
             #[cfg(target_os = "linux")]
             tauri::async_runtime::spawn(profile_watcher::watch(app.handle().clone(), profile_path));
             #[cfg(target_os = "linux")]
@@ -99,6 +105,15 @@ pub fn run() {
                 for (_label, window) in app.webview_windows() {
                     let _ = window.with_webview(|webview| {
                         let wv = webview.inner();
+                        wv.connect_web_process_terminated(|_, reason| {
+                            diagnostics::record(
+                                net_manager_engine::linux_diagnostics::LogLevel::Error,
+                                &format!(
+                                    "gui renderer_terminated pid={} reason={reason:?}",
+                                    std::process::id()
+                                ),
+                            );
+                        });
                         if let Some(manager) = wv.website_data_manager() {
                             manager.set_network_proxy_settings(NetworkProxyMode::NoProxy, None);
                         }
@@ -119,6 +134,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            diagnostics::report_frontend_failure,
             get_interfaces,
             get_routes,
             parse_bulk_cidrs,

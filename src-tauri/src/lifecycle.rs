@@ -1,6 +1,8 @@
 use crate::state::AppState;
 #[cfg(not(target_os = "linux"))]
 use net_manager_core::models::*;
+#[cfg(target_os = "linux")]
+use net_manager_engine::linux_diagnostics::LogLevel;
 use std::sync::atomic::Ordering;
 use tauri::{Emitter, Manager};
 
@@ -105,6 +107,10 @@ pub(crate) fn handle_window_event(window: &tauri::Window, event: &tauri::WindowE
     }
     #[cfg(target_os = "linux")]
     {
+        crate::diagnostics::record(
+            LogLevel::Info,
+            &format!("gui window_close_requested pid={}", std::process::id()),
+        );
         if should_hide_on_close(
             window
                 .app_handle()
@@ -113,6 +119,13 @@ pub(crate) fn handle_window_event(window: &tauri::Window, event: &tauri::WindowE
         ) && window.hide().is_ok()
         {
             api.prevent_close();
+            crate::diagnostics::record(
+                LogLevel::Info,
+                &format!(
+                    "gui window_hidden pid={} tunnels_preserved=true",
+                    std::process::id()
+                ),
+            );
         }
     }
     #[cfg(not(target_os = "linux"))]
@@ -148,6 +161,25 @@ pub(crate) fn handle_window_event(window: &tauri::Window, event: &tauri::WindowE
 }
 
 pub(crate) fn handle_run_event(app: &tauri::AppHandle, event: tauri::RunEvent) {
+    #[cfg(target_os = "linux")]
+    match &event {
+        tauri::RunEvent::Ready => crate::diagnostics::record(
+            LogLevel::Info,
+            &format!("gui ready pid={}", std::process::id()),
+        ),
+        tauri::RunEvent::Exit => crate::diagnostics::record(
+            LogLevel::Info,
+            &format!("gui exit pid={}", std::process::id()),
+        ),
+        tauri::RunEvent::ExitRequested { code, .. } => crate::diagnostics::record(
+            LogLevel::Info,
+            &format!(
+                "gui exit_requested pid={} code={code:?} shared_tunnels_preserved=true",
+                std::process::id()
+            ),
+        ),
+        _ => {}
+    }
     let tauri::RunEvent::ExitRequested { api, .. } = event else {
         return;
     };
@@ -167,6 +199,14 @@ pub(crate) fn handle_run_event(app: &tauri::AppHandle, event: tauri::RunEvent) {
         match exit_cleanup(&state).await {
             Ok(()) => {
                 state.cleanup_complete.store(true, Ordering::SeqCst);
+                #[cfg(target_os = "linux")]
+                crate::diagnostics::record(
+                    LogLevel::Info,
+                    &format!(
+                        "gui exit_cleanup_complete pid={} shared_tunnels_preserved=true",
+                        std::process::id()
+                    ),
+                );
                 handle.exit(0);
             }
             Err(err) => {

@@ -11,6 +11,7 @@ use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -122,21 +123,26 @@ impl OpenVpnProcessRunner for TrustedOpenVpnProcess {
             .spawn()
         {
             Ok(child) => child,
-            Err(_) => {
+            Err(err) => {
+                eprintln!("network-orchestrator-daemon: openvpn spawn failed uid={uid} kind={:?} os_code={:?}", err.kind(), err.raw_os_error());
                 let _ = cleanup_stage_at(runtime_root().as_path(), uid, name);
                 return Err(io::Error::other("failed to start OpenVPN"));
             }
         };
+        eprintln!(
+            "network-orchestrator-daemon: openvpn spawned uid={uid} pid={}",
+            child.id()
+        );
         let deadline = Instant::now() + MANAGEMENT_CONNECT_TIMEOUT;
         let management = loop {
             match UnixStream::connect(&socket) {
                 Ok(stream) => break stream,
                 Err(_) if Instant::now() < deadline => {
-                    if child
+                    if let Some(status) = child
                         .try_wait()
                         .map_err(|_| io::Error::other("OpenVPN child check failed"))?
-                        .is_some()
                     {
+                        eprintln!("network-orchestrator-daemon: openvpn unexpected exit phase=start uid={uid} pid={} code={:?} signal={:?}", child.id(), status.code(), status.signal());
                         let _ = cleanup_stage_at(runtime_root().as_path(), uid, name);
                         return Err(io::Error::new(
                             io::ErrorKind::NotConnected,
@@ -146,6 +152,7 @@ impl OpenVpnProcessRunner for TrustedOpenVpnProcess {
                     thread::sleep(Duration::from_millis(25));
                 }
                 Err(_) => {
+                    eprintln!("network-orchestrator-daemon: openvpn terminating uid={uid} pid={} cause=management_timeout", child.id());
                     terminate_child(&mut child)?;
                     let _ = cleanup_stage_at(runtime_root().as_path(), uid, name);
                     return Err(io::Error::new(
@@ -191,11 +198,14 @@ impl OpenVpnProcessRunner for TrustedOpenVpnProcess {
             .children
             .get_mut(name)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "OpenVPN child not found"))?;
-        let exited = process
-            .child
-            .try_wait()
-            .map_err(|_| io::Error::other("OpenVPN child check failed"))?
-            .is_some();
+        let status = process.child.try_wait().map_err(|err| {
+            eprintln!("network-orchestrator-daemon: openvpn child check failed uid={} pid={} kind={:?} os_code={:?}", process.uid, process.child.id(), err.kind(), err.raw_os_error());
+            io::Error::other("OpenVPN child check failed")
+        })?;
+        let exited = status.is_some();
+        if let Some(status) = status {
+            eprintln!("network-orchestrator-daemon: openvpn unexpected exit uid={} pid={} code={:?} signal={:?}", process.uid, process.child.id(), status.code(), status.signal());
+        }
         let mut events = Vec::new();
         let mut total = 0;
         let mut disconnected = false;
@@ -233,6 +243,13 @@ impl OpenVpnProcessRunner for TrustedOpenVpnProcess {
             }
         }
         if exited || disconnected || prompt_error.is_some() {
+            if disconnected && !exited {
+                eprintln!(
+                    "network-orchestrator-daemon: openvpn management disconnected uid={} pid={}",
+                    process.uid,
+                    process.child.id()
+                );
+            }
             if events
                 .iter()
                 .any(|event| matches!(event, ManagementEvent::AuthenticationFailed))
@@ -265,6 +282,11 @@ impl OpenVpnProcessRunner for TrustedOpenVpnProcess {
             .children
             .get_mut(name)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "OpenVPN child not found"))?;
+        eprintln!(
+            "network-orchestrator-daemon: openvpn terminating uid={} pid={} cause=teardown",
+            process.uid,
+            process.child.id()
+        );
         terminate_child(&mut process.child)?;
         self.children.remove(name);
         Ok(())
@@ -601,6 +623,11 @@ fn terminate_child(child: &mut Child) -> io::Result<()> {
     // handle. Signals through the pidfd cannot hit a later PID reuse.
     let raw_fd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id() as libc::pid_t, 0) };
     if raw_fd < 0 {
+        eprintln!(
+            "network-orchestrator-daemon: openvpn pidfd open failed pid={} os_code={:?}",
+            child.id(),
+            io::Error::last_os_error().raw_os_error()
+        );
         return if child.try_wait()?.is_some() {
             Ok(())
         } else {
@@ -620,6 +647,10 @@ fn terminate_child(child: &mut Child) -> io::Result<()> {
         }
         thread::sleep(Duration::from_millis(25));
     }
+    eprintln!(
+        "network-orchestrator-daemon: openvpn termination escalating pid={} signal=SIGKILL",
+        child.id()
+    );
     send_child_signal(&pidfd, child, libc::SIGKILL)?;
     // A child wedged in an uninterruptible syscall survives SIGKILL; bound
     // the final reap so `stop` cannot block a core task forever.
@@ -652,7 +683,9 @@ fn send_child_signal(pidfd: &OwnedFd, child: &mut Child, signal: i32) -> io::Res
             0,
         )
     };
+    let signal_error = (result < 0).then(io::Error::last_os_error);
     if result < 0 && child.try_wait()?.is_none() {
+        eprintln!("network-orchestrator-daemon: openvpn signal failed pid={} signal={signal} os_code={:?}", child.id(), signal_error.and_then(|err| err.raw_os_error()));
         return Err(io::Error::other("OpenVPN child signal failed"));
     }
     Ok(())
