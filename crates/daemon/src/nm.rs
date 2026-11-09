@@ -107,6 +107,18 @@ struct ActiveEntry {
     devices: Vec<String>,
 }
 
+fn shares_ip_config(
+    active: &HashMap<String, OwnedValue>,
+    device: &HashMap<String, OwnedValue>,
+) -> bool {
+    ["Ip4Config", "Ip6Config"].into_iter().any(|key| {
+        active
+            .get(key)
+            .and_then(|value| <&ObjectPath<'_>>::try_from(value).ok())
+            .is_some_and(|path| path.as_str() != "/" && active.get(key) == device.get(key))
+    })
+}
+
 /// Active connection UUID → object path, state and device paths.
 async fn active_map(conn: &zbus::Connection) -> io::Result<HashMap<String, ActiveEntry>> {
     let reply = conn
@@ -122,15 +134,37 @@ async fn active_map(conn: &zbus::Connection) -> io::Result<HashMap<String, Activ
     let value: OwnedValue = reply.body().deserialize().map_err(invalid)?;
     let paths = Vec::<OwnedObjectPath>::try_from(value).map_err(invalid)?;
     let mut active = HashMap::new();
+    let mut vpn_devices = Vec::new();
+    let device_paths: Vec<OwnedObjectPath> =
+        get(conn, NM_ROOT, NM, "Devices").await.unwrap_or_default();
+    for path in device_paths {
+        if let Ok(props) = get_all(conn, path.as_str(), NM_DEVICE).await {
+            vpn_devices.push((path, props));
+        }
+    }
     for path in paths {
         let props = match get_all(conn, path.as_str(), NM_ACTIVE).await {
             Ok(props) => props,
             Err(_) => continue,
         };
+        // VPN Devices lists the underlay; its tunnel shares the VPN's IP config.
+        let devices = if props
+            .get("Vpn")
+            .and_then(|v| bool::try_from(v.clone()).ok())
+            == Some(true)
+        {
+            vpn_devices
+                .iter()
+                .filter(|(_, device)| shares_ip_config(&props, device))
+                .map(|(path, _)| path.as_str().to_string())
+                .collect()
+        } else {
+            object_paths(props.get("Devices"))
+        };
         let entry = ActiveEntry {
             path: path.as_str().to_string(),
             state: number(props.get("State")).unwrap_or(0),
-            devices: object_paths(props.get("Devices")),
+            devices,
         };
         if let Some(uuid) = text(props.get("Uuid")) {
             active.insert(uuid, entry);
@@ -314,6 +348,34 @@ mod tests {
             map.insert("vpn".to_string(), section(vpn));
         }
         map
+    }
+
+    #[test]
+    fn vpn_device_matches_tunnel_ip_config_not_parent_or_empty_paths() {
+        fn props(ip4: &str, ip6: &str) -> HashMap<String, OwnedValue> {
+            [("Ip4Config", ip4), ("Ip6Config", ip6)]
+                .into_iter()
+                .map(|(key, path)| {
+                    (
+                        key.to_string(),
+                        OwnedValue::try_from(zbus::zvariant::Value::from(
+                            ObjectPath::try_from(path).unwrap(),
+                        ))
+                        .unwrap(),
+                    )
+                })
+                .collect()
+        }
+        let vpn = props("/ip4/tunnel", "/");
+        let parent = props("/ip4/ethernet", "/");
+        let tunnel = props("/ip4/tunnel", "/");
+        assert!(!shares_ip_config(&vpn, &parent));
+        assert!(shares_ip_config(&vpn, &tunnel));
+        assert!(!shares_ip_config(&props("/", "/"), &props("/", "/")));
+        assert!(shares_ip_config(
+            &props("/", "/ip6/tunnel"),
+            &props("/", "/ip6/tunnel")
+        ));
     }
 
     #[test]
