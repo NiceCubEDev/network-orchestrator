@@ -16,4 +16,4 @@ version = "0.16.3"
 
 [windows]
 # The Windows app.
-version = "0.10.4"
+version = "0.10.5"
