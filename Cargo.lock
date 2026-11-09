@@ -2855,7 +2855,7 @@ dependencies = [
 
 [[package]]
 name = "net-manager-core"
-version = "0.16.1"
+version = "0.17.0"
 dependencies = [
  "base64 0.22.1",
  "futures",
@@ -2876,7 +2876,7 @@ dependencies = [
 
 [[package]]
 name = "net-manager-engine"
-version = "0.16.1"
+version = "0.17.0"
 dependencies = [
  "base64 0.22.1",
  "core-foundation 0.10.1",

@@ -10,6 +10,8 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-11-09
+
 ### Added
 
 - Typed macOS profile, subscription, routing, network, provider, diagnostic,
