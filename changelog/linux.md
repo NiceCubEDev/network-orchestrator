@@ -10,6 +10,12 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+### Fixed
+
+- Resolve NetworkManager VPN tunnel interfaces through their shared IPv4/IPv6
+  configuration instead of the physical underlay, preventing duplicate OpenVPN
+  entries under detected system tunnels.
+
 ## [0.17.0] - 2026-11-09
 
 Core 0.17.0.
