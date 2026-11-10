@@ -128,3 +128,35 @@ test("a stale ordinary profile edit rejects newer dedicated service settings", (
   assert.notEqual(saved.name, "Edited ordinary name");
   assert.deepEqual(saved.xrayServiceChecks, [check]);
 });
+
+test("delay batch cancellation rejects pending probes and rejects reuse", async () => {
+  const backend = new SandboxBackend();
+  const measurementId = backend.invoke("start_subscription_delay_measurement", { profileId: "xray" }) as string;
+  const pending = backend.invoke("measure_subscription_endpoint_delay", { profileId: "xray", endpointIndex: 3, measurementId }) as Promise<unknown>;
+  const cancelled = assert.rejects(pending, /cancelled/);
+  backend.invoke("cancel_subscription_delay_measurement", { measurementId });
+  await cancelled;
+  assert.throws(() => backend.invoke("measure_subscription_endpoint_delay", { profileId: "xray", endpointIndex: 0, measurementId }), /cancelled/);
+});
+
+test("replacing a delay batch cannot let its old cancellation stop the new batch", async () => {
+  const backend = new SandboxBackend();
+  const oldId = backend.invoke("start_subscription_delay_measurement", { profileId: "xray" }) as string;
+  const pending = backend.invoke("measure_subscription_endpoint_delay", { profileId: "xray", endpointIndex: 3, measurementId: oldId }) as Promise<unknown>;
+  const cancelled = assert.rejects(pending, /cancelled/);
+  const measurementId = backend.invoke("start_subscription_delay_measurement", { profileId: "xray" }) as string;
+  await cancelled;
+  assert.notEqual(measurementId, oldId);
+  backend.invoke("cancel_subscription_delay_measurement", { measurementId: oldId });
+  const result = await backend.invoke("measure_subscription_endpoint_delay", { profileId: "xray", endpointIndex: 0, measurementId });
+  assert.deepEqual(result, { delayMs: 60, error: null });
+  backend.invoke("cancel_subscription_delay_measurement", { measurementId });
+});
+
+test("delay batches are profile-scoped and individual probes need no batch ID", async () => {
+  const backend = new SandboxBackend();
+  const measurementId = backend.invoke("start_subscription_delay_measurement", { profileId: "xray" }) as string;
+  assert.throws(() => backend.invoke("measure_subscription_endpoint_delay", { profileId: "wg", endpointIndex: 0, measurementId }), /cancelled/);
+  assert.deepEqual(await backend.invoke("measure_subscription_endpoint_delay", { profileId: "xray", endpointIndex: 0 }), { delayMs: 60, error: null });
+  backend.invoke("cancel_subscription_delay_measurement", { measurementId });
+});

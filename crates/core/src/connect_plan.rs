@@ -25,15 +25,126 @@ pub fn full_coverage(routes: impl IntoIterator<Item = IpNet>) -> (bool, bool) {
 }
 
 pub fn has_target_interface(profile: &Profile, interfaces: &[NetworkInterface]) -> bool {
+    #[cfg(windows)]
+    let gateways = if profile.backend == TunnelBackend::Xray && profile.xray_mode == XrayMode::Tun {
+        match windows_xray_tun_gateways(profile) {
+            Ok(gateways) => Some(gateways),
+            Err(_) => return false,
+        }
+    } else {
+        None
+    };
     interfaces.iter().any(|iface| {
-        matches!(iface.state, InterfaceState::Up)
+        let ready = matches!(iface.state, InterfaceState::Up)
             && (iface.friendly_name == profile.interface_name
-                || iface.name == profile.interface_name)
+                || iface.name == profile.interface_name);
+        #[cfg(windows)]
+        let ready = ready
+            && gateways.as_ref().is_none_or(|gateways| {
+                gateways.iter().all(|gateway| {
+                    iface.addresses.iter().any(|address| {
+                        address.address == gateway.addr()
+                            && address.prefix_len == gateway.prefix_len()
+                    })
+                })
+            });
+        ready
     })
 }
 
-/// Exact Linux-managed Xray TUN capture, shared by execution and route analysis.
-pub fn linux_xray_tun_routes(profile: &Profile) -> Vec<PolicyRoute> {
+/// Addresses assigned by Windows TUN startup after its initial route-table reset.
+pub fn windows_xray_tun_gateways(profile: &Profile) -> std::io::Result<Vec<IpNet>> {
+    let ipv4: ipnet::Ipv4Net = profile
+        .xray_tun_ip
+        .as_deref()
+        .unwrap_or("172.19.0.1/30")
+        .trim()
+        .parse()
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid Windows TUN IPv4 address",
+            )
+        })?;
+    if ipv4.prefix_len() == 0
+        || ipv4.addr().is_unspecified()
+        || ipv4.addr().is_multicast()
+        || ipv4.addr().is_loopback()
+        || ipv4.addr().is_broadcast()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid Windows TUN IPv4 address",
+        ));
+    }
+    let routes = xray_tun_capture_routes(profile);
+    let mut gateways = Vec::new();
+    if routes
+        .iter()
+        .any(|route| route.destination.addr().is_ipv4())
+    {
+        gateways.push(IpNet::V4(ipv4));
+    }
+    if routes
+        .iter()
+        .any(|route| route.destination.addr().is_ipv6())
+    {
+        gateways.push("fd42:6e65:746f::1/126".parse().unwrap());
+    }
+    Ok(gateways)
+}
+
+/// Select the physical Windows uplink from actual default routes, independently
+/// of VPN adapters and Xray's automatic interface-name heuristic.
+pub fn windows_xray_uplink(
+    interfaces: &[NetworkInterface],
+    routes: &[RouteEntry],
+) -> std::io::Result<String> {
+    routes
+        .iter()
+        .filter(|route| route.prefix_len == 0 && route.destination.is_unspecified())
+        .filter_map(|route| {
+            interfaces
+                .iter()
+                .find(|interface| {
+                    interface.if_index == route.interface_index
+                        && interface.if_index != 0
+                        && matches!(interface.state, InterfaceState::Up)
+                        && interface.physical
+                        && interface.category == InterfaceCategory::Physical
+                        && !matches!(
+                            &interface.kind,
+                            InterfaceKind::WireGuard
+                                | InterfaceKind::OpenVpn
+                                | InterfaceKind::Xray
+                                | InterfaceKind::Loopback
+                        )
+                        && !interface.friendly_name.is_empty()
+                        && interface.friendly_name.trim() == interface.friendly_name
+                        && !interface.friendly_name.eq_ignore_ascii_case("auto")
+                        && interface.friendly_name.encode_utf16().count() <= 255
+                        && !interface.friendly_name.chars().any(char::is_control)
+                })
+                .map(|interface| (route, interface))
+        })
+        .min_by_key(|(route, interface)| {
+            (
+                route.destination.is_ipv6(),
+                route.metric,
+                interface.if_index,
+            )
+        })
+        .map(|(_, interface)| interface.friendly_name.clone())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no active physical default route is available for Windows TUN",
+            )
+        })
+}
+
+/// Exact managed Xray TUN capture, shared by execution and route analysis.
+pub fn xray_tun_capture_routes(profile: &Profile) -> Vec<PolicyRoute> {
     let routes = profile.effective_routes();
     if profile.tunnel_role != TunnelRole::Primary || !routes.is_empty() {
         return routes;
@@ -43,7 +154,7 @@ pub fn linux_xray_tun_routes(profile: &Profile) -> Vec<PolicyRoute> {
         metric: 5,
         via: None,
     };
-    if profile.xray_split_default {
+    if cfg!(windows) || profile.xray_split_default {
         vec![
             route("0.0.0.0/1"),
             route("128.0.0.0/1"),
@@ -54,6 +165,8 @@ pub fn linux_xray_tun_routes(profile: &Profile) -> Vec<PolicyRoute> {
         vec![route("0.0.0.0/0"), route("::/0")]
     }
 }
+
+pub use self::xray_tun_capture_routes as linux_xray_tun_routes;
 
 pub fn unknown_route_conflicts(
     candidate: &ConfigAnalysis,
@@ -197,7 +310,17 @@ pub fn derive_installable_routes(
 /// Resolve the interface name for route installation. For WireGuard, if the
 /// profile has no explicit interface name, derive it from the config file name
 /// (the tunnel service creates an interface named after the config stem).
+/// Windows Xray TUN uses the adapter named by its TUN settings.
 pub fn resolve_install_interface(profile: &Profile) -> Option<String> {
+    #[cfg(target_os = "windows")]
+    if profile.backend == TunnelBackend::Xray && profile.xray_mode == XrayMode::Tun {
+        let name = profile
+            .xray_tun_interface
+            .as_deref()
+            .unwrap_or("xray-tun")
+            .trim();
+        return (!name.is_empty()).then(|| name.to_string());
+    }
     if !profile.interface_name.trim().is_empty() {
         return Some(profile.interface_name.clone());
     }
@@ -306,6 +429,199 @@ mod tests {
             metric: None,
             destination: destination.parse().unwrap(),
             source: source.into(),
+        }
+    }
+
+    fn system_route(network: &str, index: u32, metric: u32) -> RouteEntry {
+        let network: IpNet = network.parse().unwrap();
+        RouteEntry {
+            destination: network.network(),
+            prefix_len: network.prefix_len(),
+            gateway: None,
+            interface_index: index,
+            interface_name: "route-table-name".into(),
+            metric,
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_xray_tun_defaults_use_split_capture_regardless_of_legacy_flag() {
+        for split in [false, true] {
+            let profile = Profile {
+                xray_split_default: split,
+                ..Default::default()
+            };
+            let routes: Vec<_> = xray_tun_capture_routes(&profile)
+                .into_iter()
+                .map(|route| route.destination.to_string())
+                .collect();
+            assert_eq!(routes, ["0.0.0.0/1", "128.0.0.0/1", "::/1", "8000::/1"]);
+        }
+    }
+
+    #[test]
+    fn windows_xray_tun_gateways_match_captured_families_and_configured_host_address() {
+        let mut profile = Profile::default();
+        let gateways = |profile: &Profile| {
+            windows_xray_tun_gateways(profile)
+                .unwrap()
+                .into_iter()
+                .map(|gateway| gateway.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            gateways(&profile),
+            ["172.19.0.1/30", "fd42:6e65:746f::1/126"]
+        );
+        profile.xray_tun_ip = Some("10.5.0.7/24".into());
+        profile.routes = vec![PolicyRoute {
+            destination: "10.20.0.0/16".parse().unwrap(),
+            metric: 5,
+            via: None,
+        }];
+        assert_eq!(gateways(&profile), ["10.5.0.7/24"]);
+        profile.routes[0].destination = "fd00:50::/64".parse().unwrap();
+        assert_eq!(gateways(&profile), ["fd42:6e65:746f::1/126"]);
+    }
+
+    #[test]
+    fn windows_xray_tun_gateways_reject_invalid_ipv4_addresses() {
+        for address in [
+            "invalid",
+            "0.0.0.0/30",
+            "127.0.0.1/8",
+            "224.0.0.1/4",
+            "10.0.0.1/0",
+        ] {
+            let profile = Profile {
+                xray_tun_ip: Some(address.into()),
+                ..Default::default()
+            };
+            assert!(windows_xray_tun_gateways(&profile).is_err(), "{address}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_xray_tun_readiness_waits_for_all_gateway_addresses_and_prefixes() {
+        let profile = Profile {
+            backend: TunnelBackend::Xray,
+            xray_mode: XrayMode::Tun,
+            interface_name: "xray-tun".into(),
+            ..Default::default()
+        };
+        let mut interface = iface("adapter-id", "xray-tun", InterfaceState::Up);
+        assert!(!has_target_interface(&profile, &[interface.clone()]));
+        interface.addresses.push(InterfaceAddress {
+            address: "172.19.0.1".parse().unwrap(),
+            prefix_len: 30,
+            family: AddressFamily::Ipv4,
+        });
+        assert!(!has_target_interface(&profile, &[interface.clone()]));
+        interface.addresses.push(InterfaceAddress {
+            address: "fd42:6e65:746f::1".parse().unwrap(),
+            prefix_len: 126,
+            family: AddressFamily::Ipv6,
+        });
+        assert!(has_target_interface(&profile, &[interface.clone()]));
+        interface.addresses[0].prefix_len = 31;
+        assert!(!has_target_interface(&profile, &[interface.clone()]));
+        interface.addresses[0].prefix_len = 30;
+        interface.state = InterfaceState::Down;
+        assert!(!has_target_interface(&profile, &[interface]));
+    }
+
+    #[test]
+    fn windows_xray_uplink_uses_physical_default_even_when_vpn_metric_is_lower() {
+        let mut ethernet = iface("ethernet-id", "Проводная сеть", InterfaceState::Up);
+        ethernet.if_index = 7;
+        let mut netbird = iface("netbird-id", "wt0", InterfaceState::Up);
+        netbird.if_index = 9;
+        netbird.category = InterfaceCategory::Vpn;
+        let mut tun = iface("xray-id", "xray-tun", InterfaceState::Up);
+        tun.if_index = 10;
+        tun.kind = InterfaceKind::Xray;
+        let mut virtual_adapter = iface("virtual-id", "vEthernet", InterfaceState::Up);
+        virtual_adapter.if_index = 11;
+        virtual_adapter.physical = false;
+        let mut wifi_without_default = iface("wifi-id", "Wi-Fi", InterfaceState::Up);
+        wifi_without_default.if_index = 12;
+        let interfaces = [
+            ethernet,
+            netbird,
+            tun,
+            virtual_adapter,
+            wifi_without_default,
+        ];
+        let routes = [
+            system_route("0.0.0.0/0", 9, 1),
+            system_route("0.0.0.0/0", 10, 0),
+            system_route("0.0.0.0/0", 11, 0),
+            system_route("0.0.0.0/0", 7, 40),
+        ];
+        assert_eq!(
+            windows_xray_uplink(&interfaces, &routes).unwrap(),
+            "Проводная сеть"
+        );
+    }
+
+    #[test]
+    fn windows_xray_uplink_prefers_ipv4_then_lowest_route_metric() {
+        let mut ethernet = iface("ethernet-id", "Ethernet", InterfaceState::Up);
+        ethernet.if_index = 7;
+        let mut wifi = iface("wifi-id", "Wi-Fi", InterfaceState::Up);
+        wifi.if_index = 8;
+        let interfaces = [ethernet, wifi];
+        let mut routes = vec![
+            system_route("::/0", 7, 1),
+            system_route("0.0.0.0/0", 8, 900),
+            system_route("0.0.0.0/0", 7, u32::MAX),
+        ];
+        assert_eq!(windows_xray_uplink(&interfaces, &routes).unwrap(), "Wi-Fi");
+        routes.push(system_route("0.0.0.0/0", 7, 2));
+        assert_eq!(
+            windows_xray_uplink(&interfaces, &routes).unwrap(),
+            "Ethernet"
+        );
+    }
+
+    #[test]
+    fn windows_xray_uplink_falls_back_to_ipv6_default() {
+        let interfaces = [iface("ethernet-id", "Ethernet", InterfaceState::Up)];
+        assert_eq!(
+            windows_xray_uplink(&interfaces, &[system_route("::/0", 1, 10)]).unwrap(),
+            "Ethernet"
+        );
+    }
+
+    #[test]
+    fn windows_xray_uplink_rejects_missing_or_ineligible_physical_defaults() {
+        let ethernet = iface("ethernet-id", "Ethernet", InterfaceState::Up);
+        for routes in [
+            vec![],
+            vec![system_route("192.0.2.0/24", 1, 1)],
+            vec![system_route("0.0.0.0/0", 99, 1)],
+        ] {
+            assert!(windows_xray_uplink(std::slice::from_ref(&ethernet), &routes).is_err());
+        }
+        for variant in 0..7 {
+            let mut interface = ethernet.clone();
+            match variant {
+                0 => interface.state = InterfaceState::Down,
+                1 => interface.physical = false,
+                2 => interface.category = InterfaceCategory::Virtual,
+                3 => interface.kind = InterfaceKind::WireGuard,
+                4 => interface.friendly_name = " ".into(),
+                5 => interface.friendly_name = "auto".into(),
+                _ => interface.friendly_name = "bad\nname".into(),
+            }
+            assert_eq!(
+                windows_xray_uplink(&[interface], &[system_route("0.0.0.0/0", 1, 1)])
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::NotFound
+            );
         }
     }
 
@@ -506,6 +822,24 @@ mod tests {
         );
         unnamed.backend = TunnelBackend::OpenVpn;
         assert_eq!(resolve_install_interface(&unnamed), None);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_xray_tun_install_interface_matches_the_created_adapter() {
+        let mut p = profile("Ethernet");
+        p.backend = TunnelBackend::Xray;
+        p.xray_mode = XrayMode::Tun;
+        assert_eq!(resolve_install_interface(&p).as_deref(), Some("xray-tun"));
+
+        p.xray_tun_interface = Some("  internet0  ".into());
+        assert_eq!(resolve_install_interface(&p).as_deref(), Some("internet0"));
+
+        p.xray_tun_interface = Some("   ".into());
+        assert_eq!(resolve_install_interface(&p), None);
+
+        p.xray_mode = XrayMode::Socks;
+        assert_eq!(resolve_install_interface(&p).as_deref(), Some("Ethernet"));
     }
 
     #[test]

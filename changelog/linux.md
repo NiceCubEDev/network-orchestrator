@@ -10,6 +10,11 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+### Added
+
+- Cancel queued and active subscription delay measurements in the desktop UI,
+  preserving completed results and cleaning up temporary probes.
+
 ### Fixed
 
 - Resolve NetworkManager VPN tunnel interfaces through their shared IPv4/IPv6

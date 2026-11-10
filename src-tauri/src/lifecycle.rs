@@ -8,6 +8,9 @@ use tauri::{Emitter, Manager};
 
 #[cfg(not(target_os = "linux"))]
 pub(crate) async fn cleanup_all(state: &AppState) -> Result<(), String> {
+    state.subscription_measurements.cancel_all();
+    #[cfg(windows)]
+    net_manager_core::netbird::cancel_pending_login();
     let profiles = state.profiles.load().map_err(|e| e.to_string())?.profiles;
     let mut runtime = state.runtime.lock().await;
     let mut errors: Vec<String> = Vec::new();
@@ -83,7 +86,7 @@ async fn exit_cleanup(state: &AppState) -> Result<(), String> {
     }
     #[cfg(target_os = "linux")]
     {
-        let _ = state;
+        state.subscription_measurements.cancel_all();
         Ok(())
     }
 }
@@ -96,6 +99,15 @@ fn should_cleanup_on_ui_exit() -> bool {
 #[cfg(target_os = "linux")]
 fn should_hide_on_close(tray_created: bool) -> bool {
     cfg!(target_os = "linux") && tray_created
+}
+
+#[cfg(windows)]
+fn should_hide_on_windows_close(
+    tray_created: bool,
+    shutting_down: bool,
+    cleanup_complete: bool,
+) -> bool {
+    tray_created && !shutting_down && !cleanup_complete
 }
 
 pub(crate) fn handle_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
@@ -139,6 +151,19 @@ pub(crate) fn handle_window_event(window: &tauri::Window, event: &tauri::WindowE
         if state.cleanup_complete.load(Ordering::SeqCst) {
             return;
         }
+        #[cfg(windows)]
+        if should_hide_on_windows_close(
+            window
+                .app_handle()
+                .tray_by_id(crate::windows_tray::TRAY_ID)
+                .is_some(),
+            state.shutting_down.load(Ordering::SeqCst),
+            state.cleanup_complete.load(Ordering::SeqCst),
+        ) && window.hide().is_ok()
+        {
+            api.prevent_close();
+            return;
+        }
         api.prevent_close();
         if state.shutting_down.swap(true, Ordering::SeqCst) {
             return;
@@ -161,6 +186,13 @@ pub(crate) fn handle_window_event(window: &tauri::Window, event: &tauri::WindowE
 }
 
 pub(crate) fn handle_run_event(app: &tauri::AppHandle, event: tauri::RunEvent) {
+    #[cfg(windows)]
+    if matches!(
+        event,
+        tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
+    ) {
+        net_manager_core::netbird::cancel_pending_login();
+    }
     #[cfg(target_os = "linux")]
     match &event {
         tauri::RunEvent::Ready => crate::diagnostics::record(
@@ -233,6 +265,17 @@ mod tests {
     #[test]
     fn non_linux_ui_exit_keeps_cleanup() {
         assert!(should_cleanup_on_ui_exit());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_close_hides_only_with_a_live_tray_and_no_shutdown() {
+        assert!(should_hide_on_windows_close(true, false, false));
+        assert!(!should_hide_on_windows_close(false, false, false));
+        assert!(!should_hide_on_windows_close(true, true, false));
+        assert!(!should_hide_on_windows_close(false, true, false));
+        assert!(!should_hide_on_windows_close(true, false, true));
+        assert!(!should_hide_on_windows_close(true, true, true));
     }
 
     #[cfg(not(target_os = "linux"))]

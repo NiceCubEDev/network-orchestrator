@@ -5,6 +5,8 @@ use crate::state::RuntimeState;
 use crate::state::{find_profile, AppState};
 #[cfg(not(target_os = "linux"))]
 use net_manager_core::analysis;
+#[cfg(windows)]
+use net_manager_core::connect_plan::windows_xray_uplink;
 #[cfg(not(target_os = "linux"))]
 use net_manager_core::connect_plan::{
     active_profile_conflicts, derive_installable_routes, has_target_interface,
@@ -29,6 +31,49 @@ use net_manager_core::daemon_protocol::{OpenVpnStatusResult, XrayStatusResult};
 use net_manager_engine::linux::*;
 #[cfg(target_os = "linux")]
 use net_manager_engine::linux_credentials::OpenVpnCredentialStore;
+
+#[cfg(windows)]
+fn running_windows_xray_tun_status(
+    profile: &Profile,
+    lookup: impl FnOnce(&Profile) -> TunnelStatus,
+) -> Option<TunnelStatus> {
+    if profile.backend != TunnelBackend::Xray || profile.xray_mode != XrayMode::Tun {
+        return None;
+    }
+    let status = lookup(profile);
+    (status.profile_id == profile.id && status.state == TunnelState::Running).then_some(status)
+}
+
+#[cfg(windows)]
+fn select_windows_xray_tun_name(
+    profile: &Profile,
+    interfaces: &[NetworkInterface],
+) -> Result<String, String> {
+    let occupied = |name: &str| {
+        let name = name.to_lowercase();
+        interfaces.iter().any(|interface| {
+            interface.friendly_name.to_lowercase() == name || interface.name.to_lowercase() == name
+        })
+    };
+    if profile.xray_tun_interface.is_some() {
+        let name = resolve_install_interface(profile)
+            .ok_or_else(|| "invalid Windows TUN interface name".to_string())?;
+        if occupied(&name) {
+            return Err("the Windows TUN interface already exists; stop its owner or choose another TUN interface name".into());
+        }
+        return Ok(name);
+    }
+    (0..=128)
+        .map(|suffix| {
+            if suffix == 0 {
+                "xray-tun".to_string()
+            } else {
+                format!("xray-tun-{suffix}")
+            }
+        })
+        .find(|name| !occupied(name))
+        .ok_or_else(|| "no unused automatic Windows TUN interface name is available".to_string())
+}
 
 #[cfg(test)]
 fn select_connect_ports(
@@ -152,6 +197,15 @@ async fn connect_profile_inner(
     profile.check_role()?;
     #[cfg(not(target_os = "linux"))]
     {
+        #[cfg(windows)]
+        {
+            let mut runtime = state.runtime.lock().await;
+            if let Some(status) =
+                running_windows_xray_tun_status(&profile, |profile| runtime.tunnels.status(profile))
+            {
+                return Ok(status);
+            }
+        }
         if profile.backend != TunnelBackend::None {
             state
                 .resolve_backend_executable(profile.backend)
@@ -178,13 +232,51 @@ async fn connect_profile_inner(
             profile.use_system_proxy = false;
         }
         let mut profiles = state.profiles.load().map_err(|e| e.to_string())?.profiles;
+        #[cfg(windows)]
+        let windows_preflight: Result<_, String> = async {
+            if profile.backend == TunnelBackend::Xray && profile.xray_mode == XrayMode::Tun {
+                let interfaces = explorer::list_interfaces().map_err(|_| {
+                    "cannot inspect physical interfaces for Windows TUN".to_string()
+                })?;
+                let tun_name = select_windows_xray_tun_name(&profile, &interfaces)?;
+                let routes = explorer::list_routes()
+                    .await
+                    .map_err(|_| "cannot inspect default routes for Windows TUN".to_string())?;
+                Ok((
+                    Some(
+                        windows_xray_uplink(&interfaces, &routes)
+                            .map_err(|error| error.to_string())?,
+                    ),
+                    Some(tun_name),
+                ))
+            } else {
+                Ok((None, None))
+            }
+        }
+        .await;
         let mut runtime = state.runtime.lock().await;
+        #[cfg(windows)]
+        if let Some(status) =
+            running_windows_xray_tun_status(&profile, |profile| runtime.tunnels.status(profile))
+        {
+            return Ok(status);
+        }
+        // A concurrent connect can create its interface during preflight. Reuse
+        // its owned child before surfacing an adapter collision from that snapshot.
+        #[cfg(windows)]
+        let (windows_uplink, windows_tun_name) = windows_preflight?;
         cleanup_stale_routes_before_connect(&mut runtime, &profile).await?;
         let port_notice = if profile.backend == TunnelBackend::Xray {
             prepare_xray_listener_ports(state, &mut profile, &mut profiles)?
         } else {
             None
         };
+        // Port preparation may persist this profile. Keep automatic naming in
+        // the saved profile and use the selected alias only for this connection.
+        #[cfg(windows)]
+        if let Some(name) = &windows_tun_name {
+            profile.xray_tun_interface = Some(name.clone());
+        }
         let candidate_analysis = analysis::analyze_profile(&profile)
             .map_err(|e| format!("cannot analyze profile config: {e}"))?;
         let conflicts =
@@ -207,11 +299,21 @@ async fn connect_profile_inner(
                 ));
             }
         }
+        #[cfg(windows)]
+        runtime.tunnels.set_xray_uplink_interface(windows_uplink);
         let mut status = runtime
             .tunnels
             .connect(&profile)
             .map_err(|e| e.to_string())?;
         if let Some(notice) = port_notice {
+            status.message = Some(match status.message.take() {
+                Some(existing) => format!("{existing}; {notice}"),
+                None => notice,
+            });
+        }
+        #[cfg(windows)]
+        if let Some(name) = windows_tun_name.filter(|name| name != "xray-tun") {
+            let notice = format!("using Windows TUN interface '{name}'");
             status.message = Some(match status.message.take() {
                 Some(existing) => format!("{existing}; {notice}"),
                 None => notice,
@@ -250,7 +352,12 @@ async fn connect_profile_inner(
         // AllowedIPs, OpenVPN pushed routes) and install them through
         // `PolicyManager`. This ensures consistent ownership, rollback, and
         // conflict detection regardless of whether policy routes are set.
-        let install_routes = if !profile.routes.is_empty() {
+        let install_routes = if cfg!(target_os = "windows")
+            && profile.backend == TunnelBackend::Xray
+            && profile.xray_mode == XrayMode::Tun
+        {
+            net_manager_core::connect_plan::xray_tun_capture_routes(&profile)
+        } else if !profile.routes.is_empty() {
             profile.routes.clone()
         } else {
             let pushed = if profile.backend == TunnelBackend::OpenVpn {
@@ -775,6 +882,198 @@ pub(crate) async fn probe_openvpn_routes(
 mod tests {
     use super::*;
     use crate::test_support::*;
+
+    #[cfg(windows)]
+    fn xray_tun_status(profile: &Profile, state: TunnelState) -> TunnelStatus {
+        TunnelStatus {
+            profile_id: profile.id.clone(),
+            state,
+            message: Some("existing connection".into()),
+            interface_name: Some("xray-tun-3".into()),
+            failover: None,
+            watchdog: None,
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_xray_tun_reuses_owned_running_status_despite_occupied_explicit_name() {
+        let profile = Profile {
+            id: "owned".into(),
+            backend: TunnelBackend::Xray,
+            xray_mode: XrayMode::Tun,
+            xray_tun_interface: Some("xray-tun".into()),
+            ..Default::default()
+        };
+        let status = running_windows_xray_tun_status(&profile, |queried| {
+            assert_eq!(queried.id, profile.id);
+            xray_tun_status(queried, TunnelState::Running)
+        })
+        .expect("an already owned running connection must be reused");
+        assert_eq!(status.profile_id, profile.id);
+        assert_eq!(status.message.as_deref(), Some("existing connection"));
+        assert_eq!(status.interface_name.as_deref(), Some("xray-tun-3"));
+        assert!(select_windows_xray_tun_name(
+            &profile,
+            &[iface("old-adapter", "xray-tun", InterfaceState::Up)]
+        )
+        .is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_xray_tun_reuse_rejects_other_profiles_modes_and_nonrunning_states() {
+        let mut profile = Profile {
+            id: "owned".into(),
+            backend: TunnelBackend::Xray,
+            xray_mode: XrayMode::Tun,
+            ..Default::default()
+        };
+        for state in [TunnelState::Stopped, TunnelState::Failed] {
+            assert!(running_windows_xray_tun_status(&profile, |profile| {
+                xray_tun_status(profile, state)
+            })
+            .is_none());
+        }
+        assert!(running_windows_xray_tun_status(&profile, |profile| {
+            let mut status = xray_tun_status(profile, TunnelState::Running);
+            status.profile_id = "another-profile".into();
+            status
+        })
+        .is_none());
+        profile.xray_mode = XrayMode::Socks;
+        assert!(running_windows_xray_tun_status(&profile, |_| {
+            panic!("SOCKS profiles keep their existing connect behavior")
+        })
+        .is_none());
+        profile.xray_mode = XrayMode::Tun;
+        profile.backend = TunnelBackend::WireGuard;
+        assert!(running_windows_xray_tun_status(&profile, |_| {
+            panic!("other backends keep their existing connect behavior")
+        })
+        .is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_xray_tun_rechecks_owned_status_after_preflight() {
+        let profile = Profile {
+            id: "concurrent".into(),
+            backend: TunnelBackend::Xray,
+            xray_mode: XrayMode::Tun,
+            xray_tun_interface: Some("xray-tun".into()),
+            ..Default::default()
+        };
+        let mut states = [TunnelState::Stopped, TunnelState::Running].into_iter();
+        assert!(running_windows_xray_tun_status(&profile, |profile| {
+            xray_tun_status(profile, states.next().unwrap())
+        })
+        .is_none());
+        let preflight = select_windows_xray_tun_name(
+            &profile,
+            &[iface(
+                "started-during-preflight",
+                "xray-tun",
+                InterfaceState::Up,
+            )],
+        );
+        assert!(preflight.is_err());
+        let status = running_windows_xray_tun_status(&profile, |profile| {
+            xray_tun_status(profile, states.next().unwrap())
+        })
+        .expect("the second check must reuse a connection started during preflight");
+        assert_eq!(status.state, TunnelState::Running);
+        assert!(states.next().is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_xray_tun_rejects_existing_orphan_name_even_when_down() {
+        let profile = Profile {
+            backend: TunnelBackend::Xray,
+            xray_mode: XrayMode::Tun,
+            xray_tun_interface: Some("Work VPN".into()),
+            ..Default::default()
+        };
+        assert!(select_windows_xray_tun_name(&profile, &[]).is_ok());
+        assert!(select_windows_xray_tun_name(
+            &profile,
+            &[iface("other-id", "other VPN", InterfaceState::Up)]
+        )
+        .is_ok());
+        for state in [InterfaceState::Up, InterfaceState::Down] {
+            let error =
+                select_windows_xray_tun_name(&profile, &[iface("orphan-id", "work vpn", state)])
+                    .unwrap_err();
+            assert!(error.contains("stop its owner or choose another"));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_xray_tun_auto_name_skips_busy_aliases_and_raw_names_without_changing_profile() {
+        let profile = Profile {
+            backend: TunnelBackend::Xray,
+            xray_mode: XrayMode::Tun,
+            ..Default::default()
+        };
+        let interfaces = [
+            iface("old-adapter", "XRAY-TUN", InterfaceState::Down),
+            iface("XrAy-TuN-1", "another adapter", InterfaceState::Up),
+            iface("later-adapter", "xray-tun-3", InterfaceState::Down),
+        ];
+        assert_eq!(
+            select_windows_xray_tun_name(&profile, &[]).unwrap(),
+            "xray-tun"
+        );
+        assert_eq!(
+            select_windows_xray_tun_name(&profile, &interfaces).unwrap(),
+            "xray-tun-2"
+        );
+        assert_eq!(profile.xray_tun_interface, None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_xray_tun_auto_name_search_is_bounded() {
+        let profile = Profile {
+            backend: TunnelBackend::Xray,
+            xray_mode: XrayMode::Tun,
+            ..Default::default()
+        };
+        let interfaces: Vec<_> = (0..=128)
+            .map(|suffix| {
+                let name = if suffix == 0 {
+                    "xray-tun".to_string()
+                } else {
+                    format!("xray-tun-{suffix}")
+                };
+                iface(&name, "occupied", InterfaceState::Down)
+            })
+            .collect();
+        assert!(select_windows_xray_tun_name(&profile, &interfaces).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_xray_tun_explicit_names_preserve_case_and_do_not_fall_back() {
+        let mut profile = Profile {
+            xray_tun_interface: Some(" Work VPN ".into()),
+            backend: TunnelBackend::Xray,
+            xray_mode: XrayMode::Tun,
+            ..Default::default()
+        };
+        assert_eq!(
+            select_windows_xray_tun_name(&profile, &[]).unwrap(),
+            "Work VPN"
+        );
+        profile.xray_tun_interface = Some("xray-tun".into());
+        assert!(select_windows_xray_tun_name(
+            &profile,
+            &[iface("XrAy-TuN", "other alias", InterfaceState::Down)]
+        )
+        .is_err());
+    }
     #[cfg(target_os = "linux")]
     use net_manager_core::daemon_protocol::{OpenVpnConnectionState, OpenVpnWarning};
 

@@ -49,6 +49,8 @@ export class SandboxBackend {
   private serviceAttempts = new Map<string, Map<string, number>>();
   private editRevisions = new Map<string, string>();
   private nextEditRevision = 0;
+  private nextDelayMeasurement = 0;
+  private delayMeasurements = new Map<string, { profileId: string; pending: Set<() => void> }>();
 
   private connectionSets: ConnectionSnippet[] = [];
   private rememberedOpenVpn = new Set<string>();
@@ -1094,17 +1096,48 @@ export class SandboxBackend {
         const poolReport = p.subscription.nodePool ? this.rebuildPool(p) : null;
         return { endpointCount: this.endpoints.length, activeIndex: p.subscription.activeIndex, skippedCount: 0, fallbackUsed: false, cleanupFailed: false, poolReport };
       }
+      case "start_subscription_delay_measurement": {
+        const profile = this.find(args.profileId);
+        if (!profile.subscription) throw new Error("Not a subscription profile");
+        for (const [measurementId, batch] of this.delayMeasurements) {
+          if (batch.profileId === profile.id) this.invoke("cancel_subscription_delay_measurement", { measurementId });
+        }
+        const measurementId = `sandbox-delay-${++this.nextDelayMeasurement}`;
+        this.delayMeasurements.set(measurementId, { profileId: profile.id, pending: new Set() });
+        return measurementId;
+      }
+      case "cancel_subscription_delay_measurement": {
+        const measurementId = String(args.measurementId);
+        const batch = this.delayMeasurements.get(measurementId);
+        if (batch) {
+          this.delayMeasurements.delete(measurementId);
+          for (const cancel of batch.pending) cancel();
+          batch.pending.clear();
+        }
+        return null;
+      }
       case "measure_subscription_endpoint_delay": {
+        const measurementId = args.measurementId;
+        const batch = typeof measurementId === "string" ? this.delayMeasurements.get(measurementId) : undefined;
+        if (measurementId != null && (!batch || batch.profileId !== args.profileId)) {
+          throw new Error("Subscription delay measurement was cancelled");
+        }
         // Deterministic synthetic latency with a real wait, so the browser
         // preview shows probes landing one by one; every fourth one times out.
         const index = Number(args.endpointIndex);
         const delayMs = 60 + ((index * 263) % 900);
         const unreachable = index % 4 === 3;
-        return new Promise((resolve) =>
-          setTimeout(
-            () => resolve(unreachable ? { delayMs: null, error: "delay probe timed out" } : { delayMs, error: null }),
-            unreachable ? 2500 : delayMs * 2,
-          ));
+        return new Promise((resolve, reject) => {
+          const cancel = () => {
+            clearTimeout(timer);
+            reject(new Error("Subscription delay measurement was cancelled"));
+          };
+          const timer = setTimeout(() => {
+            batch?.pending.delete(cancel);
+            resolve(unreachable ? { delayMs: null, error: "delay probe timed out" } : { delayMs, error: null });
+          }, unreachable ? 2500 : delayMs * 2);
+          batch?.pending.add(cancel);
+        });
       }
       case "import_share_link": {
         const link = String(args.link ?? "").trim();

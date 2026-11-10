@@ -521,18 +521,33 @@ fn prepared_routing_config(profile: &Profile) -> io::Result<serde_json::Value> {
     .map_err(|_| invalid_data("failed to apply Xray routing policies"))
 }
 
-fn prepare_xray_config(profile: &Profile) -> io::Result<Vec<u8>> {
+fn prepare_xray_config(profile: &Profile, _windows_uplink: Option<&str>) -> io::Result<Vec<u8>> {
     let with_policies = prepared_routing_config(profile)?;
+    #[cfg(windows)]
+    if profile.xray_mode != crate::models::XrayMode::Tun
+        && crate::xray::has_tun_inbound(&with_policies)
+    {
+        return Err(invalid_data(
+            "this Xray config contains a TUN inbound; select TUN mode before connecting",
+        ));
+    }
     let merged = if profile.xray_mode == crate::models::XrayMode::Tun {
-        crate::xray::apply_tun_inbound(
+        #[cfg(windows)]
+        let tun = crate::xray::apply_windows_tun_inbound(
+            &with_policies,
+            profile,
+            _windows_uplink
+                .ok_or_else(|| invalid_data("a physical Windows uplink interface is required"))?,
+        );
+        #[cfg(not(windows))]
+        let tun = crate::xray::apply_tun_inbound(
             &with_policies,
             profile.xray_tun_interface.as_deref(),
             profile.xray_tun_ip.as_deref(),
-        )
-        .map_err(|err| {
+        );
+        tun.map_err(|err| {
             invalid_data(format!(
-                "failed to apply TUN inbound to '{}': {err}",
-                profile.config_path.display()
+                "failed to prepare Xray TUN interface settings: {err}"
             ))
         })?
     } else {
@@ -558,12 +573,28 @@ fn use_asset_dir(command: &mut Command, asset_dir: Option<&Path>) {
     }
 }
 
+#[cfg(windows)]
+fn windows_xray_validation_config(config: &[u8]) -> io::Result<Vec<u8>> {
+    let doc: serde_json::Value = serde_json::from_slice(config)
+        .map_err(|_| invalid_data("invalid Xray validation config"))?;
+    if !crate::xray::has_tun_inbound(&doc) {
+        return Ok(config.to_vec());
+    }
+    // Xray's -test constructs handlers too; never create a real TUN during preflight.
+    serde_json::to_vec(&crate::xray::strip_tun_inbound(&doc))
+        .map_err(|_| invalid_data("failed to prepare Xray validation config"))
+}
+
 /// [`run_xray_validation`] with the geo data the connection will run with.
 pub fn run_xray_validation_with_assets(
     exe: &Path,
     config: &[u8],
     asset_dir: Option<&Path>,
 ) -> io::Result<()> {
+    #[cfg(windows)]
+    let safe_config = windows_xray_validation_config(config)?;
+    #[cfg(windows)]
+    let config = safe_config.as_slice();
     let spec = xray_command_spec(exe, true);
     let mut command = Command::new(&spec.program);
     use_asset_dir(&mut command, asset_dir);
@@ -1002,6 +1033,8 @@ pub struct TunnelManager {
     wireguard_exe: Option<PathBuf>,
     openvpn_exe: Option<PathBuf>,
     xray_exe: Option<PathBuf>,
+    #[cfg(windows)]
+    xray_uplink_interface: Option<String>,
     log_dir: Option<PathBuf>,
     wireguard_services: HashSet<String>,
     wireguard_transient_configs: HashMap<String, PathBuf>,
@@ -1043,6 +1076,11 @@ impl TunnelManager {
         }
     }
 
+    #[cfg(windows)]
+    pub fn set_xray_uplink_interface(&mut self, interface: Option<String>) {
+        self.xray_uplink_interface = interface;
+    }
+
     pub fn with_executables(wireguard: Option<PathBuf>, openvpn: Option<PathBuf>) -> Self {
         Self::with_all_executables(wireguard, openvpn, None)
     }
@@ -1056,6 +1094,8 @@ impl TunnelManager {
             wireguard_exe: wireguard,
             openvpn_exe: openvpn,
             xray_exe: xray,
+            #[cfg(windows)]
+            xray_uplink_interface: None,
             log_dir: None,
             wireguard_services: HashSet::new(),
             wireguard_transient_configs: HashMap::new(),
@@ -1324,7 +1364,11 @@ impl TunnelManager {
             ));
         }
         let executable = resolve_xray_executable(self.xray_exe.as_deref())?;
-        let config = prepare_xray_config(profile)?;
+        #[cfg(windows)]
+        let uplink = self.xray_uplink_interface.as_deref();
+        #[cfg(not(windows))]
+        let uplink = None;
+        let config = prepare_xray_config(profile, uplink)?;
         let assets = self.xray_asset_dirs.get(&profile.id).cloned();
         run_xray_validation_with_assets(&executable, &config, assets.as_deref())?;
         Ok(PreparedXrayConnection {
@@ -1365,6 +1409,19 @@ impl TunnelManager {
         let executable = resolve_xray_executable(self.xray_exe.as_deref())?;
         if executable != prepared.executable {
             return Err(invalid_data("prepared Xray executable changed"));
+        }
+        #[cfg(windows)]
+        {
+            let config: serde_json::Value = serde_json::from_slice(&prepared.config)
+                .map_err(|_| invalid_data("invalid prepared Xray config"))?;
+            if crate::xray::has_tun_inbound(&config) {
+                if profile.xray_mode != crate::models::XrayMode::Tun {
+                    return Err(invalid_data(
+                        "select TUN mode before connecting this Xray config",
+                    ));
+                }
+                crate::managed_xray::verify_windows_tun_support(&executable)?;
+            }
         }
         let (out, err) = self.child_log_stdio(&profile.id, "xray")?;
         let mut child = spawn_xray(
@@ -2155,7 +2212,7 @@ mod tests {
             },
         ];
 
-        let bytes = prepare_xray_config(&profile).unwrap();
+        let bytes = prepare_xray_config(&profile, None).unwrap();
         let doc: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let rules = doc["routing"]["rules"].as_array().unwrap();
         assert_eq!(rules.len(), 3);
@@ -2183,7 +2240,7 @@ mod tests {
             target: DomainRouteTarget::Block,
         }];
         let config: serde_json::Value =
-            serde_json::from_slice(&prepare_xray_config(&profile).unwrap()).unwrap();
+            serde_json::from_slice(&prepare_xray_config(&profile, None).unwrap()).unwrap();
         assert_eq!(
             config["routing"]["rules"][0]["ip"],
             serde_json::json!(["geoip:us"])
@@ -2194,6 +2251,42 @@ mod tests {
         );
         assert_eq!(config["routing"]["rules"][2]["ip"][0], "10.0.0.0/8");
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_socks_profile_rejects_raw_tun_before_launch() {
+        let dir = unique_dir("windows-socks-raw-tun");
+        let path = dir.join("node.json");
+        fs::write(&path, r#"{"inbounds":[{"protocol":"tun","settings":{"name":"unexpected"}}],"outbounds":[{"protocol":"freedom","tag":"synthetic-private-value"}]}"#).unwrap();
+        let mut profile = xray_profile();
+        profile.config_path = path;
+        profile.xray_mode = crate::models::XrayMode::Socks;
+        let error = prepare_xray_config(&profile, None).unwrap_err();
+        assert!(error.to_string().contains("TUN mode"));
+        assert!(!error.to_string().contains("synthetic-private-value"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_xray_validation_never_constructs_a_tun_handler() {
+        let original = serde_json::json!({
+            "inbounds": [
+                {"protocol": "TuN", "settings": {"name": "must-not-be-created"}},
+                {"protocol": "http", "listen": "127.0.0.1", "port": 10809}
+            ],
+            "outbounds": [{"protocol": "freedom"}]
+        });
+        let bytes = serde_json::to_vec(&original).unwrap();
+        let validation: serde_json::Value =
+            serde_json::from_slice(&windows_xray_validation_config(&bytes).unwrap()).unwrap();
+        assert!(!crate::xray::has_tun_inbound(&validation));
+        assert_eq!(validation["inbounds"].as_array().unwrap().len(), 1);
+        assert_eq!(validation["outbounds"], original["outbounds"]);
+        let invalid = b"{invalid synthetic config}";
+        let error = windows_xray_validation_config(invalid).unwrap_err();
+        assert!(!error.to_string().contains("synthetic"));
     }
 
     #[test]
@@ -2236,7 +2329,7 @@ mod tests {
         let mut profile = xray_profile();
         profile.config_path = path.clone();
 
-        let err = prepare_xray_config(&profile).unwrap_err();
+        let err = prepare_xray_config(&profile, None).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("node.json"));
         assert!(!err.to_string().contains(sentinel));
@@ -2258,7 +2351,7 @@ mod tests {
         profile.id = "node-dpapi".into();
         profile.config_path = path;
 
-        let bytes = prepare_xray_config(&profile).unwrap();
+        let bytes = prepare_xray_config(&profile, None).unwrap();
         let doc: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(doc["outbounds"][0]["protocol"], "vless");
         fs::remove_dir_all(&dir).unwrap();

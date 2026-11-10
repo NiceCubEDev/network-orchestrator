@@ -90,6 +90,7 @@ interface ProfileDetailProps {
   delayResults: Record<number, SubscriptionDelayResult> | undefined;
   measuringEndpoints: Set<string>;
   measuringAll: boolean;
+  cancellingMeasurement: boolean;
   switching: boolean;
   refreshingSubscription: boolean;
   settingRefreshInterval: boolean;
@@ -136,6 +137,7 @@ export default function ProfileDetail({
   delayResults,
   measuringEndpoints,
   measuringAll,
+  cancellingMeasurement,
   switching,
   refreshingSubscription,
   settingRefreshInterval,
@@ -730,19 +732,14 @@ export default function ProfileDetail({
                 className="btn-sm btn-with-icon"
                 onClick={onMeasureAllEndpoints}
                 disabled={
-                  measuringAll ||
-                  switching ||
-                  refreshingSubscription ||
-                  isBusy
+                  cancellingMeasurement ||
+                  (!measuringAll && (switching || refreshingSubscription || isBusy))
                 }
-                title={t("detail.testAllTitle")}
+                title={measuringAll ? t("Cancel measurement") : t("detail.testAllTitle")}
               >
                 {measuringAll && <SpinnerIcon size={12} />}
                 {measuringAll
-                  ? t("detail.testingProgress", {
-                      done: Object.keys(delayResults ?? {}).length,
-                      total: liveEndpoints.length,
-                    })
+                  ? t("Cancel measurement")
                   : t("detail.testAll")}
               </button>
             </div>
@@ -759,27 +756,28 @@ export default function ProfileDetail({
             )}
             <ul className="endpoint-list">
               {endpoints.map((ep, i) => {
+                const active = !ep.isMissing && i === subscription?.activeIndex;
                 const res = delayResults?.[i];
                 const measuring = measuringEndpoints.has(`${profile.id}:${i}`);
                 const order = backupOrder.get(ep.key);
                 const live = failover?.nodes.find((n) => n.key === ep.key);
                 return (
-                  <li key={ep.key} className="endpoint-row">
+                  <li key={`${ep.key}:${i}`} className="endpoint-row">
                     <button
                       type="button"
-                      className={`endpoint-item ${ep.active ? "active" : ""}`}
+                      className={`endpoint-item ${active ? "active" : ""}`}
                       onClick={() => onSwitchEndpoint(ep.key)}
                       disabled={
                         ep.isMissing ||
                         switching ||
                         refreshingSubscription ||
                         isBusy ||
-                        ep.active
+                        active
                       }
                       title={
                         ep.isMissing
                           ? t("detail.missingEndpoint")
-                          : ep.active
+                          : active
                             ? t("detail.activeEndpoint")
                             : status.state === "running"
                               ? t("detail.switchEndpointReconnect")
@@ -787,7 +785,7 @@ export default function ProfileDetail({
                       }
                     >
                       <span
-                        className={`endpoint-item-dot ${ep.active ? "on" : ""}`}
+                        className={`endpoint-item-dot ${active ? "on" : ""}`}
                       />
                       <span className="endpoint-item-name">
                         {endpointDisplay?.names[i] ?? ep.name}

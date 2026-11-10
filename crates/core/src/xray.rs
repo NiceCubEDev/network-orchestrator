@@ -1984,7 +1984,11 @@ pub fn apply_tun_inbound(
 
     // Remove existing SOCKS inbound(s) — TUN mode replaces system-proxy-based
     // traffic capture with interface-level capture.
-    inbounds.retain(|inbound| inbound["protocol"].as_str() != Some("socks"));
+    inbounds.retain(|inbound| {
+        !inbound["protocol"]
+            .as_str()
+            .is_some_and(|protocol| protocol.eq_ignore_ascii_case("socks"))
+    });
 
     // TUN traffic arrives as bare IP packets; sniffing recovers the TLS
     // SNI / HTTP Host so domain and geosite routing rules can match. With
@@ -2011,6 +2015,68 @@ pub fn apply_tun_inbound(
         },
     });
     inbounds.insert(0, tun_inbound);
+    Ok(doc)
+}
+
+/// Windows interface setup; capture routes are owned by the app's PolicyManager.
+pub fn apply_windows_tun_inbound(
+    base: &Value,
+    profile: &crate::models::Profile,
+    uplink: &str,
+) -> io::Result<Value> {
+    profile.check_role().map_err(invalid_input)?;
+    let uplink = uplink.trim();
+    if uplink.is_empty()
+        || uplink.eq_ignore_ascii_case("auto")
+        || uplink.encode_utf16().count() > 255
+        || uplink.chars().any(char::is_control)
+    {
+        return Err(invalid_input(
+            "a physical Windows uplink interface is required",
+        ));
+    }
+    let name = profile
+        .xray_tun_interface
+        .as_deref()
+        .unwrap_or("xray-tun")
+        .trim();
+    if name.is_empty() || name.encode_utf16().count() > 255 || name.chars().any(char::is_control) {
+        return Err(invalid_input("invalid Windows TUN interface name"));
+    }
+    let gateways = crate::connect_plan::windows_xray_tun_gateways(profile)?;
+    let mtu = profile.xray_tun_mtu.unwrap_or(1500);
+    if !(512..=9000).contains(&mtu) {
+        return Err(invalid_input("invalid Windows TUN MTU"));
+    }
+    if gateways.iter().any(|address| address.addr().is_ipv6()) && mtu < 1280 {
+        return Err(invalid_input(
+            "IPv6 TUN capture requires an MTU of at least 1280",
+        ));
+    }
+    let mut doc = base.clone();
+    if let Some(inbounds) = doc.get_mut("inbounds").and_then(Value::as_array_mut) {
+        inbounds.retain(|inbound| {
+            !inbound["protocol"]
+                .as_str()
+                .is_some_and(|protocol| protocol.eq_ignore_ascii_case("tun"))
+        });
+    }
+    let mut doc = apply_tun_inbound(&doc, None, None)?;
+    let mut settings = json!({
+        "name": name,
+        "gateway": gateways.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "mtu": mtu,
+        "autoOutboundsInterface": uplink,
+    });
+    // Leave other interfaces and NetBird's private DNS policy untouched.
+    if !profile.xray_tun_dns_servers.is_empty() {
+        settings["dns"] = json!(profile
+            .xray_tun_dns_servers
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>());
+    }
+    doc["inbounds"][0]["settings"] = settings;
     Ok(doc)
 }
 
@@ -2045,7 +2111,11 @@ pub fn apply_macos_tun_inbound(base: &Value, mtu: u32, uplink: &str) -> io::Resu
         .as_array_mut()
         .ok_or_else(|| invalid_data("xray config inbounds must be an array"))?;
 
-    inbounds.retain(|inbound| inbound["protocol"].as_str() != Some("socks"));
+    inbounds.retain(|inbound| {
+        !inbound["protocol"]
+            .as_str()
+            .is_some_and(|protocol| protocol.eq_ignore_ascii_case("socks"))
+    });
 
     // TUN traffic arrives as bare IP packets; sniffing recovers the TLS
     // SNI / HTTP Host so domain and geosite routing rules can match. With
@@ -2426,7 +2496,11 @@ fn hijack_routed_domains(root: &mut Map<String, Value>, domains: &[Value]) {
 pub fn strip_tun_inbound(base: &Value) -> Value {
     let mut doc = base.clone();
     if let Some(inbounds) = doc.get_mut("inbounds").and_then(Value::as_array_mut) {
-        inbounds.retain(|inbound| inbound["protocol"].as_str() != Some("tun"));
+        inbounds.retain(|inbound| {
+            !inbound["protocol"]
+                .as_str()
+                .is_some_and(|protocol| protocol.eq_ignore_ascii_case("tun"))
+        });
     }
     doc
 }
@@ -2436,9 +2510,11 @@ pub fn has_tun_inbound(config: &Value) -> bool {
     config["inbounds"]
         .as_array()
         .map(|inbounds| {
-            inbounds
-                .iter()
-                .any(|inbound| inbound["protocol"].as_str() == Some("tun"))
+            inbounds.iter().any(|inbound| {
+                inbound["protocol"]
+                    .as_str()
+                    .is_some_and(|protocol| protocol.eq_ignore_ascii_case("tun"))
+            })
         })
         .unwrap_or(false)
 }
@@ -3436,6 +3512,94 @@ mod tests {
             result["routing"]["rules"][0],
             json!({"type": "field", "domain": ["a.com"], "outboundTag": "p"})
         );
+    }
+
+    #[test]
+    fn windows_tun_uses_pinned_xray_schema_and_app_owned_routes() {
+        let profile = crate::models::Profile {
+            xray_mode: crate::models::XrayMode::Tun,
+            ..Default::default()
+        };
+        let base = json!({
+            "inbounds": [{"protocol": "socks", "port": 10808}],
+            "outbounds": [{"tag": "proxy", "protocol": "vless"}],
+        });
+        let config = apply_windows_tun_inbound(&base, &profile, "Ethernet").unwrap();
+        let settings = &config["inbounds"][0]["settings"];
+        assert_eq!(settings["name"], "xray-tun");
+        assert_eq!(settings["gateway"][0], "172.19.0.1/30");
+        assert!(settings["gateway"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|gateway| gateway.as_str().unwrap().contains(':')));
+        assert_eq!(settings["autoOutboundsInterface"], "Ethernet");
+        assert!(settings.get("autoSystemRoutingTable").is_none());
+        assert!(settings.get("interfaceName").is_none());
+        assert!(settings.get("ip").is_none());
+        assert!(settings.get("dns").is_none());
+        assert_eq!(config["outbounds"], base["outbounds"]);
+    }
+
+    #[test]
+    fn windows_tun_preserves_explicit_interface_dns_and_capture_family() {
+        let profile = crate::models::Profile {
+            xray_mode: crate::models::XrayMode::Tun,
+            xray_tun_interface: Some(" Work VPN ".into()),
+            xray_tun_ip: Some("10.5.0.1/24".into()),
+            xray_tun_mtu: Some(1400),
+            xray_tun_dns_servers: vec!["9.9.9.9".parse().unwrap()],
+            routes: vec![crate::models::PolicyRoute {
+                destination: "192.0.2.0/24".parse().unwrap(),
+                metric: 5,
+                via: None,
+            }],
+            ..Default::default()
+        };
+        let config = apply_windows_tun_inbound(&json!({}), &profile, "Ethernet").unwrap();
+        let settings = &config["inbounds"][0]["settings"];
+        assert_eq!(settings["name"], "Work VPN");
+        assert_eq!(settings["gateway"], json!(["10.5.0.1/24"]));
+        assert_eq!(settings["mtu"], 1400);
+        assert_eq!(settings["dns"], json!(["9.9.9.9"]));
+    }
+
+    #[test]
+    fn windows_tun_replaces_existing_tun_without_duplicate_interfaces() {
+        let base = json!({"inbounds": [
+            {"protocol": "TUN", "settings": {"name": "old-tun"}},
+            {"protocol": "SOCKS", "port": 10808},
+            {"protocol": "http", "listen": "127.0.0.1", "port": 10809}
+        ]});
+        let config = apply_windows_tun_inbound(&base, &Default::default(), "Ethernet").unwrap();
+        let inbounds = config["inbounds"].as_array().unwrap();
+        assert_eq!(inbounds.len(), 2);
+        assert_eq!(inbounds[0]["protocol"], "tun");
+        assert_eq!(inbounds[1]["protocol"], "http");
+    }
+
+    #[test]
+    fn windows_tun_rejects_invalid_interface_address_or_mtu() {
+        for name in ["", "bad\nname"] {
+            let profile = crate::models::Profile {
+                xray_tun_interface: Some(name.into()),
+                ..Default::default()
+            };
+            assert!(apply_windows_tun_inbound(&json!({}), &profile, "Ethernet").is_err());
+        }
+        let profile = crate::models::Profile {
+            xray_tun_ip: Some("not-an-address".into()),
+            ..Default::default()
+        };
+        assert!(apply_windows_tun_inbound(&json!({}), &profile, "Ethernet").is_err());
+        let profile = crate::models::Profile {
+            xray_tun_mtu: Some(1),
+            ..Default::default()
+        };
+        assert!(apply_windows_tun_inbound(&json!({}), &profile, "Ethernet").is_err());
+        for uplink in ["", "auto", "bad\nname"] {
+            assert!(apply_windows_tun_inbound(&json!({}), &Default::default(), uplink).is_err());
+        }
     }
 
     #[test]

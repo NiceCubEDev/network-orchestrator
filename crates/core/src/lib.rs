@@ -28,7 +28,7 @@ mod macos_inventory;
 pub mod macos_vpn;
 pub mod managed_xray;
 pub mod models;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub mod netbird;
 pub mod node_pool;
 pub mod openvpn_config;
@@ -45,6 +45,8 @@ pub mod route_plan;
 pub mod route_state;
 pub mod service_checks;
 pub mod subscription;
+#[cfg(windows)]
+pub mod subscription_hwid;
 pub mod system_proxy;
 pub mod vpn;
 pub mod windows_job;

@@ -22,6 +22,9 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ### Changed
 
+- Refresh the shared English/Russian catalogs for subscription and desktop
+  runtime controls.
+
 - **Breaking:** `netorch up` now detaches by default, and quitting the GUI no
   longer disconnects shared connections. Use `down` explicitly or migrate
   foreground scripts to `up --foreground` (`-f`). Foreground exit releases only

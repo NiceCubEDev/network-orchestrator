@@ -1,7 +1,8 @@
 //! NetBird next to the managed tunnels: the app drives the user's own NetBird
 //! daemon through its CLI (`netbird status|up|down`), exactly as a terminal
-//! would. Nothing here is privileged; the setup key goes to the CLI through a
-//! 0600 file, never the command line, and is not stored.
+//! would. The installed daemon owns privileged network changes; the setup key
+//! goes to the CLI through a private file, never the command line, and is not
+//! stored.
 
 use crate::state::AppState;
 use serde_json::Value;
@@ -22,7 +23,17 @@ fn runtime_dir(state: &AppState) -> std::path::PathBuf {
         })
 }
 
-#[cfg(unix)]
+#[cfg(windows)]
+fn runtime_dir(state: &AppState) -> std::path::PathBuf {
+    state
+        .config_vault
+        .root()
+        .parent()
+        .expect("config vault is under the application data directory")
+        .join("runtime")
+}
+
+#[cfg(any(unix, windows))]
 async fn blocking<T: Send + 'static>(
     work: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, String> {
@@ -40,12 +51,12 @@ pub(crate) async fn netbird_status(state: State<'_, AppState>) -> Result<Value, 
         let root = state.data_dir().to_path_buf();
         blocking(move || net_manager_engine::linux_services::netbird_status(&root)).await?
     }
-    #[cfg(all(unix, not(target_os = "linux")))]
+    #[cfg(any(windows, all(unix, not(target_os = "linux"))))]
     {
         let _ = state;
         blocking(|| net_manager_core::netbird::NetBird::detect().status()).await
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = state;
         Ok(serde_json::json!({"installed": false, "state": "notInstalled"}))
@@ -72,7 +83,7 @@ pub(crate) async fn netbird_up(
         })
         .await?
     }
-    #[cfg(all(unix, not(target_os = "linux")))]
+    #[cfg(any(windows, all(unix, not(target_os = "linux"))))]
     {
         let runtime = runtime_dir(&state);
         blocking(move || {
@@ -82,7 +93,7 @@ pub(crate) async fn netbird_up(
         })
         .await?
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (management_url, setup_key, state);
         Err("NetBird control is not available on this platform".into())
@@ -96,12 +107,12 @@ pub(crate) async fn netbird_down(state: State<'_, AppState>) -> Result<Value, St
         let root = state.data_dir().to_path_buf();
         blocking(move || net_manager_engine::linux_services::netbird_down(&root)).await?
     }
-    #[cfg(all(unix, not(target_os = "linux")))]
+    #[cfg(any(windows, all(unix, not(target_os = "linux"))))]
     {
         let _ = state;
         blocking(|| net_manager_core::netbird::NetBird::detect().down()).await?
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = state;
         Err("NetBird control is not available on this platform".into())

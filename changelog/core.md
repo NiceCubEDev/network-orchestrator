@@ -10,6 +10,13 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+### Added
+
+- Windows Xray TUN configuration, physical-uplink selection and verified managed
+  Wintun assets, with app-owned capture routes and address-aware readiness.
+- Windows NetBird service control with bounded commands and private setup-key
+  handling, plus automatic device identifiers for subscription imports.
+
 ### Fixed
 
 - Resolve Windows adapter identifiers to their friendly names and preserve netsh

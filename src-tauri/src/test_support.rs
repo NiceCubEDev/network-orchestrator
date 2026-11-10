@@ -111,6 +111,7 @@ pub(crate) fn app_state(dir: &Path) -> AppState {
     AppState {
         profiles: ProfileStore::new(dir.join("profiles.json")),
         config_vault: ConfigVault::new(dir.join("configs")),
+        subscription_measurements: Default::default(),
         #[cfg(not(target_os = "linux"))]
         backend_settings: BackendSettingsStore::new(dir.join("backend-settings.json")),
         #[cfg(not(target_os = "linux"))]

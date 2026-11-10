@@ -509,6 +509,27 @@ See [`docs/testing.md`](docs/testing.md) for isolated packet evidence and limits
   the app; an external Xray (`xray.exe`) install is optional because a
   verified managed install exists.
 
+### Windows subscriptions and NetBird
+
+Import a subscription through **Import → Subscription** to choose its servers
+inside the app. If the provider requires an HWID, use **Generate automatically**
+or enter the HWID already registered with that provider. A generated identifier
+is stable for this Windows installation; it can count as an additional device
+at the provider. Supported inputs are VLESS/Hysteria2 share-link subscriptions
+and full Xray JSON subscriptions.
+
+New Windows Xray imports use TUN mode; saved profiles retain their previous
+mode. Install managed Xray from Settings before connecting. Its pinned package
+includes Wintun. The app owns capture routes and rollback and selects a physical
+uplink for Xray; NetBird keeps its own more-specific private routes and DNS.
+Native simultaneous-traffic and crash-recovery acceptance is still pending.
+
+Install and sign in to the official NetBird Windows service once, then use its
+service row in Profiles for status/connect/disconnect. The app talks to the
+installed daemon rather than importing NetBird keys. Generic detected adapters
+are read-only on Windows; they are not VPN profile controls. Windows background
+service/CLI parity remains outside this implementation.
+
 ### Quality gates
 
 ```bash

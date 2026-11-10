@@ -3,6 +3,7 @@ use crate::elevation;
 use crate::state::AppState;
 #[cfg(not(target_os = "linux"))]
 use crate::state::{existing_profile_for_update, find_profile};
+use crate::subscription_measurements::cancellable_measurement;
 #[cfg(all(test, not(target_os = "linux")))]
 use net_manager_core::config_security;
 #[cfg(not(target_os = "linux"))]
@@ -22,9 +23,46 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, Manager, State};
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(test, not(target_os = "linux")))]
 use net_manager_core::subscription::MAX_SUBSCRIPTION_BODY_BYTES;
 static SUBSCRIPTION_REFRESH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[tauri::command]
+pub(crate) fn start_subscription_delay_measurement(
+    profile_id: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    subscription_profile(&state.profiles, &profile_id)?;
+    Ok(state.subscription_measurements.start(&profile_id))
+}
+
+#[tauri::command]
+pub(crate) fn cancel_subscription_delay_measurement(
+    measurement_id: String,
+    state: State<'_, AppState>,
+) {
+    state.subscription_measurements.cancel(&measurement_id);
+}
+
+#[tauri::command]
+pub(crate) fn generate_subscription_hwid() -> Result<String, String> {
+    #[cfg(windows)]
+    {
+        net_manager_core::subscription_hwid::generate_windows_hwid()
+            .map_err(|_| "Could not generate a device ID. Enter an HWID manually.".to_string())
+    }
+    #[cfg(not(windows))]
+    Err("Could not generate a device ID. Enter an HWID manually.".into())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn imported_xray_mode() -> XrayMode {
+    if cfg!(windows) {
+        XrayMode::Tun
+    } else {
+        XrayMode::platform_default()
+    }
+}
 
 #[cfg(not(target_os = "linux"))]
 fn validate_refresh_interval(minutes: Option<u32>) -> Result<(), String> {
@@ -600,7 +638,7 @@ pub(crate) async fn import_share_link(
         &generate_import_id(0),
         &name,
         &link,
-        net_manager_core::models::XrayMode::platform_default(),
+        imported_xray_mode(),
         loopback_port_available,
     )
     .map_err(|error| match error.kind() {
@@ -632,7 +670,7 @@ pub(crate) async fn import_configs_batch(
         &state.profiles,
         &paths,
         default_backend,
-        net_manager_core::models::XrayMode::platform_default(),
+        imported_xray_mode(),
     )
     .map(redact_batch_import_for_ipc)
     .map_err(|e| e.to_string())
@@ -671,22 +709,6 @@ pub(crate) async fn import_subscription_into(
         refresh_interval_minutes,
         fetched.meta,
     )
-}
-
-#[cfg(not(target_os = "linux"))]
-async fn read_subscription_response(mut response: reqwest::Response) -> Result<String, String> {
-    let mut bytes = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|_| "failed to read subscription body".to_string())?
-    {
-        if chunk.len() > MAX_SUBSCRIPTION_BODY_BYTES - bytes.len() {
-            return Err("subscription body exceeds size limit".into());
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-    String::from_utf8(bytes).map_err(|_| "subscription body is not UTF-8".to_string())
 }
 
 #[cfg(all(test, not(target_os = "linux")))]
@@ -732,7 +754,7 @@ fn import_subscription_body_into_with_metadata(
         &request,
         body,
         meta,
-        net_manager_core::models::XrayMode::platform_default(),
+        imported_xray_mode(),
         loopback_port_available,
     )
     .map_err(|error| {
@@ -777,7 +799,6 @@ pub(crate) struct SubscriptionRefreshResult {
     pub pool_report: Option<net_manager_core::node_pool::NodePoolReport>,
 }
 
-#[cfg(not(target_os = "linux"))]
 fn subscription_profile(
     store: &net_manager_core::profiles::ProfileStore,
     id: &str,
@@ -816,25 +837,21 @@ async fn refresh_subscription_into_with_ports(
 ) -> Result<SubscriptionRefreshResult, String> {
     let profile = subscription_profile(store, id)?;
     let subscription = profile.subscription.as_ref().unwrap();
-    let response = client
-        .get(&subscription.url)
-        .header("X-HWID", &subscription.hwid)
-        .send()
-        .await
-        .map_err(|_| "subscription refresh fetch failed".to_string())?;
-    if !response.status().is_success() {
-        return Err(format!(
-            "subscription refresh returned HTTP {}",
-            response.status()
-        ));
-    }
-    let headers = response.headers().clone();
-    let body = read_subscription_response(response).await?;
-    let meta = net_manager_core::subscription::response_meta_from_headers(&headers, &body);
+    let fetched =
+        net_manager_core::subscription::fetch(client, &subscription.url, &subscription.hwid)
+            .await
+            .map_err(|error| error.to_string())?;
     if subscription_profile(store, id)? != profile {
         return Err("subscription changed during refresh".into());
     }
-    refresh_subscription_body_into_with_metadata(vault, store, id, &body, available, meta)
+    refresh_subscription_body_into_with_metadata(
+        vault,
+        store,
+        id,
+        &fetched.body,
+        available,
+        fetched.meta,
+    )
 }
 
 #[cfg(all(test, not(target_os = "linux")))]
@@ -1060,11 +1077,8 @@ pub(crate) async fn refresh_subscription(
     let _guard = SUBSCRIPTION_REFRESH_LOCK.lock().await;
     let profile = subscription_profile(&state.profiles, &id)?;
     ensure_profile_stopped(&state, &profile, "refreshing subscription").await?;
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .user_agent(net_manager_core::subscription::SUBSCRIPTION_USER_AGENT)
-        .build()
-        .map_err(|_| "failed to build subscription HTTP client".to_string())?;
+    let client =
+        net_manager_core::subscription::http_client().map_err(|error| error.to_string())?;
     let result =
         refresh_subscription_into(&state.config_vault, &state.profiles, &client, &id).await;
 
@@ -1083,11 +1097,7 @@ pub(crate) async fn refresh_subscription(
 
 pub(crate) async fn run_subscription_refresh_loop(app: tauri::AppHandle) {
     #[cfg(not(target_os = "linux"))]
-    let Ok(client) = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .user_agent(net_manager_core::subscription::SUBSCRIPTION_USER_AGENT)
-        .build()
-    else {
+    let Ok(client) = net_manager_core::subscription::http_client() else {
         return;
     };
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -1217,8 +1227,13 @@ async fn measure_delay_with_process(
 pub(crate) async fn measure_subscription_endpoint_delay(
     profile_id: String,
     endpoint_index: usize,
+    measurement_id: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<SubscriptionDelayResult, String> {
+    let cancelled = measurement_id
+        .as_deref()
+        .map(|id| state.subscription_measurements.receiver(&profile_id, id))
+        .transpose()?;
     let _profile = subscription_profile(&state.profiles, &profile_id)?;
     let endpoints = state
         .config_vault
@@ -1233,11 +1248,14 @@ pub(crate) async fn measure_subscription_endpoint_delay(
     let mut command = tokio::process::Command::new(executable.path);
     command.args(["run", "-config", "stdin:"]);
     Ok(
-        match measure_delay_with_process(
-            &endpoint.url,
-            command,
-            DELAY_PROBE_URL,
-            DELAY_PROBE_TIMEOUT,
+        match cancellable_measurement(
+            cancelled,
+            measure_delay_with_process(
+                &endpoint.url,
+                command,
+                DELAY_PROBE_URL,
+                DELAY_PROBE_TIMEOUT,
+            ),
         )
         .await
         {
@@ -2242,10 +2260,18 @@ pub(crate) async fn refresh_subscription(
 pub(crate) async fn measure_subscription_endpoint_delay(
     profile_id: String,
     endpoint_index: usize,
+    measurement_id: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<net_manager_engine::linux_profiles::SubscriptionDelayResult, String> {
+    let cancelled = measurement_id
+        .as_deref()
+        .map(|id| state.subscription_measurements.receiver(&profile_id, id))
+        .transpose()?;
     linux_profiles_operation(state.inner(), move |service| {
-        profile_network(service.measure_endpoint_delay(&profile_id, endpoint_index))
+        profile_network(cancellable_measurement(
+            cancelled,
+            service.measure_endpoint_delay(&profile_id, endpoint_index),
+        ))
     })
     .await
 }
@@ -2417,6 +2443,14 @@ pub(crate) async fn apply_xray_policy_migration(
 #[cfg(all(test, not(target_os = "linux")))]
 mod native_tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_xray_imports_capture_internet_without_changing_stored_defaults() {
+        assert_eq!(imported_xray_mode(), XrayMode::Tun);
+        // Older saved documents missing xrayMode retain their SOCKS behavior.
+        assert_eq!(XrayMode::default(), XrayMode::Socks);
+    }
     use crate::test_support::*;
     use base64::Engine;
     use std::fs;
@@ -3737,7 +3771,7 @@ mod native_tests {
         .await
         .unwrap_err();
         server.await.unwrap();
-        assert!(err.contains("size limit"));
+        assert!(err.contains("4 MiB"));
         assert!(!err.contains("private-token"));
         assert_eq!(store.load().unwrap().profiles[0], old);
         fs::remove_dir_all(&dir).unwrap();

@@ -42,6 +42,7 @@ export default function ImportModal({
   const [linkName, setLinkName] = useState("");
   const [subUrl, setSubUrl] = useState("");
   const [subHwid, setSubHwid] = useState("");
+  const [generatingHwid, setGeneratingHwid] = useState(false);
   const [subRefreshMinutes, setSubRefreshMinutes] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
   const t = useT();
@@ -96,7 +97,7 @@ export default function ImportModal({
   };
 
   const submit = () => {
-    if (busy) return;
+    if (busy || generatingHwid) return;
     if (tab === "files") {
       if (files.length === 0) return;
       void run(() =>
@@ -150,8 +151,49 @@ export default function ImportModal({
     }
   };
 
+  const generateHwid = async () => {
+    if (busy || generatingHwid) return;
+    setGeneratingHwid(true);
+    setError(null);
+    try {
+      setSubHwid(await invoke<string>("generate_subscription_hwid"));
+    } catch {
+      setError("Could not generate a device ID. Enter an HWID manually.");
+    } finally {
+      setGeneratingHwid(false);
+    }
+  };
+
+  const hwidField = (
+    <>
+      <label>
+        {t("import.hwid")}
+        <input
+          type="password"
+          value={subHwid}
+          onChange={(event) => setSubHwid(event.target.value)}
+          placeholder="device-hwid"
+          autoComplete="off"
+          disabled={busy || generatingHwid}
+        />
+      </label>
+      {caps?.os === "windows" && (
+        <>
+          <div>
+            <button type="button" className="btn-sm" onClick={() => void generateHwid()} disabled={busy || generatingHwid}>
+              {t("native.hwidAuto")}
+            </button>
+          </div>
+          <p className="profile-help">
+            {tr("This app may count as a separate device in your subscription.")}
+          </p>
+        </>
+      )}
+    </>
+  );
+
   const canSubmit =
-    !busy &&
+    !busy && !generatingHwid &&
     (tab === "files"
       ? files.length > 0
       : tab === "link"
@@ -203,7 +245,7 @@ export default function ImportModal({
             type="button"
             className={`modal-tab ${tab === item.id ? "active" : ""}`}
             onClick={() => switchTab(item.id)}
-            disabled={busy}
+            disabled={busy || generatingHwid}
           >
             {item.label}
           </button>
@@ -287,17 +329,7 @@ export default function ImportModal({
                 />
               </label>
             ) : (
-              <label>
-                {t("import.hwid")}
-                <input
-                  type="password"
-                  value={subHwid}
-                  onChange={(event) => setSubHwid(event.target.value)}
-                  placeholder="device-hwid"
-                  autoComplete="off"
-                  disabled={busy}
-                />
-              </label>
+              hwidField
             )}
           </>
         )}
@@ -308,7 +340,7 @@ export default function ImportModal({
             <label>
               {t("import.subUrl")}
               <input
-                type="text"
+                type="password"
                 value={subUrl}
                 onChange={(event) => { setSubUrl(event.target.value); setError(null); }}
                 placeholder="https://example.com/sub"
@@ -318,17 +350,7 @@ export default function ImportModal({
                 autoFocus
               />
             </label>
-            <label>
-              {t("import.hwid")}
-              <input
-                type="password"
-                value={subHwid}
-                onChange={(event) => setSubHwid(event.target.value)}
-                placeholder="device-hwid"
-                autoComplete="off"
-                disabled={busy}
-              />
-            </label>
+            {hwidField}
             <div className="import-row">
               <span>{t("import.autoRefresh")}</span>
               <div className="filter-state" role="radiogroup" aria-label={t("import.autoRefresh")}>

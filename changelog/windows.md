@@ -10,6 +10,18 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+### Added
+
+- Managed Xray TUN and NetBird controls for internet VPN and private-network use.
+- Automatic subscription device IDs, compatible server imports and cancelable
+  background server-delay measurements.
+- A tray icon with Open, Hide and Exit actions; closing the window keeps owned
+  VPN connections running when the tray is available.
+- Startup recovery choices for an existing instance, with bounded probing,
+  graceful restart and explicit confirmation before forced termination.
+- Reuse an already-running managed connection and select a free automatic TUN
+  name when a previous adapter still occupies the default name.
+
 ### Fixed
 
 - Resolve adapter names correctly when changing their administrative state and

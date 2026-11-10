@@ -13,10 +13,15 @@ mod profile_watcher;
 #[cfg(not(target_os = "linux"))]
 mod route_runtime;
 mod state;
+mod subscription_measurements;
 #[cfg(test)]
 mod test_support;
 #[cfg(target_os = "linux")]
 mod tray;
+#[cfg(windows)]
+mod windows_instance;
+#[cfg(windows)]
+mod windows_tray;
 
 #[cfg(target_os = "linux")]
 use auto_connect::get_auto_connect_result;
@@ -47,12 +52,22 @@ fn get_auto_connect_result() -> Option<serde_json::Value> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let context = tauri::generate_context!();
+    #[cfg(windows)]
+    let Some(launch_guard) = windows_instance::prepare_launch(&context.config().identifier) else {
+        return;
+    };
     #[cfg(target_os = "linux")]
     diagnostics::install();
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         // Must be first: a second launch exits here and focuses the running UI
         // before setup starts auto-connect, refresh loops or the tray again.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            #[cfg(windows)]
+            if _args.iter().any(|arg| arg == "--netorch-request-restart") {
+                app.exit(0);
+                return;
+            }
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.unminimize();
                 let _ = window.show();
@@ -76,6 +91,10 @@ pub fn run() {
             #[cfg(target_os = "linux")]
             diagnostics::initialize(state.data_dir());
             app.manage(state);
+            #[cfg(windows)]
+            if let Err(error) = windows_tray::install(app) {
+                eprintln!("network-orchestrator: tray unavailable: {error}");
+            }
             #[cfg(target_os = "linux")]
             tauri::async_runtime::spawn(profile_watcher::watch(app.handle().clone(), profile_path));
             #[cfg(target_os = "linux")]
@@ -169,9 +188,12 @@ pub fn run() {
             import_configs_batch,
             import_share_link,
             import_subscription,
+            generate_subscription_hwid,
             refresh_subscription,
             set_subscription_refresh_interval,
             measure_subscription_endpoint_delay,
+            start_subscription_delay_measurement,
+            cancel_subscription_delay_measurement,
             get_subscription_endpoints,
             switch_subscription_endpoint,
             set_subscription_backups,
@@ -241,7 +263,9 @@ pub fn run() {
             down_connection_set
         ])
         .on_window_event(lifecycle::handle_window_event)
-        .build(tauri::generate_context!())
-        .expect("error while building tauri application")
-        .run(lifecycle::handle_run_event);
+        .build(context)
+        .expect("error while building tauri application");
+    #[cfg(windows)]
+    drop(launch_guard);
+    app.run(lifecycle::handle_run_event);
 }

@@ -28,11 +28,11 @@ SOCKS/HTTP mode and the per-user system proxy. Everything that needs root
 | Feature | Windows | Linux | macOS | Notes |
 |---|---|---|---|---|
 | Several tunnels at once (primary + secondary by network) | — | ✅ WireGuard, OpenVPN, Xray TUN (daemon-enforced; split DNS via systemd-resolved) | ✅ Xray, WireGuard, OpenVPN | macOS: one primary connection, secondary ones carry only listed networks — `docs/plans/2026-10-14-18-macos-multi-tunnel.md` |
-| NetBird | — | ✅ via the user's own daemon (unverified against a live daemon) | ✅ via the user's own daemon | `net_manager_core::netbird` shared by both clients; Linux: Profiles → Services row; macOS: status/up/down through the NetBird CLI, SSO or setup key — `docs/plans/2026-10-14-18-macos-multi-tunnel.md` |
+| NetBird | ✅ installed Windows service (mock-tested; live connection acceptance pending) | ✅ via the user's own daemon (unverified against a live daemon) | ✅ via the user's own daemon | `net_manager_core::netbird` shared by the clients; Windows: trusted installed CLI over its named pipe; Linux: Profiles → Services row; macOS: status/up/down through the NetBird CLI, SSO or setup key — `docs/plans/2026-10-14-18-macos-multi-tunnel.md` |
 | WireGuard profile | ✅ | ✅ | ✅ helper, arm64 | Win: embedded tunnel lib + service install; Linux: `wireguard-tools` + daemon; macOS: userspace engine (`boringtun`) inside the privileged helper — `docs/plans/2026-10-14-17-macos-wireguard-openvpn.md` |
 | OpenVPN profile | ✅ | ✅ | ✅ helper, arm64 | Win/Linux as before; macOS: pinned self-contained OpenVPN from the app bundle run by the helper, routes/DNS installed by the helper, credentials in the Keychain |
 | Xray — SOCKS mode | ✅ | ✅ | ✅ native, arm64 | macOS: the shared unprivileged Engine runtime owner runs managed Xray for both GUI and CLI |
-| Xray — TUN mode | ✅ manual | ✅ managed | ✅ helper, arm64 | Win: user sets iface name/IP; Linux: daemon generates config (`xrayMode: "tun"` default); macOS: the launchd helper creates the `utun`, hands its fd to Xray (`XRAY_TUN_FD`, Xray runs as the console user) and owns routes + DNS — `docs/plans/2026-10-14-16-macos-xray-tun.md`; one tunnel at a time |
+| Xray — TUN mode | ⚠️ managed interface + app-owned routes; native traffic acceptance pending | ✅ managed | ✅ helper, arm64 | Win: pinned Wintun, explicit physical uplink, IPv4/IPv6 capture through `PolicyManager`; new imports use TUN and older stored modes are preserved. Linux: daemon generates config (`xrayMode: "tun"` default); macOS: the launchd helper creates the `utun`, hands its fd to Xray (`XRAY_TUN_FD`, Xray runs as the console user) and owns routes + DNS — `docs/plans/2026-10-14-16-macos-xray-tun.md`; one tunnel at a time |
 | Managed Xray TUN dual-stack capture | — | ✅ IPv4 + IPv6 | — | Linux primary defaults and four split-default halves; explicit/secondary scope preserved, captured-family FakeDNS, `/32` + `/128` ownership/recovery; requires daemon `xray.tun.ipv6` |
 | Xray backup nodes and pinned domain egress | — | ✅ app + CLI | — | One TUN, ordered HTTPS-probed backups with automatic primary return; pinned domains fail closed, including when a subscription node disappears |
 | Xray filtered pools and actual exit countries | — | ✅ app + CLI | — | Opt-in country/name filters, bounded candidate probes, explicit primary/backups/domain/DNS nodes excluded from automatic recruitment |
@@ -89,6 +89,11 @@ per-connection Diagnostics report (`core::diagnostics`) and a DNS tab on Network
   apply, credential preflight, rollback and partial teardown reporting.
 - Subscription profiles: multi-endpoint list, per-endpoint delay,
   refresh interval, traffic quota display.
+- Windows subscription import offers a user-triggered stable HWID derived from
+  the machine identifier without revealing it. Missing-HWID and device-limit
+  response headers produce distinct errors; a new HWID can count as another
+  device at the provider. External interface rows are read-only on Windows;
+  supported NetBird controls live in the separate service row.
 - Import: URI/file batch import (`ImportModal`); standard WireGuard `.conf`
   import on all three clients.
 - Home (Linux Tauri and macOS): last-profile reconnect, running connections,

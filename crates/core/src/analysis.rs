@@ -643,15 +643,15 @@ fn analyze_xray_bytes(
         }
     }
 
-    // Managed Linux capture must match the actual scoped or dual-stack request.
+    // Managed capture must match the actual scoped or dual-stack request.
     // Secondary routes are assigned by analyze_profile after config analysis.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     if profile.xray_mode == crate::models::XrayMode::Tun
         && profile.tunnel_role == crate::models::TunnelRole::Primary
     {
         analysis.os_routes.clear();
         analysis.os_routes.extend(
-            crate::connect_plan::linux_xray_tun_routes(profile)
+            crate::connect_plan::xray_tun_capture_routes(profile)
                 .into_iter()
                 .map(|route| AnalyzedRoute {
                     metric: Some(route.metric),
@@ -661,7 +661,7 @@ fn analyze_xray_bytes(
         );
     }
     // Other platforms retain their existing capture contract.
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     if profile.xray_mode == crate::models::XrayMode::Tun
         && !analysis.os_routes.iter().any(|r| r.source == "Xray TUN")
     {
@@ -1221,11 +1221,91 @@ mod tests {
         let result = analyze_profile(&p).unwrap();
         // Profile is configured for TUN mode — 0.0.0.0/0 OS route is added
         // proactively even though the stored config still has a SOCKS inbound.
+        let default = if cfg!(windows) {
+            net("0.0.0.0/1")
+        } else {
+            net("0.0.0.0/0")
+        };
         assert!(result
             .os_routes
             .iter()
-            .any(|r| r.destination == net("0.0.0.0/0") && r.source == "Xray TUN"));
+            .any(|r| r.destination == default && r.source == "Xray TUN"));
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn managed_xray_tun_analysis_reports_both_capture_families() {
+        for (split, expected) in [
+            (false, vec![net("0.0.0.0/0"), net("::/0")]),
+            (
+                true,
+                vec![
+                    net("0.0.0.0/1"),
+                    net("128.0.0.0/1"),
+                    net("::/1"),
+                    net("8000::/1"),
+                ],
+            ),
+        ] {
+            let p = Profile {
+                backend: TunnelBackend::Xray,
+                xray_mode: XrayMode::Tun,
+                xray_split_default: split,
+                ..Default::default()
+            };
+            let result =
+                analyze_xray_snapshot(&p, br#"{"inbounds":[{"protocol":"tun","settings":{}}]}"#)
+                    .unwrap();
+            let expected = if cfg!(windows) {
+                vec![
+                    net("0.0.0.0/1"),
+                    net("128.0.0.0/1"),
+                    net("::/1"),
+                    net("8000::/1"),
+                ]
+            } else {
+                expected
+            };
+            assert_eq!(destinations(&result.os_routes), expected, "split={split}");
+            assert!(result
+                .os_routes
+                .iter()
+                .all(|route| route.source == "Xray TUN" && route.metric == Some(5)));
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn managed_xray_tun_analysis_preserves_explicit_scope_and_secondary_networks() {
+        let mut p = Profile {
+            backend: TunnelBackend::Xray,
+            xray_mode: XrayMode::Tun,
+            xray_split_default: true,
+            routes: vec![PolicyRoute {
+                destination: net("10.20.0.0/16"),
+                metric: 17,
+                via: None,
+            }],
+            ..Default::default()
+        };
+        let snapshot = br#"{"inbounds":[{"protocol":"tun","settings":{}}]}"#;
+        let primary = analyze_xray_snapshot(&p, snapshot).unwrap();
+        assert_eq!(destinations(&primary.os_routes), vec![net("10.20.0.0/16")]);
+        assert_eq!(primary.os_routes[0].metric, Some(17));
+        assert_eq!(primary.os_routes[0].source, "Xray TUN");
+
+        p.tunnel_role = crate::models::TunnelRole::Secondary;
+        p.tunnel_networks = vec![net("192.168.50.0/24"), net("fd00:50::/64")];
+        let secondary = analyze_xray_snapshot(&p, snapshot).unwrap();
+        assert_eq!(
+            destinations(&secondary.os_routes),
+            vec![net("192.168.50.0/24"), net("fd00:50::/64")]
+        );
+        assert!(secondary
+            .os_routes
+            .iter()
+            .all(|route| route.source == "secondary tunnel" && route.metric == Some(5)));
     }
 
     #[test]

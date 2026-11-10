@@ -9,6 +9,7 @@ import {
   useScanLocalProxies,
 } from "../prefs";
 import { providerPrefix } from "../subscriptions";
+import { createSubscriptionDelayBatch, type SubscriptionDelayBatch } from "../subscriptionMeasurements";
 import { popupNativeMenu, MenuEntry } from "../nativeMenu";
 import { useT } from "../i18n";
 import { BACKEND_LABEL_KEYS } from "../i18n/labels";
@@ -226,6 +227,19 @@ export default function ProfileManager() {
     new Set(),
   );
   const [measuringAll, setMeasuringAll] = useState<Set<string>>(new Set());
+  const [cancellingMeasurements, setCancellingMeasurements] = useState<Set<string>>(new Set());
+  const measurementRuns = useRef(new Map<string, SubscriptionDelayBatch>());
+  const measurementOwners = useRef(new Map<string, object>());
+  const measurementsMounted = useRef(true);
+  useEffect(() => {
+    measurementsMounted.current = true;
+    return () => {
+      measurementsMounted.current = false;
+      for (const run of measurementRuns.current.values()) void run.cancel().catch(() => {});
+      measurementRuns.current.clear();
+      measurementOwners.current.clear();
+    };
+  }, []);
   const [delayResults, setDelayResults] = useState<
     Record<string, Record<number, SubscriptionDelayResult>>
   >({});
@@ -281,7 +295,7 @@ export default function ProfileManager() {
   } | null>(null);
   const [tailscale, setTailscale] = useState<TailscaleStatusResult | null>(null);
   const [tailscaleBusy, setTailscaleBusy] = useState(false);
-  const netbird = useNetBird(caps?.os === "linux");
+  const netbird = useNetBird(caps?.os === "linux" || caps?.os === "windows");
   const [serviceSelected, setServiceSelected] = useState(false);
   const [ctxMenu, setCtxMenu] = useState<{
     x: number;
@@ -587,6 +601,7 @@ export default function ProfileManager() {
   // delete / TUN admin-down via the daemon, polkit-gated). "On" only exists
   // for a foreign TUN we downed — WG devices are gone after a stop.
   const onToggleExternal = async (iface: NetworkInterface) => {
+    if (caps?.os !== "linux") return;
     setExternalBusy(iface.name);
     try {
       if (!(await ensureElevation(t("iface.elevationState")))) return;
@@ -1086,60 +1101,86 @@ export default function ProfileManager() {
     }
   };
 
-  const onMeasureEndpoint = async (profile: Profile, index: number) => {
-    const key = `${profile.id}:${index}`;
-    setMeasuringEndpoints((prev) => new Set(prev).add(key));
-    try {
-      const result = await invoke<SubscriptionDelayResult>(
-        "measure_subscription_endpoint_delay",
-        { profileId: profile.id, endpointIndex: index },
-      );
-      setDelayResults((current) => ({
-        ...current,
-        [profile.id]: { ...(current[profile.id] ?? {}), [index]: result },
-      }));
-    } catch {
-      setDelayResults((current) => ({
-        ...current,
-        [profile.id]: {
-          ...(current[profile.id] ?? {}),
-          [index]: { delayMs: null, error: t("profiles.delayCheckFailed") },
-        },
-      }));
-    } finally {
-      setMeasuringEndpoints((prev) => {
-        const next = new Set(prev);
-        next.delete(key);
-        return next;
-      });
-    }
+  const finishMeasurement = (profileId: string, run: SubscriptionDelayBatch) => {
+    if (!measurementsMounted.current || measurementRuns.current.get(profileId) !== run) return;
+    measurementRuns.current.delete(profileId);
+    const clearProfile = (previous: Set<string>) => {
+      if (measurementRuns.current.has(profileId)) return previous;
+      const next = new Set(previous);
+      next.delete(profileId);
+      return next;
+    };
+    setMeasuringAll(clearProfile);
+    setCancellingMeasurements(clearProfile);
+    setMeasuringEndpoints((previous) => measurementRuns.current.has(profileId)
+      ? previous
+      : new Set([...previous].filter((key) => !key.startsWith(`${profileId}:`))));
   };
 
-  /** Rolling pool: up to eight probes in flight, the next one starts as soon
-   * as any finishes, so one slow server never holds the rest back. */
   const onMeasureAllEndpoints = async (profile: Profile) => {
-    const list = endpoints[profile.id] ?? [];
-    if (list.length === 0) return;
+    const active = measurementRuns.current.get(profile.id);
+    if (active) {
+      if (active.cancelled) return;
+      setCancellingMeasurements((previous) => new Set(previous).add(profile.id));
+      try {
+        await active.cancel();
+      } catch (err) {
+        if (measurementsMounted.current && measurementRuns.current.get(profile.id) === active) toast("error", String(err));
+      } finally {
+        finishMeasurement(profile.id, active);
+      }
+      return;
+    }
+    const indexes = (endpoints[profile.id] ?? []).flatMap((endpoint, index) => endpoint.isMissing ? [] : [index]);
+    if (indexes.length === 0) return;
+    const owner = {};
+    measurementOwners.current.set(profile.id, owner);
+    let run!: SubscriptionDelayBatch;
+    const current = () => measurementsMounted.current && measurementRuns.current.get(profile.id) === run;
+    run = createSubscriptionDelayBatch(indexes, {
+      start: () => invoke<string>("start_subscription_delay_measurement", { profileId: profile.id }),
+      measure: async (index, measurementId) => {
+        try {
+          return await invoke<SubscriptionDelayResult>("measure_subscription_endpoint_delay", {
+            profileId: profile.id, endpointIndex: index, measurementId,
+          });
+        } catch {
+          return { delayMs: null, error: t("profiles.delayCheckFailed") };
+        }
+      },
+      cancel: (measurementId) => invoke<void>("cancel_subscription_delay_measurement", { measurementId }),
+      isCurrent: current,
+      onPending: (index, pending) => {
+        setMeasuringEndpoints((previous) => {
+          if (!current()) return previous;
+          const next = new Set(previous);
+          const key = `${profile.id}:${index}`;
+          if (pending) next.add(key); else next.delete(key);
+          return next;
+        });
+      },
+      onResult: (index, result) => {
+        setDelayResults((previous) => !measurementsMounted.current || measurementOwners.current.get(profile.id) !== owner ? previous : ({
+          ...previous,
+          [profile.id]: { ...(previous[profile.id] ?? {}), [index]: result },
+        }));
+      },
+    });
+    measurementRuns.current.set(profile.id, run);
     setMeasuringAll((prev) => new Set(prev).add(profile.id));
+    setCancellingMeasurements((previous) => {
+      const next = new Set(previous);
+      next.delete(profile.id);
+      return next;
+    });
+    setMeasuringEndpoints((previous) => new Set([...previous].filter((key) => !key.startsWith(`${profile.id}:`))));
     setDelayResults((current) => ({ ...current, [profile.id]: {} }));
     try {
-      const POOL = 8;
-      let next = 0;
-      const worker = async () => {
-        while (next < list.length) {
-          const index = next++;
-          await onMeasureEndpoint(profile, index);
-        }
-      };
-      await Promise.all(
-        Array.from({ length: Math.min(POOL, list.length) }, worker),
-      );
+      await run.done;
+    } catch (err) {
+      if (current() && !run.cancelled) toast("error", String(err));
     } finally {
-      setMeasuringAll((prev) => {
-        const next = new Set(prev);
-        next.delete(profile.id);
-        return next;
-      });
+      finishMeasurement(profile.id, run);
     }
   };
 
@@ -1994,21 +2035,23 @@ export default function ProfileManager() {
                 >
                   {kindIcon(iface.kind, 14)}
                 </span>
-                <span className="profile-row-name">{iface.name}</span>
+                <span className="profile-row-name">{iface.friendlyName || iface.name}</span>
                 <span className="badge badge-external">
                   {t("detail.external")}
                 </span>
-                <ToggleSwitch
-                  checked={iface.state === "up"}
-                  onChange={() => void onToggleExternal(iface)}
-                  disabled={externalBusy === iface.name}
-                  busy={externalBusy === iface.name}
-                  title={
-                    iface.state === "up"
-                      ? t("profiles.externalStop")
-                      : t("iface.bringUp")
-                  }
-                />
+                {caps?.os === "linux" && (
+                  <ToggleSwitch
+                    checked={iface.state === "up"}
+                    onChange={() => void onToggleExternal(iface)}
+                    disabled={externalBusy === iface.name}
+                    busy={externalBusy === iface.name}
+                    title={
+                      iface.state === "up"
+                        ? t("profiles.externalStop")
+                        : t("iface.bringUp")
+                    }
+                  />
+                )}
               </div>
             ))}
           </div>
@@ -2190,6 +2233,7 @@ export default function ProfileManager() {
               delayResults={delayResults[selected.id]}
               measuringEndpoints={measuringEndpoints}
               measuringAll={measuringAll.has(selected.id)}
+              cancellingMeasurement={cancellingMeasurements.has(selected.id)}
               switching={switching === selected.id}
               refreshingSubscription={
                 refreshingSubscription === selected.id

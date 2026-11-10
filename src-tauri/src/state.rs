@@ -38,6 +38,8 @@ pub(crate) struct ResolvedBackendExecutable {
 pub(crate) struct AppState {
     pub(crate) profiles: ProfileStore,
     pub(crate) config_vault: ConfigVault,
+    pub(crate) subscription_measurements:
+        crate::subscription_measurements::SubscriptionMeasurements,
     #[cfg(not(target_os = "linux"))]
     pub(crate) backend_settings: BackendSettingsStore,
     /// Windows/non-Linux managed-install store root.
@@ -159,6 +161,7 @@ pub(crate) fn build_state(data_dir: PathBuf) -> std::io::Result<AppState> {
     Ok(AppState {
         profiles: store,
         config_vault,
+        subscription_measurements: Default::default(),
         #[cfg(not(target_os = "linux"))]
         backend_settings,
         #[cfg(not(target_os = "linux"))]

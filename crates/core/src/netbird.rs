@@ -11,7 +11,10 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
 pub const DEFAULT_SOCKET: &str = "/var/run/netbird.sock";
+#[cfg(windows)]
+pub const DEFAULT_SOCKET: &str = "netbird";
 /// Where the CLI lives when NetBird was installed by Homebrew or the package.
 #[cfg(target_os = "macos")]
 const CLI_CANDIDATES: [&str; 4] = [
@@ -22,7 +25,7 @@ const CLI_CANDIDATES: [&str; 4] = [
 ];
 /// The distribution packages put it in `/usr/bin`; a manual install script in
 /// `/usr/local/bin`.
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 const CLI_CANDIDATES: [&str; 3] = [
     "/usr/bin/netbird",
     "/usr/local/bin/netbird",
@@ -36,20 +39,110 @@ struct Pending {
     child: Child,
     key_file: Option<PathBuf>,
     socket: PathBuf,
+    #[cfg(windows)]
+    generation: u64,
 }
 
 static PENDING: Mutex<Option<Pending>> = Mutex::new(None);
+#[cfg(windows)]
+static NEXT_PENDING_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+#[cfg(windows)]
+fn start_pending_reaper(pid: u32, socket: PathBuf, generation: u64) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name("netbird-login-cleanup".into())
+        .spawn(move || loop {
+            let mut guard = PENDING.lock().unwrap_or_else(|error| error.into_inner());
+            let Some(pending) = guard.as_mut() else {
+                return;
+            };
+            if pending.child.id() != pid
+                || pending.socket != socket
+                || pending.generation != generation
+            {
+                return;
+            }
+            if matches!(pending.child.try_wait(), Ok(None)) {
+                drop(guard);
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+            // Keep the slot locked through deletion so a newer login cannot
+            // publish another setup key at the same path before cleanup ends.
+            if let Some(path) = pending.key_file.take() {
+                let _ = std::fs::remove_file(path);
+            }
+            *guard = None;
+            return;
+        })
+        .map(|_| ())
+}
 
 pub struct NetBird {
     pub cli: Option<PathBuf>,
     pub socket: PathBuf,
 }
 
+#[cfg(unix)]
 fn executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
+#[cfg(windows)]
+fn executable(path: &Path) -> bool {
+    reject_windows_reparse(path).is_ok()
+        && std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
+}
+
+#[cfg(windows)]
+fn windows_cli_path(path: &Path, roots: &[PathBuf]) -> bool {
+    path.is_absolute()
+        && roots.iter().any(|root| {
+            root.is_absolute()
+                && path.as_os_str().to_string_lossy().eq_ignore_ascii_case(
+                    &root.join("NetBird").join("netbird.exe").to_string_lossy(),
+                )
+        })
+}
+
+#[cfg(windows)]
+fn windows_program_files() -> Vec<PathBuf> {
+    use windows::core::{w, PCWSTR};
+    use windows::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ};
+
+    [
+        "ProgramW6432Dir",
+        "ProgramFilesDir",
+        "ProgramFilesDir (x86)",
+    ]
+    .into_iter()
+    .filter_map(|value| {
+        let value: Vec<u16> = value.encode_utf16().chain(Some(0)).collect();
+        let mut buffer = [0u16; 1024];
+        let mut length = std::mem::size_of_val(&buffer) as u32;
+        let result = unsafe {
+            RegGetValueW(
+                HKEY_LOCAL_MACHINE,
+                w!("SOFTWARE\\Microsoft\\Windows\\CurrentVersion"),
+                PCWSTR::from_raw(value.as_ptr()),
+                RRF_RT_REG_SZ,
+                None,
+                Some(buffer.as_mut_ptr().cast()),
+                Some(&mut length),
+            )
+        };
+        if result.0 != 0 {
+            return None;
+        }
+        let length = buffer.iter().position(|unit| *unit == 0)?;
+        let path = PathBuf::from(String::from_utf16(&buffer[..length]).ok()?);
+        path.is_absolute().then_some(path)
+    })
+    .collect()
+}
+
+#[cfg(unix)]
 fn default_socket(legacy: &Path) -> PathBuf {
     if !legacy.exists() {
         // Profile-based installs keep the default daemon in netbird/default.sock.
@@ -65,29 +158,73 @@ impl NetBird {
     /// The installed CLI and the daemon socket; both can be pointed elsewhere
     /// for tests and unusual installs.
     pub fn detect() -> Self {
+        #[cfg(unix)]
         let cli = std::env::var_os("NETORCH_NETBIRD_CLI")
             .map(PathBuf::from)
             .into_iter()
             .chain(CLI_CANDIDATES.iter().map(PathBuf::from))
             .find(|path| executable(path));
+        #[cfg(windows)]
+        let cli = {
+            // Read install roots from HKLM, not PATH or user-controlled env roots.
+            let roots = windows_program_files();
+            std::env::var_os("NETORCH_NETBIRD_CLI")
+                .map(PathBuf::from)
+                .into_iter()
+                .chain(
+                    roots
+                        .iter()
+                        .map(|root| root.join("NetBird").join("netbird.exe")),
+                )
+                .find(|path| windows_cli_path(path, &roots) && executable(path))
+        };
+        #[cfg(unix)]
         let socket = std::env::var_os("NETORCH_NETBIRD_SOCKET")
             .map(PathBuf::from)
             .unwrap_or_else(|| default_socket(Path::new(DEFAULT_SOCKET)));
+        #[cfg(windows)]
+        let socket = PathBuf::from(DEFAULT_SOCKET);
         Self { cli, socket }
     }
 
     fn command(&self, cli: &Path) -> Command {
         let mut command = Command::new(cli);
+        #[cfg(unix)]
+        let address = format!("unix://{}", self.socket.display());
+        #[cfg(windows)]
+        let address = format!("npipe://{}", self.socket.display());
         command
             .arg("--daemon-addr")
-            .arg(format!("unix://{}", self.socket.display()))
+            .arg(address)
             .stdin(Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
         command
+    }
+
+    fn daemon_available(&self) -> bool {
+        #[cfg(unix)]
+        {
+            self.socket.exists()
+        }
+        #[cfg(windows)]
+        {
+            // Named pipes are not filesystem entries; let the bounded CLI query them.
+            true
+        }
     }
 }
 
 /// Runs `command`, killing it after `limit`. Output is capped.
 fn run_with_timeout(mut command: Command, limit: Duration) -> Result<(bool, String), String> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
     let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -208,6 +345,7 @@ fn cancel_pending_for(socket: Option<&Path>) {
         return;
     }
     let taken = guard.take();
+    #[cfg(not(windows))]
     drop(guard);
     if let Some(mut pending) = taken {
         let _ = pending.child.kill();
@@ -216,6 +354,14 @@ fn cancel_pending_for(socket: Option<&Path>) {
             let _ = std::fs::remove_file(file);
         }
     }
+    #[cfg(windows)]
+    drop(guard);
+}
+
+/// Cancel this application's unfinished login without disconnecting the daemon.
+#[cfg(windows)]
+pub fn cancel_pending_login() {
+    cancel_pending_for(None);
 }
 
 #[cfg(test)]
@@ -234,10 +380,12 @@ fn pending_for(socket: &Path) -> bool {
 
 impl NetBird {
     pub fn status(&self) -> Value {
+        // A failed daemon query must not leave a completed login's setup key behind.
+        let _ = pending_for(&self.socket);
         let Some(cli) = &self.cli else {
             return json!({"installed": false, "state": "notInstalled"});
         };
-        if !self.socket.exists() {
+        if !self.daemon_available() {
             // The CLI would wait ten seconds for a daemon that is not there.
             return json!({"installed": true, "state": "daemonStopped"});
         }
@@ -261,7 +409,7 @@ impl NetBird {
         setup_key: Option<&str>,
     ) -> Result<Value, String> {
         let cli = self.cli.clone().ok_or("NetBird is not installed")?;
-        if !self.socket.exists() {
+        if !self.daemon_available() {
             return Err("The NetBird service is not running".into());
         }
         if let Some(url) = management_url {
@@ -298,6 +446,14 @@ impl NetBird {
         if let Some(url) = management_url {
             command.arg("--management-url").arg(url);
         }
+        let log = private_file(&dir.join("up.log"), true)
+            .map_err(|_| "NetBird state could not be prepared".to_string())?;
+        command
+            .stdout(Stdio::from(
+                log.try_clone()
+                    .map_err(|_| "NetBird could not be started".to_string())?,
+            ))
+            .stderr(Stdio::from(log));
         if let Some(key) = setup_key {
             #[cfg(target_os = "linux")]
             {
@@ -312,21 +468,15 @@ impl NetBird {
                 key_file = Some(path);
             }
         }
-        let log = private_file(&dir.join("up.log"), true)
-            .map_err(|_| "NetBird state could not be prepared".to_string())?;
-        command
-            .arg("up")
-            .stdout(Stdio::from(
-                log.try_clone()
-                    .map_err(|_| "NetBird could not be started".to_string())?,
-            ))
-            .stderr(Stdio::from(log));
-        let mut child = command.spawn().map_err(|_| {
+        command.arg("up");
+        let child = command.spawn().map_err(|_| {
             if let Some(file) = &key_file {
                 let _ = std::fs::remove_file(file);
             }
             "NetBird could not be started".to_string()
         })?;
+        #[cfg(target_os = "linux")]
+        let mut child = child;
         #[cfg(target_os = "linux")]
         {
             drop(key_handle);
@@ -338,18 +488,29 @@ impl NetBird {
                 }
             }
         }
+        #[cfg(windows)]
+        let generation = NEXT_PENDING_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(windows)]
+        let pid = child.id();
         *PENDING.lock().unwrap_or_else(|e| e.into_inner()) = Some(Pending {
             child,
             key_file,
             socket: self.socket.clone(),
+            #[cfg(windows)]
+            generation,
         });
+        #[cfg(windows)]
+        if start_pending_reaper(pid, self.socket.clone(), generation).is_err() {
+            cancel_pending_for(Some(&self.socket));
+            return Err("NetBird could not be started".into());
+        }
         Ok(self.status_in(runtime))
     }
 
     pub fn down(&self) -> Result<Value, String> {
         let cli = self.cli.clone().ok_or("NetBird is not installed")?;
         cancel_pending_for(Some(&self.socket));
-        if !self.socket.exists() {
+        if !self.daemon_available() {
             return Ok(self.status());
         }
         let mut command = self.command(&cli);
@@ -363,7 +524,9 @@ impl NetBird {
     }
 
     pub fn status_in(&self, runtime: &Path) -> Value {
-        let mut status = self.status();
+        let status = self.status();
+        #[cfg(target_os = "linux")]
+        let mut status = status;
         #[cfg(target_os = "linux")]
         if pending_in(runtime, &self.socket)
             && matches!(
@@ -421,6 +584,7 @@ fn validate_setup_key(key: &str) -> Result<(), String> {
     }
 }
 
+#[cfg(unix)]
 fn secure_runtime(runtime: &Path) -> std::io::Result<PathBuf> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
     let invalid = || std::io::Error::other("invalid NetBird runtime");
@@ -461,6 +625,41 @@ fn secure_runtime(runtime: &Path) -> std::io::Result<PathBuf> {
     Ok(runtime.join("netbird"))
 }
 
+#[cfg(windows)]
+fn reject_windows_reparse(path: &Path) -> std::io::Result<()> {
+    use std::os::windows::fs::MetadataExt;
+    use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    for ancestor in path.ancestors() {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(metadata) if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 => {
+                return Err(std::io::Error::other("linked NetBird path is not allowed"));
+            }
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn secure_runtime(runtime: &Path) -> std::io::Result<PathBuf> {
+    if !runtime.is_absolute() {
+        return Err(std::io::Error::other("invalid NetBird runtime"));
+    }
+    for path in [runtime.to_path_buf(), runtime.join("netbird")] {
+        reject_windows_reparse(&path)?;
+        std::fs::create_dir_all(&path)?;
+        reject_windows_reparse(&path)?;
+        if !std::fs::symlink_metadata(&path)?.is_dir() {
+            return Err(std::io::Error::other("invalid NetBird runtime"));
+        }
+        crate::config_security::protect_path(&path)?;
+    }
+    Ok(runtime.join("netbird"))
+}
+
+#[cfg(unix)]
 fn private_file(path: &Path, truncate: bool) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
     let file = std::fs::OpenOptions::new()
@@ -478,6 +677,43 @@ fn private_file(path: &Path, truncate: bool) -> std::io::Result<std::fs::File> {
     {
         return Err(std::io::Error::other("invalid NetBird file"));
     }
+    if truncate {
+        file.set_len(0)?;
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn private_file(path: &Path, truncate: bool) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    reject_windows_reparse(path)?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+        return Err(std::io::Error::other("invalid NetBird file"));
+    }
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    // The borrowed handle remains open throughout this metadata query.
+    unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut information) }
+        .map_err(|_| std::io::Error::last_os_error())?;
+    if information.nNumberOfLinks != 1 {
+        return Err(std::io::Error::other("linked NetBird file is not allowed"));
+    }
+    crate::config_security::protect_path(path)?;
     if truncate {
         file.set_len(0)?;
     }
@@ -641,7 +877,7 @@ fn cancel_pending_in(runtime: &Path, socket: &Path) -> Result<(), String> {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
@@ -654,6 +890,27 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     file.write_all(bytes)
 }
 
+#[cfg(windows)]
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows::Win32::Storage::FileSystem::{FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ};
+
+    reject_windows_reparse(path)?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .share_mode(FILE_SHARE_READ.0)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0)
+        .open(path)?;
+    let result = crate::config_security::protect_path(path).and_then(|()| file.write_all(bytes));
+    drop(file);
+    if result.is_err() {
+        let _ = std::fs::remove_file(path);
+    }
+    result
+}
+
 /// The tail of what `netbird up` printed (a login URL, an error).
 pub fn log_tail(runtime: &Path) -> String {
     let text = std::fs::read_to_string(runtime.join("netbird/up.log")).unwrap_or_default();
@@ -661,7 +918,7 @@ pub fn log_tail(runtime: &Path) -> String {
     lines[lines.len().saturating_sub(40)..].join("\n")
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
@@ -1039,5 +1296,215 @@ mod tests {
         let result = run_with_timeout(Command::new(&script), Duration::from_millis(300));
         assert!(result.is_err());
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use crate::config_security::inspect_path_protection;
+
+    static SERIAL: Mutex<()> = Mutex::new(());
+
+    fn fake_pending_login(runtime: &Path) -> (u32, u64, PathBuf) {
+        use std::os::windows::process::CommandExt;
+        let directory = secure_runtime(runtime).unwrap();
+        let key = directory.join("setup-key");
+        write_private(&key, b"synthetic-test-key").unwrap();
+        let powershell = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+        let child = Command::new(powershell)
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Milliseconds 100",
+            ])
+            .creation_flags(0x0800_0000)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let generation = NEXT_PENDING_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        *PENDING.lock().unwrap_or_else(|error| error.into_inner()) = Some(Pending {
+            child,
+            key_file: Some(key.clone()),
+            socket: PathBuf::from("netbird"),
+            generation,
+        });
+        (pid, generation, key)
+    }
+
+    #[test]
+    fn cli_detection_only_accepts_official_absolute_install_paths() {
+        let roots = [PathBuf::from(r"C:\Program Files")];
+        assert!(windows_cli_path(
+            Path::new(r"c:\program files\NetBird\netbird.exe"),
+            &roots
+        ));
+        for path in [
+            "netbird.exe",
+            r"C:\Users\Public\netbird.exe",
+            r"C:\Program Files\NetBird\..\netbird.exe",
+            r"C:\Program Files\NetBird\other.exe",
+        ] {
+            assert!(!windows_cli_path(Path::new(path), &roots));
+        }
+    }
+
+    #[test]
+    fn commands_use_the_windows_named_pipe() {
+        let nb = NetBird {
+            cli: Some(PathBuf::from(r"C:\Program Files\NetBird\netbird.exe")),
+            socket: PathBuf::from("netbird"),
+        };
+        let command = nb.command(nb.cli.as_ref().unwrap());
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_str().unwrap())
+            .collect();
+        assert_eq!(args, ["--daemon-addr", "npipe://netbird"]);
+        assert!(nb.daemon_available());
+    }
+
+    #[test]
+    fn status_summary_does_not_expose_keys_or_events() {
+        let status = summarize(
+            &json!({
+                "daemonStatus": "Connected", "netbirdIp": "192.0.2.8/32",
+                "privateKey": "synthetic-private-key",
+                "events": [{"message": "synthetic-private-event"}],
+                "peers": {"total": 2, "connected": 1}
+            }),
+            false,
+        );
+        assert_eq!(status["state"], "connected");
+        assert_eq!(status["ip"], "192.0.2.8/32");
+        assert!(!status.to_string().contains("synthetic-private"));
+    }
+
+    #[test]
+    fn private_runtime_key_and_logs_have_protected_acls() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = temp.path().join("runtime");
+        let dir = secure_runtime(&runtime).unwrap();
+        let key = dir.join("setup-key");
+        write_private(&key, b"synthetic-test-key").unwrap();
+        let log = dir.join("up.log");
+        let _file = private_file(&log, true).unwrap();
+        for path in [&runtime, &dir, &key, &log] {
+            let acl = inspect_path_protection(path).unwrap();
+            assert!(acl.protected_dacl && acl.current_user && acl.system && acl.administrators);
+        }
+        assert_eq!(std::fs::read(&key).unwrap(), b"synthetic-test-key");
+        assert!(write_private(&key, b"replacement").is_err());
+        assert_eq!(std::fs::read(&key).unwrap(), b"synthetic-test-key");
+    }
+
+    #[test]
+    fn private_runtime_rejects_directory_links() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let link = temp.path().join("linked-runtime");
+        if let Err(error) = std::os::windows::fs::symlink_dir(&target, &link) {
+            assert_eq!(error.raw_os_error(), Some(1314));
+            return;
+        }
+        assert!(secure_runtime(&link).is_err());
+        assert!(!target.join("netbird").exists());
+    }
+
+    #[test]
+    fn private_logs_reject_hard_links_before_truncating_or_changing_acls() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("unrelated-file");
+        std::fs::write(&target, b"preserve this synthetic content").unwrap();
+        let original_acl = inspect_path_protection(&target).unwrap();
+        let directory = secure_runtime(&temp.path().join("runtime")).unwrap();
+        let log = directory.join("up.log");
+        std::fs::hard_link(&target, &log).unwrap();
+        assert!(private_file(&log, true).is_err());
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"preserve this synthetic content"
+        );
+        assert_eq!(inspect_path_protection(&target).unwrap(), original_acl);
+    }
+
+    #[test]
+    fn reaper_removes_completed_login_key_without_status_polling() {
+        let _turn = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+        cancel_pending();
+        let temp = tempfile::tempdir().unwrap();
+        let (pid, generation, key) = fake_pending_login(temp.path());
+        start_pending_reaper(pid, PathBuf::from("netbird"), generation).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while key.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let removed = !key.exists();
+        cancel_pending();
+        assert!(removed, "completed login key remained without UI polling");
+    }
+
+    #[test]
+    fn stale_reaper_does_not_remove_a_newer_login_key() {
+        let _turn = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+        cancel_pending();
+        let temp = tempfile::tempdir().unwrap();
+        let (pid, generation, key) = fake_pending_login(temp.path());
+        start_pending_reaper(pid, PathBuf::from("netbird"), generation - 1).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut exited = false;
+        while Instant::now() < deadline {
+            exited = PENDING
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_mut()
+                .unwrap()
+                .child
+                .try_wait()
+                .unwrap()
+                .is_some();
+            if exited {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(exited, "the synthetic login did not finish in time");
+        assert!(
+            key.exists(),
+            "a stale generation removed the current login key"
+        );
+        cancel_pending();
+        assert!(!key.exists());
+    }
+
+    #[test]
+    fn completed_fake_login_removes_its_setup_key() {
+        let _turn = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+        cancel_pending();
+        let temp = tempfile::tempdir().unwrap();
+        // The test harness rejects --daemon-addr and exits; no NetBird is run.
+        let nb = NetBird {
+            cli: Some(std::env::current_exe().unwrap()),
+            socket: PathBuf::from("netbird"),
+        };
+        nb.up(temp.path(), None, Some("synthetic-test-key"))
+            .unwrap();
+        for _ in 0..100 {
+            // Failed daemon queries must still reap a completed login child.
+            let _ = nb.status();
+            if !temp.path().join("netbird/setup-key").exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!temp.path().join("netbird/setup-key").exists());
+        assert!(!pending_alive());
+        assert!(!log_tail(temp.path()).contains("synthetic-test-key"));
     }
 }

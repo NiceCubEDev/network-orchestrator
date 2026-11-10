@@ -1,7 +1,7 @@
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 pub const MANAGED_XRAY_VERSION: &str = "v26.7.28";
@@ -13,12 +13,14 @@ pub const MAX_XRAY_ARCHIVE_BYTES: usize = 64 * 1024 * 1024;
 
 const MAX_XRAY_ENTRY_BYTES: u64 = 48 * 1024 * 1024;
 const MAX_XRAY_TOTAL_BYTES: u64 = 96 * 1024 * 1024;
-const ALLOWLIST: [&str; 5] = [
+const ALLOWLIST: [&str; 7] = [
     "xray.exe",
     "geoip.dat",
     "geosite.dat",
     "LICENSE",
     "README.md",
+    "wintun.dll",
+    "LICENSE-Wintun",
 ];
 const REQUIRED: [&str; 3] = ["xray.exe", "geoip.dat", "geosite.dat"];
 const REQUIRED_SHA256: [(&str, &str); 3] = [
@@ -33,6 +35,17 @@ const REQUIRED_SHA256: [(&str, &str); 3] = [
     (
         "geosite.dat",
         "ea8d817c4782a84db4104ba416329bb14024f69568c666f5cca6c4303ef1942e",
+    ),
+];
+
+const WINDOWS_TUN_SHA256: [(&str, &str); 2] = [
+    (
+        "wintun.dll",
+        "e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce",
+    ),
+    (
+        "LICENSE-Wintun",
+        "183adac21e7d96c508c8fd34d394b7b6708bc81564ad1bad61ab66143a008cd2",
     ),
 ];
 
@@ -409,11 +422,36 @@ pub fn verify_managed_executable(root: &Path, executable: &Path) -> io::Result<(
     verify_required_hashes(&expected_dir, &REQUIRED_SHA256)
 }
 
+/// Verify the bundled Wintun payload beside the selected executable before
+/// Windows TUN startup. Legacy SOCKS-only installs remain valid independently.
+pub fn verify_windows_tun_support(executable: &Path) -> io::Result<()> {
+    let directory = executable
+        .parent()
+        .filter(|directory| !directory.as_os_str().is_empty());
+    if directory.is_some_and(|directory| {
+        WINDOWS_TUN_SHA256
+            .iter()
+            .all(|(name, hash)| windows_tun_file_verified(directory, name, hash))
+    }) {
+        Ok(())
+    } else {
+        Err(invalid_data(
+            "Windows TUN support is missing or failed integrity verification; install managed Xray again in Settings",
+        ))
+    }
+}
+
 pub fn install_verified_archive(
     root: &Path,
     archive: &[u8],
 ) -> io::Result<ManagedXrayInstallation> {
-    install_archive_with_expected_hash(root, archive, MANAGED_XRAY_SHA256, &REQUIRED_SHA256)
+    install_archive_with_expected_hash(
+        root,
+        archive,
+        MANAGED_XRAY_SHA256,
+        &REQUIRED_SHA256,
+        &WINDOWS_TUN_SHA256,
+    )
 }
 
 fn install_archive_with_expected_hash(
@@ -421,14 +459,124 @@ fn install_archive_with_expected_hash(
     archive: &[u8],
     expected_hash: &str,
     expected_required: &[(&str, &str)],
+    expected_tun: &[(&str, &str)],
 ) -> io::Result<ManagedXrayInstallation> {
-    install_archive_for_platform(
-        root,
-        archive,
-        expected_hash,
-        expected_required,
-        WINDOWS_LAYOUT,
-    )
+    if !expected_tun.is_empty() && root.join(MANAGED_XRAY_VERSION).is_dir() {
+        // Verify the legacy executable/assets and the whole pinned archive first.
+        // Only missing, independently verified TUN files may be added afterwards.
+        let installed = install_archive_for_platform(
+            root,
+            archive,
+            expected_hash,
+            expected_required,
+            WINDOWS_LAYOUT,
+        )?;
+        complete_windows_tun_package(&installed.version_dir, archive, expected_tun)?;
+        return Ok(installed);
+    }
+    let required: Vec<_> = expected_required
+        .iter()
+        .chain(expected_tun)
+        .copied()
+        .collect();
+    install_archive_for_platform(root, archive, expected_hash, &required, WINDOWS_LAYOUT)
+}
+
+fn windows_tun_file_verified(directory: &Path, name: &str, expected_hash: &str) -> bool {
+    fs::symlink_metadata(directory.join(name))
+        .is_ok_and(|metadata| metadata.len() <= MAX_XRAY_ENTRY_BYTES)
+        && version_verified(directory, &[(name, expected_hash)])
+}
+
+fn complete_windows_tun_package(
+    directory: &Path,
+    archive: &[u8],
+    expected: &[(&str, &str)],
+) -> io::Result<()> {
+    if fs::symlink_metadata(directory)?.file_type().is_symlink() {
+        return Err(invalid_data("managed Xray directory must not be a symlink"));
+    }
+    // Never overwrite an unrecognised file, including a symlink or directory.
+    for (name, hash) in expected {
+        match fs::symlink_metadata(directory.join(name)) {
+            Ok(_) if !windows_tun_file_verified(directory, name, hash) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("managed Xray TUN file '{name}' failed verification; remove it explicitly before reinstalling"),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let names: Vec<_> = expected.iter().map(|(name, _)| *name).collect();
+    let central = allowlisted_central_names(archive, &names)?;
+    let mut reader = zip::ZipArchive::new(std::io::Cursor::new(archive)).map_err(invalid_data)?;
+    let mut payloads = Vec::new();
+    for (name, hash) in expected {
+        if central
+            .iter()
+            .filter(|entry| entry.as_str() == *name)
+            .count()
+            != 1
+        {
+            return Err(invalid_data(
+                "archive has missing or duplicate Windows TUN files",
+            ));
+        }
+        let entry = reader.by_name(name).map_err(invalid_data)?;
+        if !entry.is_file()
+            || entry
+                .unix_mode()
+                .is_some_and(|mode| mode & 0o170000 == 0o120000)
+            || entry.size() > MAX_XRAY_ENTRY_BYTES
+        {
+            return Err(invalid_data("archive contains an invalid Windows TUN file"));
+        }
+        let declared_size = entry.size();
+        let mut bytes = Vec::new();
+        entry
+            .take(MAX_XRAY_ENTRY_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 != declared_size || sha256_hex(&bytes) != *hash {
+            return Err(invalid_data(
+                "archive Windows TUN file failed integrity verification",
+            ));
+        }
+        payloads.push((*name, *hash, bytes));
+    }
+    for (name, hash, bytes) in payloads {
+        let target = directory.join(name);
+        if !windows_tun_file_verified(directory, name, hash) {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0);
+            let temporary = directory.join(format!(".{name}.tmp-{}-{nanos}", std::process::id()));
+            let mut file = fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temporary)?;
+            let result = (|| {
+                file.write_all(&bytes)?;
+                file.sync_all()?;
+                drop(file);
+                crate::config_security::protect_path(&temporary)?;
+                // Hard-link publication is atomic and cannot replace a file that
+                // appeared concurrently. Both names stay on the same volume.
+                match fs::hard_link(&temporary, &target) {
+                    Ok(()) => Ok(()),
+                    Err(_) if windows_tun_file_verified(directory, name, hash) => Ok(()),
+                    Err(error) => Err(error),
+                }
+            })();
+            let _ = fs::remove_file(&temporary);
+            result?;
+        }
+        crate::config_security::protect_path(&target)?;
+    }
+    Ok(())
 }
 
 fn install_archive_for_platform(
@@ -985,11 +1133,137 @@ mod tests {
             .iter()
             .map(|(n, h)| (n.as_str(), h.as_str()))
             .collect();
-        install_archive_with_expected_hash(root, archive, &sha256_hex(archive), &refs)
+        install_archive_with_expected_hash(root, archive, &sha256_hex(archive), &refs, &[])
     }
 
     fn version_dir(root: &Path) -> PathBuf {
         managed_version_dir(root)
+    }
+
+    fn windows_tun_entries() -> Vec<(&'static str, Vec<u8>)> {
+        let mut entries = required_entries();
+        entries.push(("wintun.dll", b"MZ pinned Wintun".to_vec()));
+        entries.push(("LICENSE-Wintun", b"pinned Wintun license".to_vec()));
+        entries
+    }
+
+    fn install_tun_synthetic(root: &Path, archive: &[u8]) -> io::Result<ManagedXrayInstallation> {
+        let hashes: Vec<_> = windows_tun_entries()
+            .iter()
+            .map(|(name, bytes)| (name.to_string(), sha256_hex(bytes)))
+            .collect();
+        let refs: Vec<_> = hashes
+            .iter()
+            .map(|(name, hash)| (name.as_str(), hash.as_str()))
+            .collect();
+        let (base, tun) = refs.split_at(REQUIRED.len());
+        install_archive_with_expected_hash(root, archive, &sha256_hex(archive), base, tun)
+    }
+
+    #[test]
+    fn windows_tun_install_includes_verified_driver_and_license() {
+        let dir = unique_dir("windows-tun-package");
+        let root = dir.join("xray");
+        let owned = windows_tun_entries();
+        let archive = build_archive(&slices(&owned));
+        let installed = install_tun_synthetic(&root, &archive).unwrap();
+        for (name, bytes) in owned {
+            assert_eq!(fs::read(installed.version_dir.join(name)).unwrap(), bytes);
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn windows_tun_install_completes_legacy_package_without_replacing_base() {
+        let dir = unique_dir("windows-tun-upgrade");
+        let root = dir.join("xray");
+        let base = required_entries();
+        let legacy = install_synthetic(&root, &build_archive(&slices(&base))).unwrap();
+        let owned = windows_tun_entries();
+        let archive = build_archive(&slices(&owned));
+        let installed = install_tun_synthetic(&root, &archive).unwrap();
+        assert!(!installed.created);
+        assert_eq!(installed.executable, legacy.executable);
+        for (name, bytes) in owned {
+            assert_eq!(fs::read(installed.version_dir.join(name)).unwrap(), bytes);
+        }
+        assert!(!install_tun_synthetic(&root, &archive).unwrap().created);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn windows_tun_install_preserves_existing_tampered_driver() {
+        let dir = unique_dir("windows-tun-preserve");
+        let root = dir.join("xray");
+        let base = required_entries();
+        let installed = install_synthetic(&root, &build_archive(&slices(&base))).unwrap();
+        fs::write(installed.version_dir.join("wintun.dll"), b"unknown driver").unwrap();
+        let owned = windows_tun_entries();
+        let error = install_tun_synthetic(&root, &build_archive(&slices(&owned))).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            fs::read(installed.version_dir.join("wintun.dll")).unwrap(),
+            b"unknown driver"
+        );
+        assert!(!installed.version_dir.join("LICENSE-Wintun").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn windows_tun_wrong_archive_driver_is_rejected_before_publication() {
+        let dir = unique_dir("windows-tun-wrong-hash");
+        let root = dir.join("xray");
+        let mut owned = windows_tun_entries();
+        owned
+            .iter_mut()
+            .find(|(name, _)| *name == "wintun.dll")
+            .unwrap()
+            .1 = b"wrong driver".to_vec();
+        let error = install_tun_synthetic(&root, &build_archive(&slices(&owned))).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(!version_dir(&root).exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn windows_tun_upgrade_rejects_unverified_archive_without_adding_files() {
+        let dir = unique_dir("windows-tun-upgrade-bad-hash");
+        let root = dir.join("xray");
+        let base = required_entries();
+        let installed = install_synthetic(&root, &build_archive(&slices(&base))).unwrap();
+        let mut owned = windows_tun_entries();
+        owned
+            .iter_mut()
+            .find(|(name, _)| *name == "LICENSE-Wintun")
+            .unwrap()
+            .1 = b"wrong license".to_vec();
+        let error = install_tun_synthetic(&root, &build_archive(&slices(&owned))).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(!installed.version_dir.join("wintun.dll").exists());
+        assert!(!installed.version_dir.join("LICENSE-Wintun").exists());
+        assert!(
+            !install_synthetic(&root, &build_archive(&slices(&base)))
+                .unwrap()
+                .created
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn windows_tun_guard_is_actionable_and_does_not_expose_paths() {
+        let dir = unique_dir("windows-tun-guard");
+        let executable = dir.join("xray.exe");
+        for driver in [None, Some(b"unverified driver".as_slice())] {
+            if let Some(bytes) = driver {
+                fs::write(dir.join("wintun.dll"), bytes).unwrap();
+            }
+            let error = verify_windows_tun_support(&executable).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            let message = error.to_string();
+            assert!(message.contains("install managed Xray again in Settings"));
+            assert!(!message.contains(&dir.display().to_string()));
+        }
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
