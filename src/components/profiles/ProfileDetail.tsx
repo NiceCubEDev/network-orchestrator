@@ -59,7 +59,7 @@ function countPolicyRules(
   return policies
     .filter((p) => target === undefined || p.target === target)
     .flatMap((p) => p.domains)
-    .filter((d) => !d.trimStart().startsWith("#")).length;
+    .filter((d) => d.trim() !== "" && !d.trimStart().startsWith("#")).length;
 }
 
 /** Same thresholds as the native client: <300 ms good, <800 ms fair. */
@@ -100,6 +100,7 @@ interface ProfileDetailProps {
   onConnect: () => void;
   onDisconnect: () => void;
   onEdit: () => void;
+  onEditRouting: () => void;
   onMoveUp: () => void;
   onMoveDown: () => void;
   onToggleAlwaysOn: (kind: AlwaysOnKind, enrolled: boolean) => void;
@@ -147,6 +148,7 @@ export default function ProfileDetail({
   onConnect,
   onDisconnect,
   onEdit,
+  onEditRouting,
   onMoveUp,
   onMoveDown,
   onToggleAlwaysOn,
@@ -186,8 +188,6 @@ export default function ProfileDetail({
     alwaysOn?.supportedKinds.includes(alwaysOnKind) === true &&
     (alwaysOnKind === "wireGuard" ||
       (profile.interfaceName.length > 0 && profile.routes.length > 0));
-  const ruleCount = countPolicyRules(profile.domainPolicies);
-  const detailCount = profile.routes.length + ruleCount;
   const isWireGuard = profile.backend === "wireGuard";
   const showConfig =
     isWireGuard || profile.backend === "openVpn";
@@ -419,6 +419,37 @@ export default function ProfileDetail({
             {profile.interfaceName || t("detail.notAssigned")}
           </span>
         </div>
+        {profile.backend === "xray" && (
+          <section
+            className="interface-section domain-rules-section"
+            aria-labelledby="profile-domain-rules-heading"
+          >
+            <div className="domain-rules-header">
+              <span id="profile-domain-rules-heading" className="section-label">
+                {t("detail.domainRules")}
+              </span>
+              <button className="btn-sm" onClick={onEditRouting} disabled={isBusy}>
+                {t("common.edit")}
+              </button>
+            </div>
+            <dl className="domain-rules-summary">
+              {(["block", "proxy", "direct"] as const).map((target) => {
+                const count = countPolicyRules(profile.domainPolicies, target);
+                return (
+                  <div className="domain-rules-row" key={target}>
+                    <dt className="domain-rules-label">
+                      <span className={`rules-dot rules-dot-${target}`} aria-hidden="true" />
+                      {t(DOMAIN_TARGET_LABEL_KEYS[target])}
+                    </dt>
+                    <dd className="domain-rules-count num" data-empty={count === 0}>
+                      {t("rules.entryCount", { count })}
+                    </dd>
+                  </div>
+                );
+              })}
+            </dl>
+          </section>
+        )}
         {os === "linux" && supportsRole(profile) && (
           <TunnelRoleSection
             profile={profile}
@@ -557,7 +588,7 @@ export default function ProfileDetail({
           </div>
         )}
 
-        {(detailCount > 0 ||
+        {(profile.routes.length > 0 ||
           profile.subscription !== null ||
           (profile.backend === "xray" && profile.privateLanDirect) ||
           profile.useSystemProxy) && (
@@ -669,27 +700,6 @@ export default function ProfileDetail({
                 <span className="row-label">{t("detail.proxyBypass")}</span>
                 <span className="row-value mono">
                   {profile.proxyBypass.join("; ") || t("detail.bypassDefault")}
-                </span>
-              </div>
-            )}
-            {ruleCount > 0 && (
-              <div className="interface-row">
-                <span className="row-label">{t("detail.domainRules")}</span>
-                <span className="row-value">
-                  {(["block", "proxy", "direct"] as const)
-                    .map((target) => ({
-                      target,
-                      count: countPolicyRules(
-                        profile.domainPolicies,
-                        target,
-                      ),
-                    }))
-                    .filter((entry) => entry.count > 0)
-                    .map(
-                      (entry) =>
-                        `${t(DOMAIN_TARGET_LABEL_KEYS[entry.target])} ${entry.count}`,
-                    )
-                    .join(" · ")}
                 </span>
               </div>
             )}

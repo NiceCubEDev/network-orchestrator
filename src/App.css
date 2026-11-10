@@ -1691,6 +1691,48 @@ a:focus-visible,
 .rules-dot-direct { background: var(--up); }
 .rules-dot-block { background: var(--down); }
 
+.domain-rules-section {
+  padding-block: var(--sp-2);
+}
+
+.domain-rules-header,
+.domain-rules-row,
+.domain-rules-label {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+.domain-rules-header {
+  justify-content: space-between;
+}
+
+.domain-rules-header .section-label {
+  color: var(--text-primary);
+  font-size: var(--fs-sm);
+}
+
+.domain-rules-summary {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  margin: 0;
+  font-size: var(--fs-sm);
+}
+
+.domain-rules-label {
+  color: var(--text-secondary);
+}
+
+.domain-rules-count {
+  margin: 0 0 0 auto;
+  font-variant-numeric: tabular-nums;
+}
+
+.domain-rules-count[data-empty="true"] {
+  color: var(--text-muted);
+}
+
 .rules-fg-proxy { color: var(--accent); }
 .rules-fg-direct { color: var(--up); }
 .rules-fg-block { color: var(--down); }

@@ -15,6 +15,11 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 - Cancel queued and active subscription delay measurements in the desktop UI,
   preserving completed results and cleaning up temporary probes.
 
+### Changed
+
+- Show Xray domain/IP rule counts for Block, Proxy and Direct, including zero
+  counts, and open Routing settings directly from the profile overview.
+
 ### Fixed
 
 - Resolve NetworkManager VPN tunnel interfaces through their shared IPv4/IPv6

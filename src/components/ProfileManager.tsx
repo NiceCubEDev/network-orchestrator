@@ -202,6 +202,7 @@ export default function ProfileManager() {
   const [busy, setBusy] = useState<Set<string>>(new Set());
   const [editing, setEditing] = useState<ProfileFormState | null>(null);
   const [formOpen, setFormOpen] = useState(false);
+  const [formInitialTab, setFormInitialTab] = useState<"general" | "routing">("general");
   const [inspections, setInspections] = useState<
     Record<string, ProfileInspection>
   >(listCache?.inspections ?? {});
@@ -1311,6 +1312,7 @@ export default function ProfileManager() {
   };
 
   const openNew = (backend?: TunnelBackend) => {
+    setFormInitialTab("general");
     setEditing(newFormState(backend, caps?.os));
     setFormOpen(true);
   };
@@ -1325,7 +1327,7 @@ export default function ProfileManager() {
     openNew(backend);
   };
 
-  const openEdit = async (profile: Profile) => {
+  const openEdit = async (profile: Profile, initialTab: "general" | "routing" = "general") => {
     if (alwaysOn?.profiles.some((item) => item.profileId === profile.id)) {
       setError(t("profiles.disableAlwaysOnEdit"));
       return;
@@ -1333,6 +1335,7 @@ export default function ProfileManager() {
     try {
       const editable = await invoke<{ profile: Profile; revision: string }>("get_profile_for_edit", { id: profile.id });
       setEditing(editFormState(editable.profile, editable.revision));
+      setFormInitialTab(initialTab);
       setFormOpen(true);
     } catch (err) {
       setError(String(err));
@@ -2247,6 +2250,7 @@ export default function ProfileManager() {
               onConnect={() => void onConnect(selected)}
               onDisconnect={() => void onDisconnect(selected)}
               onEdit={() => openEdit(selected)}
+              onEditRouting={() => openEdit(selected, "routing")}
               onMoveUp={() =>
                 selGroup &&
                 moveProfileInGroup(selGroup.items, selected.id, -1)
@@ -2302,6 +2306,7 @@ export default function ProfileManager() {
         open={formOpen}
         editing={editing}
         interfaces={interfaces}
+        initialTab={formInitialTab}
         onClose={() => {
           setFormOpen(false);
           setEditing(null);

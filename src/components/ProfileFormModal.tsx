@@ -285,6 +285,7 @@ interface ProfileFormModalProps {
   open: boolean;
   editing: ProfileFormState | null;
   interfaces: NetworkInterface[];
+  initialTab?: FormTab;
   onClose: () => void;
   onSaved: (profiles: Profile[], inspection: ProfileInspection | null) => void;
   onError: (message: string) => void;
@@ -296,6 +297,7 @@ export default function ProfileFormModal({
   open,
   editing,
   interfaces,
+  initialTab = "general",
   onClose,
   onSaved,
   onError,
@@ -334,12 +336,12 @@ export default function ProfileFormModal({
       setRouteCheckTarget("");
       setRouteCheckResult(null);
       setRouteCheckError(null);
-      setTab("general");
+      setTab(initialTab);
       setRulesEditor(null);
       setProbeResults(null);
       setProbeNotice(null);
     }
-  }, [open, editing?.id]);
+  }, [open, editing?.id, initialTab]);
 
   const current = form ?? editing;
   if (!current) return null;
@@ -794,7 +796,7 @@ export default function ProfileFormModal({
           value={current.name}
           onChange={(e) => update({ name: e.target.value })}
           placeholder={tr("form.namePh")}
-          autoFocus
+          autoFocus={initialTab === "general"}
         />
       </label>
       <label>

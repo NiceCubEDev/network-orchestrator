@@ -25,6 +25,11 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 - Reuse an already-running managed connection and select a free automatic TUN
   name when a previous adapter still occupies the default name.
 
+### Changed
+
+- Show Xray domain/IP rule counts for Block, Proxy and Direct, including zero
+  counts, and open Routing settings directly from the profile overview.
+
 ### Fixed
 
 - Resolve adapter names correctly when changing their administrative state and
