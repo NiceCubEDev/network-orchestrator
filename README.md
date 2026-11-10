@@ -544,12 +544,19 @@ npm run build
 
 No CI/CD service is required:
 
-```bash
-npm ci
-npm run tauri build -- --bundles nsis
+```powershell
+npm.cmd ci
+pwsh -File scripts/build-windows.ps1
 ```
 
-Produces an unsigned release-mode NSIS installer under `target/release/bundle/nsis/`.
+Requires PowerShell 7 and the normal Windows build prerequisites, including
+`python3` on PATH. The script prints the unsigned NSIS installer path and keeps
+build output outside the checkout. `TEMP` must be on the same drive as the project;
+an existing external `CARGO_TARGET_DIR` is reused.
+
+The destination PC only needs the installer, not Rust or Node. Setup downloads
+WebView2 when it is missing. Install managed Xray from the app settings, install
+and sign in to NetBird separately, and import the subscription on that PC.
 
 ## Limitations
 

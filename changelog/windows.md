@@ -12,6 +12,9 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ### Added
 
+- A PowerShell helper for unsigned NSIS packaging with embedded frontend assets
+  and temporary output outside the checkout.
+
 - Managed Xray TUN and NetBird controls for internet VPN and private-network use.
 - Automatic subscription device IDs, compatible server imports and cancelable
   background server-delay measurements.
