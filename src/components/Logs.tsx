@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import Page from "./Page";
-import { LogEvent, LogLevel } from "../types";
+import { LogEvent, LogLevel, LoggingVerbosity } from "../types";
 import { useT } from "../i18n";
+import { usePlatformCapabilities } from "../platform";
 
 const POLL_MS = 2000;
 const MAX_RENDERED = 1000;
@@ -15,6 +16,13 @@ function formatTime(tsUnix: number): string {
 
 export default function Logs() {
   const t = useT();
+  const caps = usePlatformCapabilities();
+  const [verbosity, setVerbosity] = useState<LoggingVerbosity | null>(null);
+  const [verbosityBusy, setVerbosityBusy] = useState(false);
+  const [verbosityReadError, setVerbosityReadError] = useState(false);
+  const [verbositySaveError, setVerbositySaveError] = useState(false);
+  const verbositySaving = useRef(false);
+  const verbosityRequest = useRef(0);
   const [events, setEvents] = useState<LogEvent[]>([]);
   const [daemonLines, setDaemonLines] = useState<LogEvent[]>([]);
   const [search, setSearch] = useState("");
@@ -31,6 +39,37 @@ export default function Logs() {
       // Log view must never break the UI; a failed fetch just keeps stale data.
     }
   }, []);
+
+  const refreshVerbosity = useCallback(async () => {
+    if (caps?.os !== "linux" || verbositySaving.current) return;
+    const request = ++verbosityRequest.current;
+    try {
+      const current = await invoke<LoggingVerbosity | null>("get_logging_verbosity");
+      if (request !== verbosityRequest.current) return;
+      setVerbosity(current);
+      setVerbosityReadError(current === null);
+    } catch {
+      if (request === verbosityRequest.current) setVerbosityReadError(true);
+    }
+  }, [caps?.os]);
+
+  const changeVerbosity = async (value: LoggingVerbosity) => {
+    verbositySaving.current = true;
+    ++verbosityRequest.current;
+    setVerbosityBusy(true);
+    setVerbositySaveError(false);
+    try {
+      await invoke("set_logging_verbosity", { verbosity: value });
+      const current = await invoke<LoggingVerbosity | null>("get_logging_verbosity");
+      setVerbosity(current);
+      setVerbosityReadError(current === null);
+    } catch {
+      setVerbositySaveError(true);
+    } finally {
+      verbositySaving.current = false;
+      setVerbosityBusy(false);
+    }
+  };
 
   const refreshDaemon = useCallback(async () => {
     try {
@@ -50,9 +89,16 @@ export default function Logs() {
 
   useEffect(() => {
     void refresh();
-    const id = setInterval(() => void refresh(), POLL_MS);
-    return () => clearInterval(id);
-  }, [refresh]);
+    void refreshVerbosity();
+    const id = setInterval(() => {
+      void refresh();
+      void refreshVerbosity();
+    }, POLL_MS);
+    return () => {
+      clearInterval(id);
+      ++verbosityRequest.current;
+    };
+  }, [refresh, refreshVerbosity]);
 
   useEffect(() => {
     if (daemonOpen) void refreshDaemon();
@@ -108,6 +154,30 @@ export default function Logs() {
           {t("common.clear")}
         </button>
       </div>
+
+      {caps?.os === "linux" && (
+        <>
+          <div className="settings-row">
+            <div className="settings-row-main">
+              <span className="settings-row-label">{t("Daemon diagnostic verbosity")}</span>
+              <span className="settings-row-sub">{t("Debug and trace add diagnostic metadata and can increase journal volume and overhead. These diagnostics omit secrets.")}</span>
+            </div>
+            <select
+              aria-label={t("Daemon diagnostic verbosity")}
+              value={verbosity ?? ""}
+              disabled={verbosity === null || verbosityBusy}
+              onChange={(e) => void changeVerbosity(e.target.value as LoggingVerbosity)}
+            >
+              {verbosity === null && <option value="">{verbosityReadError ? t("Unavailable") : t("Loading…")}</option>}
+              <option value="normal">{t("Normal")}</option>
+              <option value="debug">{t("Debug")}</option>
+              <option value="trace">{t("Trace")}</option>
+            </select>
+          </div>
+          {verbosityReadError && <div className="save-notice" role="alert">{t("Could not read daemon diagnostic verbosity. Retrying automatically.")}</div>}
+          {verbositySaveError && <div className="save-notice" role="alert">{t("Could not change or confirm daemon diagnostic verbosity. The setting may have changed; it will be refreshed automatically.")}</div>}
+        </>
+      )}
 
       <div
         className="log-view"

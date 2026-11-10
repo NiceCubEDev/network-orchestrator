@@ -1,7 +1,9 @@
 use super::commands::Output;
 use super::ctx::Ctx;
 use clap::{Subcommand, ValueEnum};
+use net_manager_core::daemon_protocol::LoggingVerbosity;
 use net_manager_engine::linux_diagnostics as shared;
+use net_manager_engine::linux_system;
 use serde::Serialize;
 use std::future::Future;
 
@@ -39,6 +41,23 @@ impl From<Level> for shared::LogLevel {
     }
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum Verbosity {
+    Normal,
+    Debug,
+    Trace,
+}
+
+impl From<Verbosity> for LoggingVerbosity {
+    fn from(value: Verbosity) -> Self {
+        match value {
+            Verbosity::Normal => Self::Normal,
+            Verbosity::Debug => Self::Debug,
+            Verbosity::Trace => Self::Trace,
+        }
+    }
+}
+
 #[derive(Debug, Subcommand)]
 pub enum LogsCommand {
     Show {
@@ -48,6 +67,10 @@ pub enum LogsCommand {
         contains: Option<String>,
     },
     Clear,
+    Verbosity {
+        #[arg(value_enum)]
+        verbosity: Option<Verbosity>,
+    },
     Daemon {
         #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u32).range(1..=500))]
         lines: u32,
@@ -135,6 +158,10 @@ pub fn run_logs(ctx: &Ctx, command: LogsCommand) -> Result<Output, String> {
             output(serde_json::json!({"cleared": true}))
         }
         LogsCommand::Daemon { lines } => output(run_async(shared::daemon_log_tail(lines))?),
+        LogsCommand::Verbosity { verbosity } => output(match verbosity {
+            Some(verbosity) => linux_system::set_logging_verbosity(&ctx.engine, verbosity.into())?,
+            None => linux_system::logging_settings(&ctx.engine)?,
+        }),
     }
 }
 
@@ -152,5 +179,16 @@ pub fn run_recovery(ctx: &Ctx, command: RecoveryCommand) -> Result<Output, Strin
             &ctx.vault(),
             &ctx.store(),
         ))?),
+    }
+}
+
+#[cfg(test)]
+mod verbosity_tests {
+    use super::*;
+
+    #[test]
+    fn verbosity_rejects_unknown_levels() {
+        assert!(<Verbosity as ValueEnum>::from_str("trace", false).is_ok());
+        assert!(<Verbosity as ValueEnum>::from_str("verbose", false).is_err());
     }
 }

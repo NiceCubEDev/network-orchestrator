@@ -20,6 +20,46 @@ pub(crate) async fn daemon_log_tail(lines: u32) -> Result<Vec<LogEvent>, String>
     net_manager_engine::linux_diagnostics::daemon_log_tail(lines).await
 }
 
+#[cfg(target_os = "linux")]
+#[tauri::command]
+pub(crate) async fn get_logging_verbosity(
+) -> Result<Option<net_manager_core::daemon_protocol::LoggingVerbosity>, String> {
+    crate::daemon_client::DaemonClient::system()
+        .engine_request(|engine| {
+            net_manager_engine::linux_system::logging_settings(&engine)
+                .map(|settings| Some(settings.verbosity))
+        })
+        .await
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+pub(crate) async fn set_logging_verbosity(
+    verbosity: net_manager_core::daemon_protocol::LoggingVerbosity,
+) -> Result<(), String> {
+    crate::daemon_client::DaemonClient::system()
+        .engine_request(move |engine| {
+            net_manager_engine::linux_system::set_logging_verbosity(&engine, verbosity).map(|_| ())
+        })
+        .await
+}
+
+#[cfg(not(target_os = "linux"))]
+#[tauri::command]
+pub(crate) async fn get_logging_verbosity(
+) -> Result<Option<net_manager_core::daemon_protocol::LoggingVerbosity>, String> {
+    Ok(None)
+}
+
+#[cfg(not(target_os = "linux"))]
+#[tauri::command]
+pub(crate) async fn set_logging_verbosity(
+    verbosity: net_manager_core::daemon_protocol::LoggingVerbosity,
+) -> Result<(), String> {
+    let _ = verbosity;
+    Err("Logging verbosity is managed by the Linux daemon".into())
+}
+
 #[cfg(not(target_os = "linux"))]
 pub(crate) use non_linux::*;
 #[cfg(not(target_os = "linux"))]

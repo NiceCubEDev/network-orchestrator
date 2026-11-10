@@ -10,6 +10,20 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+### Added
+
+- Live daemon diagnostic verbosity (`normal`, `debug`, `trace`) in Logs and
+  `netorch logs verbosity [normal|debug|trace]`. The daemon persists one shared
+  setting; changing it does not restart tunnels or alter VPN authorization.
+- Bounded, asynchronous thread snapshots on Xray stop and netlink timeouts,
+  including wait channels, syscall numbers and available kernel frame names.
+  Snapshots remain enabled at normal verbosity; unavailable kernel stacks are
+  reported without widening service privileges.
+- Debug HTTPS failure categories and trace request, core-lock and netlink
+  queue/execution timings. Verbose metadata uses nonblocking journald output
+  and its retention/rate limits; client logs retain their existing size cap.
+  No configs, credentials, URLs, syscall arguments or process memory are logged.
+
 ### Fixed
 
 - Resolve NetworkManager VPN tunnel interfaces through their shared IPv4/IPv6

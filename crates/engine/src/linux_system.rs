@@ -183,6 +183,16 @@ pub fn vpn_auth_mode(engine: &LinuxEngine) -> Result<Option<VpnAuthMode>, String
         engine.ask(method::SETTINGS_GET, serde_json::Value::Null)?;
     Ok(Some(result.vpn_auth_mode))
 }
+pub fn logging_settings(engine: &LinuxEngine) -> Result<protocol::LoggingSettings, String> {
+    engine.ask(method::LOGGING_GET, serde_json::Value::Null)
+}
+
+pub fn set_logging_verbosity(
+    engine: &LinuxEngine,
+    verbosity: protocol::LoggingVerbosity,
+) -> Result<protocol::LoggingSettings, String> {
+    engine.ask(method::LOGGING_SET, protocol::LoggingSettings { verbosity })
+}
 
 pub fn set_vpn_auth_mode(engine: &LinuxEngine, mode: VpnAuthMode) -> Result<(), String> {
     let _: protocol::SettingsResult = engine.ask(

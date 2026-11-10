@@ -1,7 +1,7 @@
 import type {
   AlwaysOnListResult, BackendAvailability, ConditionalRuleEntry, ConditionalRouteRule,
   ConfigAnalysis, DomainPolicy, NetIntentView, NetworkInterface, NodePoolSettings, PinnedRoute,
-  PoolProbeEntry, Profile, ProfileInspection, RouteEntry, RouteMap, TunnelStatus, VpnAuthMode,
+  PoolProbeEntry, Profile, ProfileInspection, RouteEntry, RouteMap, TunnelStatus, VpnAuthMode, LoggingVerbosity,
   XrayPolicyPreview,
   ServiceCheck, ServiceCheckOutcome, ServiceCheckResult,
   ConnectionSetCredentialInput,
@@ -49,6 +49,7 @@ export class SandboxBackend {
   private serviceAttempts = new Map<string, Map<string, number>>();
   private editRevisions = new Map<string, string>();
   private nextEditRevision = 0;
+  private loggingVerbosity: LoggingVerbosity = "normal";
 
   private connectionSets: ConnectionSnippet[] = [];
   private rememberedOpenVpn = new Set<string>();
@@ -810,6 +811,8 @@ export class SandboxBackend {
       case "set_login_autostart": this.loginAutostart = Boolean(args.enabled); return this.loginAutostart;
       case "get_vpn_auth_mode": return this.authMode;
       case "set_vpn_auth_mode": this.authMode = args.mode as VpnAuthMode; return this.authMode;
+      case "get_logging_verbosity": return this.loggingVerbosity;
+      case "set_logging_verbosity": this.loggingVerbosity = args.verbosity as LoggingVerbosity; return null;
       case "get_recovery_report": return { issues: this.recovered ? [] : [{ kind: "ownedRoutes", profileId: "static", message: "Synthetic stale route from a previous sandbox session." }], requiresElevation: false };
       case "cleanup_recovery": this.recovered = true; return { issues: [], requiresElevation: false };
       case "connect_profile":

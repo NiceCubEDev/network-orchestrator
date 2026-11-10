@@ -1,6 +1,6 @@
 //! Administrator-chosen daemon settings, persisted next to the journal.
 
-use net_manager_core::daemon_protocol::VpnAuthMode;
+use net_manager_core::daemon_protocol::{LoggingVerbosity, VpnAuthMode};
 use net_manager_core::journal::write_atomic;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -14,6 +14,8 @@ const SETTINGS_VERSION: u32 = 1;
 #[serde(rename_all = "camelCase")]
 pub struct DaemonSettings {
     pub vpn_auth_mode: VpnAuthMode,
+    #[serde(default)]
+    pub logging_verbosity: LoggingVerbosity,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -39,6 +41,7 @@ impl SettingsStore {
     pub fn load(&self) -> DaemonSettings {
         let fail_closed = DaemonSettings {
             vpn_auth_mode: VpnAuthMode::Always,
+            logging_verbosity: LoggingVerbosity::Normal,
         };
         let raw = match fs::read(&self.path) {
             Ok(raw) => raw,
@@ -111,6 +114,7 @@ mod tests {
             store
                 .save(DaemonSettings {
                     vpn_auth_mode: mode,
+                    logging_verbosity: LoggingVerbosity::Normal,
                 })
                 .unwrap();
             assert_eq!(store.load().vpn_auth_mode, mode);
@@ -124,6 +128,32 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_settings_keep_authorization_and_default_logging() {
+        let (store, dir) = store("legacy");
+        fs::write(
+            dir.join(SETTINGS_FILE),
+            br#"{"version":1,"vpnAuthMode":"always"}"#,
+        )
+        .unwrap();
+        let loaded = store.load();
+        assert_eq!(loaded.vpn_auth_mode, VpnAuthMode::Always);
+        assert_eq!(loaded.logging_verbosity, LoggingVerbosity::Normal);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn logging_verbosity_roundtrips() {
+        let (store, dir) = store("verbosity");
+        let settings = DaemonSettings {
+            vpn_auth_mode: VpnAuthMode::FullTunnelOnly,
+            logging_verbosity: LoggingVerbosity::Trace,
+        };
+        store.save(settings).unwrap();
+        assert_eq!(store.load(), settings);
         fs::remove_dir_all(dir).unwrap();
     }
 
