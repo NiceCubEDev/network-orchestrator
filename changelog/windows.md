@@ -10,6 +10,14 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+### Fixed
+
+- Resolve adapter names correctly when changing their administrative state and
+  retain useful netsh errors.
+- Report subscription device requirements precisely and keep server delay probes
+  from opening console windows.
+- Keep the native-icon consistency check independent of Windows line endings.
+
 ## [0.10.5] - 2026-11-09
 
 Core 0.16.1.

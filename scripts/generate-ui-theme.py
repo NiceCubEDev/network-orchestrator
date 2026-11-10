@@ -146,7 +146,7 @@ def main():
         else:
             path.write_text(expected)
     if args.check:
-        digest = hashlib.sha256((ROOT / "src/icons.tsx").read_bytes()).hexdigest()
+        digest = hashlib.sha256((ROOT / "src/icons.tsx").read_text(encoding="utf-8").encode("utf-8")).hexdigest()
         recorded = ROOT / "macos/Sources/NetworkOrchestrator/Resources/Icons/source.sha256"
         if not recorded.exists() or recorded.read_text().strip() != digest:
             raise SystemExit("Native icons are stale; regenerate with scripts/generate-native-icons.py (reportlab).")

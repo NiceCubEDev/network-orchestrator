@@ -10,6 +10,13 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+### Fixed
+
+- Resolve Windows adapter identifiers to their friendly names and preserve netsh
+  failure details.
+- Diagnose subscription device requirements and unsupported responses without
+  exposing credentials; hide temporary Windows probe consoles.
+
 ## [0.17.0] - 2026-11-09
 
 ### Added

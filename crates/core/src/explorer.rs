@@ -1084,6 +1084,52 @@ pub fn list_interfaces() -> std::io::Result<Vec<NetworkInterface>> {
 
 // ── Interface state control ─────────────────────────────────────────────
 
+#[cfg(target_os = "windows")]
+fn windows_interface_name<'a>(
+    name: &str,
+    interfaces: &'a [NetworkInterface],
+) -> std::io::Result<&'a str> {
+    let interface = interfaces
+        .iter()
+        .find(|interface| interface.name.eq_ignore_ascii_case(name))
+        .or_else(|| {
+            let alias = name.to_lowercase();
+            interfaces
+                .iter()
+                .find(|interface| interface.friendly_name.to_lowercase() == alias)
+        })
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "network interface not found")
+        })?;
+    if interface.friendly_name.trim().is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "network interface has no Windows alias",
+        ));
+    }
+    Ok(&interface.friendly_name)
+}
+
+#[cfg(target_os = "windows")]
+fn netsh_interface_error(name: &str, admin: &str, output: &std::process::Output) -> std::io::Error {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let details = [stderr.trim(), stdout.trim()]
+        .into_iter()
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let message = format!(
+        "netsh interface set interface name={name:?} admin={admin} failed ({})",
+        output.status
+    );
+    std::io::Error::other(if details.is_empty() {
+        message
+    } else {
+        format!("{message}: {details}")
+    })
+}
+
 /// Bring an interface up or down by name.
 /// Requires administrator/root privileges.
 pub fn set_interface_state(name: &str, up: bool) -> std::io::Result<()> {
@@ -1109,26 +1155,20 @@ pub fn set_interface_state(name: &str, up: bool) -> std::io::Result<()> {
 
     #[cfg(target_os = "windows")]
     {
+        let interfaces = list_interfaces()?;
+        let name = windows_interface_name(name, &interfaces)?;
         let admin = if up { "enable" } else { "disable" };
         let output = std::process::Command::new("netsh")
             .args([
                 "interface",
                 "set",
                 "interface",
-                name,
+                &format!("name={name}"),
                 &format!("admin={admin}"),
             ])
             .output()?;
         if !output.status.success() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                format!(
-                    "netsh interface set interface {} admin={}: {}",
-                    name,
-                    admin,
-                    String::from_utf8_lossy(&output.stderr).trim()
-                ),
-            ));
+            return Err(netsh_interface_error(name, admin, &output));
         }
         Ok(())
     }
@@ -1150,6 +1190,102 @@ mod tests {
     use super::*;
     use std::cmp::Reverse;
     use std::net::Ipv4Addr;
+
+    #[cfg(target_os = "windows")]
+    mod windows_interface_state {
+        use super::*;
+        use std::os::windows::process::ExitStatusExt;
+
+        fn interface(name: &str, friendly_name: &str) -> NetworkInterface {
+            NetworkInterface {
+                name: name.into(),
+                friendly_name: friendly_name.into(),
+                kind: InterfaceKind::OpenVpn,
+                state: InterfaceState::Down,
+                addresses: vec![],
+                dns_servers: vec![],
+                dns_suffix: None,
+                mtu: None,
+                if_index: 24,
+                physical: false,
+                mac: None,
+                gateway: None,
+                ipv6_gateway: None,
+                rx_bytes: None,
+                tx_bytes: None,
+                link_speed_mbps: None,
+                category: InterfaceCategory::Vpn,
+                description: String::new(),
+                if_type: 6,
+                tunnel_type: None,
+            }
+        }
+
+        #[test]
+        fn resolves_down_adapter_id_and_alias_to_friendly_name() {
+            let id = "{11111111-aaaa-4111-8111-111111111111}";
+            let alias = "Подключение по локальной сети 2";
+            let interfaces = [interface(id, alias)];
+            for name in [id.to_uppercase(), alias.to_lowercase()] {
+                assert_eq!(windows_interface_name(&name, &interfaces).unwrap(), alias);
+            }
+        }
+
+        #[test]
+        fn adapter_id_takes_priority_over_a_matching_alias() {
+            let interfaces = [
+                interface("other-id", "target-id"),
+                interface("target-id", "OpenVPN adapter"),
+            ];
+            assert_eq!(
+                windows_interface_name("target-id", &interfaces).unwrap(),
+                "OpenVPN adapter"
+            );
+        }
+
+        #[test]
+        fn rejects_unknown_adapter_and_blank_alias() {
+            let interfaces = [interface("adapter-id", " ")];
+            assert_eq!(
+                windows_interface_name("missing-id", &interfaces)
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::NotFound
+            );
+            assert_eq!(
+                windows_interface_name("adapter-id", &interfaces)
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::InvalidData
+            );
+        }
+
+        #[test]
+        fn netsh_failures_keep_both_output_streams_and_exit_status() {
+            for (stdout, stderr) in [
+                ("Interface not found", ""),
+                ("", "Access denied"),
+                ("Interface not found", "Additional diagnostic"),
+                (" \r\n", " \r\n"),
+            ] {
+                let output = std::process::Output {
+                    status: std::process::ExitStatus::from_raw(5),
+                    stdout: stdout.as_bytes().to_vec(),
+                    stderr: stderr.as_bytes().to_vec(),
+                };
+                let error = netsh_interface_error("OpenVPN adapter", "enable", &output);
+                let message = error.to_string();
+                for diagnostic in [stdout.trim(), stderr.trim()] {
+                    if !diagnostic.is_empty() {
+                        assert!(message.contains(diagnostic), "{message}");
+                    }
+                }
+                assert!(message.contains("5"), "{message}");
+                assert!(!message.ends_with(": "), "{message}");
+                assert_eq!(error.kind(), std::io::ErrorKind::Other);
+            }
+        }
+    }
 
     #[cfg(target_os = "macos")]
     #[test]

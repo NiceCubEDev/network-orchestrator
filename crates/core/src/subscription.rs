@@ -27,6 +27,12 @@ pub const SUBSCRIPTION_USER_AGENT: &str = "v2rayN/7.13.8";
 
 pub const UNSUPPORTED_CLIENT_MESSAGE: &str =
     "The subscription server returned a placeholder instead of servers. It may not recognize this app or require an HWID.";
+pub const SUBSCRIPTION_HWID_REQUIRED_MESSAGE: &str =
+    "The subscription server requires a device HWID. Generate one or enter the HWID registered with your provider.";
+pub const SUBSCRIPTION_HWID_LIMIT_MESSAGE: &str =
+    "The subscription device limit has been reached. Remove an unused device in your provider account or contact support.";
+pub const UNSUPPORTED_SHARE_LINKS_MESSAGE: &str =
+    "This subscription contains protocols that are not supported as share links. Export an Xray JSON subscription or a VLESS/Hysteria2 subscription.";
 
 /// Stable, privacy-preserving device HWID for the `X-HWID` header. Panels with
 /// a device limit (e.g. Remnawave) refuse subscriptions without one; deriving
@@ -48,11 +54,23 @@ pub fn derive_hwid(machine_id: &str) -> String {
 
 /// True when every link is a panel placeholder such as "App not supported".
 pub fn is_unsupported_client_placeholder(urls: &[String]) -> bool {
-    const MARKERS: [&str; 4] = [
-        "not supported",
-        "unsupported",
-        "не поддерживается",
+    const MARKERS: [&str; 16] = [
+        "app not supported",
+        "app is not supported",
+        "application not supported",
+        "application is not supported",
+        "client not supported",
+        "client is not supported",
+        "unsupported app",
+        "unsupported client",
+        "приложение не поддерживается",
+        "клиент не поддерживается",
         "обновите приложение",
+        "обновите клиент",
+        "update your app",
+        "update your client",
+        "please update app",
+        "please update client",
     ];
     !urls.is_empty()
         && urls.iter().all(|url| {
@@ -61,6 +79,27 @@ pub fn is_unsupported_client_placeholder(urls: &[String]) -> bool {
                 MARKERS.iter().any(|marker| name.contains(marker))
             })
         })
+}
+
+fn placeholder_error_message(skipped_protocols: &[String]) -> &'static str {
+    if skipped_protocols.iter().any(|protocol| {
+        matches!(
+            protocol.to_ascii_lowercase().as_str(),
+            "vmess"
+                | "trojan"
+                | "ss"
+                | "ssr"
+                | "wireguard"
+                | "wg"
+                | "amneziawg"
+                | "tuic"
+                | "hysteria"
+        )
+    }) {
+        UNSUPPORTED_SHARE_LINKS_MESSAGE
+    } else {
+        UNSUPPORTED_CLIENT_MESSAGE
+    }
 }
 
 /// Supported entries of a subscription body (share links or full Xray JSON
@@ -440,6 +479,27 @@ pub fn summarize_subscription_body(body: &str, content_type: Option<&str>) -> St
         if schemes.is_empty() { "-" } else { &schemes }
     )
 }
+/// Classify explicit provider HWID denials without exposing response values.
+/// Flags are checked before the HTTP status or subscription body is handled.
+pub fn validate_subscription_response_headers(
+    headers: &reqwest::header::HeaderMap,
+) -> io::Result<()> {
+    let enabled = |name: &str| {
+        headers.get_all(name).iter().any(|value| {
+            value
+                .to_str()
+                .is_ok_and(|text| text.trim().eq_ignore_ascii_case("true"))
+        })
+    };
+    if enabled("x-hwid-max-devices-reached") || enabled("x-hwid-limit") {
+        return Err(invalid(SUBSCRIPTION_HWID_LIMIT_MESSAGE));
+    }
+    if enabled("x-hwid-not-supported") {
+        return Err(invalid(SUBSCRIPTION_HWID_REQUIRED_MESSAGE));
+    }
+    Ok(())
+}
+
 pub async fn fetch(
     client: &reqwest::Client,
     source: &str,
@@ -468,6 +528,7 @@ async fn fetch_inner(
         let mut response = request.send().await.map_err(|_| {
             failure("Could not fetch the subscription. Check the URL and network connection.")
         })?;
+        validate_subscription_response_headers(response.headers())?;
         if matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
             if redirect == 5 {
                 return Err(failure("Subscription redirected too many times"));
@@ -563,7 +624,7 @@ pub fn import_body(
         return Err(invalid("Subscription contained no supported share links"));
     }
     if is_unsupported_client_placeholder(&urls) {
-        return Err(invalid(UNSUPPORTED_CLIENT_MESSAGE));
+        return Err(invalid(placeholder_error_message(&skipped_protocols)));
     }
     let used = profile_listener_ports(&document.profiles, "");
     let (socks, http) = select_generated_ports(None, None, &used, available)?;
@@ -1148,7 +1209,7 @@ pub fn refresh_body(
 
     let (urls, mut skipped_count, skipped_protocols) = parse_subscription_body_detailed(body);
     if is_unsupported_client_placeholder(&urls) {
-        return Err(invalid(UNSUPPORTED_CLIENT_MESSAGE));
+        return Err(invalid(placeholder_error_message(&skipped_protocols)));
     }
     let mut endpoints = Vec::new();
     let mut configs = Vec::new();
@@ -1334,6 +1395,8 @@ pub(crate) async fn temporary_socks_client(
         .map_err(|_| "failed to encode delay probe config".to_string())?;
     drop(listener);
 
+    #[cfg(windows)]
+    command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     command
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
@@ -1457,6 +1520,57 @@ pub fn public_profiles(mut profiles: Vec<Profile>) -> Vec<Profile> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn windows_probe_console_child() {
+        use std::io::Read;
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetConsoleWindow() -> *mut std::ffi::c_void;
+        }
+        let Some(report) = std::env::var_os("NETORCH_TEST_PROBE_CONSOLE_REPORT") else {
+            return;
+        };
+        std::io::stdin().read_to_end(&mut Vec::new()).unwrap();
+        let console = !unsafe { GetConsoleWindow() }.is_null();
+        std::fs::write(report, if console { "console" } else { "hidden" }).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_temporary_probe_runs_without_console() {
+        let directory = tempfile::tempdir().unwrap();
+        let report = directory.path().join("console-state");
+        let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "subscription::tests::windows_probe_console_child",
+            ])
+            .env("NETORCH_TEST_PROBE_CONSOLE_REPORT", &report);
+        command.creation_flags(0x0000_0010); // CREATE_NEW_CONSOLE must be overridden by the probe.
+        let mut process = None;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            super::temporary_socks_client(
+                |_| Ok(serde_json::json!({"inbounds": []})),
+                command,
+                std::time::Duration::from_secs(1),
+                &mut process,
+            ),
+        )
+        .await
+        .expect("the synthetic probe child must finish promptly");
+        if let Some(mut process) = process {
+            process.stop().await.unwrap();
+        }
+        assert_eq!(
+            result.expect_err("the synthetic child has no proxy listener"),
+            "delay probe process exited before proxy was ready"
+        );
+        assert_eq!(std::fs::read_to_string(report).unwrap(), "hidden");
+    }
+
     fn headers(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         pairs
             .iter()
@@ -1928,6 +2042,68 @@ mod tests {
     }
 
     #[test]
+    fn valid_server_names_with_unsupported_words_are_not_placeholders() {
+        for name in [
+            "IPv6 unsupported fallback",
+            "IPv6 not supported",
+            "IPv6 не поддерживается",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let vault = ConfigVault::new(dir.path().join("configs"));
+            let store = ProfileStore::new(dir.path().join("profiles.json"));
+            let request = SubscriptionImport {
+                id: "real-server",
+                url: "https://example.test/sub",
+                hwid: "",
+                name: "",
+                refresh_interval_minutes: None,
+            };
+            let body = format!("vless://synthetic-id@node.test:443?security=tls#{name}");
+            let result = import_body(
+                &vault,
+                &store,
+                &request,
+                &body,
+                ResponseMeta::default(),
+                XrayMode::Socks,
+                |_| true,
+            )
+            .unwrap();
+            assert_eq!(result.profiles.len(), 1);
+        }
+    }
+
+    #[test]
+    fn unsupported_protocols_with_placeholder_get_a_protocol_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = ConfigVault::new(dir.path().join("configs"));
+        let store = ProfileStore::new(dir.path().join("profiles.json"));
+        let request = SubscriptionImport {
+            id: "mixed-protocols",
+            url: "https://example.test/sub",
+            hwid: "",
+            name: "",
+            refresh_interval_minutes: None,
+        };
+        let body = "vmess://e30=\nvless://id@0.0.0.0:1#App%20not%20supported";
+        let error = import_body(
+            &vault,
+            &store,
+            &request,
+            body,
+            ResponseMeta::default(),
+            XrayMode::Socks,
+            |_| true,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "This subscription contains protocols that are not supported as share links. Export an Xray JSON subscription or a VLESS/Hysteria2 subscription."
+        );
+        assert!(store.load().unwrap().profiles.is_empty());
+    }
+
+    #[test]
     fn import_rejects_placeholder_subscription_with_a_clear_message() {
         let dir = tempfile::tempdir().unwrap();
         let vault = ConfigVault::new(dir.path().join("configs"));
@@ -2093,6 +2269,53 @@ mod tests {
             stream.write_all(response.as_bytes()).await.unwrap();
         });
         (url, task)
+    }
+
+    #[tokio::test]
+    async fn hwid_denial_headers_return_precise_redacted_errors() {
+        let missing = "The subscription server requires a device HWID. Generate one or enter the HWID registered with your provider.";
+        let limit = "The subscription device limit has been reached. Remove an unused device in your provider account or contact support.";
+        for (status, flag, expected) in [
+            ("403 Forbidden", "X-Hwid-Not-Supported: true", missing),
+            ("200 OK", "x-hwid-not-supported: TRUE", missing),
+            ("403 Forbidden", "x-hwid-max-devices-reached: true", limit),
+            ("200 OK", "x-hwid-limit: true", limit),
+            (
+                "200 OK",
+                "x-hwid-not-supported: true\r\nx-hwid-max-devices-reached: true",
+                limit,
+            ),
+        ] {
+            let body = "private-response-body";
+            let (url, server) = fake_response(format!(
+                "HTTP/1.1 {status}\r\n{flag}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ))
+            .await;
+            let error = fetch(&http_client().unwrap(), &url, "private-hwid")
+                .await
+                .err()
+                .expect("HWID denial must be an error")
+                .to_string();
+            assert_eq!(error, expected);
+            for secret in ["private-token", "private-hwid", "private-response-body"] {
+                assert!(!error.contains(secret));
+            }
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn inactive_hwid_denial_flags_do_not_reject_the_response() {
+        let (url, server) = fake_response(
+            "HTTP/1.1 200 OK\r\nx-hwid-active: true\r\nx-hwid-not-supported: false\r\nx-hwid-max-devices-reached: FALSE\r\nx-hwid-limit: 0\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".into(),
+        )
+        .await;
+        assert_eq!(
+            fetch(&http_client().unwrap(), &url, "").await.unwrap().body,
+            "ok"
+        );
+        server.await.unwrap();
     }
 
     #[tokio::test]
