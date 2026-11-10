@@ -207,6 +207,8 @@ pub fn run() {
             get_logs,
             clear_logs,
             daemon_log_tail,
+            get_logging_verbosity,
+            set_logging_verbosity,
             get_recovery_report,
             cleanup_recovery,
             list_conditional_rules,

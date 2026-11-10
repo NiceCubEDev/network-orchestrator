@@ -358,20 +358,38 @@ fn https_client(interface: &str) -> io::Result<reqwest::blocking::Client> {
 }
 fn https(client: &reqwest::blocking::Client, url: &str) -> ProbeOutcome {
     let started = Instant::now();
-    let result = (|| -> Option<()> {
-        let response = client.get(url).send().ok()?;
+    let result = (|| -> Result<(), (&'static str, Option<u16>)> {
+        let response = client.get(url).send().map_err(|error| {
+            let reason = if error.is_timeout() {
+                "timeout"
+            } else if error.is_connect() {
+                "connect"
+            } else {
+                "request"
+            };
+            (reason, None)
+        })?;
         if !response.status().is_success() {
-            return None;
+            return Err(("http_status", Some(response.status().as_u16())));
         }
         // A bounded prefix is enough to prove the TLS/HTTP path, not the
         // integrity of an arbitrary site's entire response body.
-        io::copy(&mut response.take(64 * 1024), &mut io::sink()).ok()?;
-        Some(())
+        io::copy(&mut response.take(64 * 1024), &mut io::sink())
+            .map_err(|_| ("body_read", None))?;
+        Ok(())
     })();
-    if result.is_some() {
-        ProbeOutcome::Healthy(started.elapsed().as_millis().min(u128::from(u32::MAX)) as u32)
-    } else {
-        ProbeOutcome::Stalled
+    match result {
+        Ok(()) => {
+            crate::diagnostic_logging::trace(format_args!(
+                "watchdog https outcome=healthy duration_ms={}",
+                started.elapsed().as_millis()
+            ));
+            ProbeOutcome::Healthy(started.elapsed().as_millis().min(u128::from(u32::MAX)) as u32)
+        }
+        Err((reason, status)) => {
+            crate::diagnostic_logging::debug(format_args!("watchdog https outcome=stalled reason={reason} http_status={status:?} duration_ms={}", started.elapsed().as_millis()));
+            ProbeOutcome::Stalled
+        }
     }
 }
 fn dns_probe(interface: &str, server: IpAddr, hostname: &str) -> ProbeOutcome {
@@ -616,6 +634,7 @@ fn run(
                 continue;
             }
             let udp_sockets = resources.as_ref().map(|report| report.udp_sockets);
+            crate::diagnostic_logging::trace(format_args!("watchdog observation online={online} https={https_result:?} dns={dns_result:?} node_reachable={node_reachable} udp_sockets={udp_sockets:?}"));
             state.observe(https_result, dns_result, node_reachable, resources);
             if let Ok(mut published) = shared.lock() {
                 if let Some(reason) = published.request.as_ref() {

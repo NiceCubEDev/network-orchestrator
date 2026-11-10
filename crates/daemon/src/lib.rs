@@ -11,6 +11,8 @@ pub mod cond_rules;
 #[cfg(target_os = "linux")]
 pub mod core;
 #[cfg(target_os = "linux")]
+pub mod diagnostic_logging;
+#[cfg(target_os = "linux")]
 pub mod dns;
 #[cfg(target_os = "linux")]
 pub mod dns_status;

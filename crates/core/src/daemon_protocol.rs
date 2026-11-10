@@ -71,6 +71,8 @@ pub mod method {
     pub const ALWAYS_ON_RESUME: &str = "alwaysOn.resume";
     pub const SETTINGS_GET: &str = "settings.get";
     pub const SETTINGS_SET: &str = "settings.set";
+    pub const LOGGING_GET: &str = "logging.get";
+    pub const LOGGING_SET: &str = "logging.set";
     pub const COND_RULES_LIST: &str = "condRules.list";
     pub const COND_RULES_PUT: &str = "condRules.put";
     pub const COND_RULES_REMOVE: &str = "condRules.remove";
@@ -122,6 +124,8 @@ pub mod method {
         ALWAYS_ON_RESUME,
         SETTINGS_GET,
         SETTINGS_SET,
+        LOGGING_GET,
+        LOGGING_SET,
         COND_RULES_LIST,
         COND_RULES_PUT,
         COND_RULES_REMOVE,
@@ -173,6 +177,21 @@ pub enum VpnAuthMode {
     FullTunnelOnly,
     /// Every connect requires an administrator.
     Always,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum LoggingVerbosity {
+    #[default]
+    Normal,
+    Debug,
+    Trace,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LoggingSettings {
+    pub verbosity: LoggingVerbosity,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

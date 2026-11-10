@@ -18,15 +18,16 @@ use net_manager_core::daemon_protocol::{
     AlwaysOnSetParams, AlwaysOnSetResult, CondRulesListResult, CondRulesPutParams,
     CondRulesPutResult, CondRulesRemoveParams, CondRulesRemoveResult, ConditionalRuleEntry,
     ErrorCode, EventFrame, ExternalTunnelStopParams, HelloParams, HelloResult, LinkSetStateParams,
-    NetDnsProbeParams, NetEditResult, NetIntentDelParams, NetIntentResult, NetIntentSetParams,
-    NetRouteAddParams, NetRouteDelParams, NetRuleAddParams, NetRuleDelParams, NmListResult,
-    NmSetActiveParams, OpenVpnConnectRequest, OpenVpnConnectResult, OpenVpnDisconnectResult,
-    OpenVpnProbeResult, OpenVpnProfileParams, OwnedChanged, OwnedListResult, OwnerParams,
-    RequestFrame, ResponseFrame, RoutesApplyParams, RoutesApplyResult, RoutesRemoveResult,
-    SettingsResult, SettingsSetParams, VpnAuthMode, WireGuardConnectParams, WireGuardConnectResult,
-    WireGuardDisconnectResult, WireGuardProfileParams, XrayConnectParams, XrayConnectResult,
-    XrayDisconnectResult, XrayInstallParams, XrayInstallResult, XrayProfileParams,
-    XrayRemoveResult, HELLO_TIMEOUT_SECS, MAX_CONNECTIONS, MAX_FRAME_BYTES, PROTOCOL_VERSION,
+    LoggingSettings, LoggingVerbosity, NetDnsProbeParams, NetEditResult, NetIntentDelParams,
+    NetIntentResult, NetIntentSetParams, NetRouteAddParams, NetRouteDelParams, NetRuleAddParams,
+    NetRuleDelParams, NmListResult, NmSetActiveParams, OpenVpnConnectRequest, OpenVpnConnectResult,
+    OpenVpnDisconnectResult, OpenVpnProbeResult, OpenVpnProfileParams, OwnedChanged,
+    OwnedListResult, OwnerParams, RequestFrame, ResponseFrame, RoutesApplyParams,
+    RoutesApplyResult, RoutesRemoveResult, SettingsResult, SettingsSetParams, VpnAuthMode,
+    WireGuardConnectParams, WireGuardConnectResult, WireGuardDisconnectResult,
+    WireGuardProfileParams, XrayConnectParams, XrayConnectResult, XrayDisconnectResult,
+    XrayInstallParams, XrayInstallResult, XrayProfileParams, XrayRemoveResult, HELLO_TIMEOUT_SECS,
+    MAX_CONNECTIONS, MAX_FRAME_BYTES, PROTOCOL_VERSION,
 };
 use net_manager_core::wireguard_config::parse_wireguard_config;
 use serde::de::DeserializeOwned;
@@ -125,7 +126,9 @@ impl<A: Authorizer> ServerContext<A> {
     }
 
     pub fn with_settings_store(mut self, store: SettingsStore) -> Self {
-        self.settings = Arc::new(Mutex::new(store.load()));
+        let settings = store.load();
+        crate::diagnostic_logging::set_verbosity(settings.logging_verbosity);
+        self.settings = Arc::new(Mutex::new(settings));
         self.settings_store = Some(Arc::new(store));
         self
     }
@@ -337,8 +340,40 @@ async fn dispatch<A: Authorizer>(
         .copied()
         .find(|known| *known == method_name)
         .unwrap_or("unknown");
+    let read_method = matches!(
+        safe_method,
+        method::SETTINGS_GET
+            | method::LOGGING_GET
+            | method::OWNED_LIST
+            | method::ALWAYS_ON_LIST
+            | method::COND_RULES_LIST
+            | method::WIREGUARD_STATUS
+            | method::OPENVPN_STATUS
+            | method::OPENVPN_PLAN
+            | method::XRAY_STATUS
+            | method::XRAY_PROXY_EXITS
+            | method::TAILSCALE_STATUS
+            | method::NM_LIST
+            | method::NET_TABLES
+            | method::NET_EXPLAIN
+            | method::NET_DNS_STATUS
+            | method::NET_INTENT_LIST
+    );
+    if read_method {
+        crate::diagnostic_logging::debug(format_args!("request begin method={safe_method}"));
+    }
     let result = handle(request, peer, ctx).await;
-    if result.is_err() || required_action(&method_name).is_some() {
+    if read_method {
+        crate::diagnostic_logging::debug(format_args!(
+            "request end method={safe_method} ok={} duration_ms={}",
+            result.is_ok(),
+            started.elapsed().as_millis()
+        ));
+    }
+    if result.is_err()
+        || required_action(&method_name).is_some()
+        || safe_method == method::LOGGING_SET
+    {
         let outcome = match &result {
             Ok(_) => "ok".to_string(),
             Err((code, _)) => format!("{code:?}"),
@@ -372,13 +407,15 @@ async fn handle<A: Authorizer>(
         method::SETTINGS_SET => {
             let params: SettingsSetParams = params(request.params)?;
             authorize(ctx, peer, Action::SystemNetwork).await?;
-            let settings = DaemonSettings {
-                vpn_auth_mode: params.vpn_auth_mode,
-            };
+            let mode = params.vpn_auth_mode;
             let live = ctx.settings.clone();
             let store = ctx.settings_store.clone();
             tokio::task::spawn_blocking(move || {
                 let mut current = live.lock().unwrap();
+                let settings = DaemonSettings {
+                    vpn_auth_mode: mode,
+                    ..*current
+                };
                 if let Some(store) = store {
                     store.save(settings)?;
                 }
@@ -389,8 +426,35 @@ async fn handle<A: Authorizer>(
             .map_err(|_| (ErrorCode::Internal, "settings task failed".to_string()))?
             .map_err(|_| (ErrorCode::Internal, "cannot save settings".to_string()))?;
             to_value(&SettingsResult {
-                vpn_auth_mode: settings.vpn_auth_mode,
+                vpn_auth_mode: mode,
             })
+        }
+        method::LOGGING_GET => to_value(&LoggingSettings {
+            verbosity: ctx.settings.lock().unwrap().logging_verbosity,
+        }),
+        method::LOGGING_SET => {
+            let params: LoggingSettings = params(request.params)?;
+            authorize(ctx, peer, Action::SystemNetwork).await?;
+            let verbosity = params.verbosity;
+            let live = ctx.settings.clone();
+            let store = ctx.settings_store.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut current = live.lock().unwrap();
+                let settings = DaemonSettings {
+                    logging_verbosity: verbosity,
+                    ..*current
+                };
+                if let Some(store) = store {
+                    store.save(settings)?;
+                }
+                *current = settings;
+                crate::diagnostic_logging::set_verbosity(settings.logging_verbosity);
+                Ok::<(), io::Error>(())
+            })
+            .await
+            .map_err(|_| (ErrorCode::Internal, "settings task failed".to_string()))?
+            .map_err(|_| (ErrorCode::Internal, "cannot save settings".to_string()))?;
+            to_value(&params)
         }
         method::OWNED_LIST => {
             let owners = with_core(ctx, move |core| Ok(core.owned(uid))).await?;
@@ -1075,8 +1139,20 @@ where
 {
     let core = core.clone();
     tokio::task::spawn_blocking(move || {
+        let tracing = crate::diagnostic_logging::enabled(LoggingVerbosity::Trace);
+        let wait_started = tracing.then(Instant::now);
         let mut core = core.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        f(&mut core)
+        let acquired = tracing.then(Instant::now);
+        let result = f(&mut core);
+        drop(core);
+        if let (Some(wait), Some(hold)) = (wait_started, acquired) {
+            crate::diagnostic_logging::trace(format_args!(
+                "core mutex wait_us={} hold_us={}",
+                hold.duration_since(wait).as_micros(),
+                hold.elapsed().as_micros()
+            ));
+        }
+        result
     })
     .await
     .map_err(|err| (ErrorCode::Internal, err.to_string()))?
@@ -1741,6 +1817,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn logging_updates_are_authorized_validated_and_independent() {
+        let harness = Harness::new(AuthDecision::Authorized);
+        let mut client = harness.hello(1000).await;
+        let reply = client
+            .call(2, method::LOGGING_SET, json!({"verbosity":"invalid"}))
+            .await;
+        assert_eq!(reply["error"]["code"], json!("invalidParams"));
+        client
+            .call(3, method::LOGGING_SET, json!({"verbosity":"trace"}))
+            .await;
+        client
+            .call(4, method::SETTINGS_SET, json!({"vpnAuthMode":"always"}))
+            .await;
+        assert_eq!(
+            client.call(5, method::LOGGING_GET, Value::Null).await["result"]["verbosity"],
+            json!("trace")
+        );
+        assert_eq!(
+            client.call(6, method::SETTINGS_GET, Value::Null).await["result"]["vpnAuthMode"],
+            json!("always")
+        );
+
+        let denied = Harness::new(AuthDecision::Denied);
+        let mut client = denied.hello(1000).await;
+        let reply = client
+            .call(2, method::LOGGING_SET, json!({"verbosity":"debug"}))
+            .await;
+        assert_eq!(reply["error"]["code"], json!("notAuthorized"));
+        assert_eq!(
+            client.call(3, method::LOGGING_GET, Value::Null).await["result"]["verbosity"],
+            json!("normal")
+        );
+    }
+
+    #[tokio::test]
     async fn concurrent_settings_updates_keep_disk_and_live_mode_in_sync() {
         let dir = std::env::temp_dir().join(format!(
             "netorch-concurrent-settings-{}-{}",
@@ -1763,13 +1874,23 @@ mod tests {
             let barrier = barrier.clone();
             tasks.push(tokio::spawn(async move {
                 barrier.wait().await;
-                client
-                    .call(
-                        index as u64 + 2,
-                        method::SETTINGS_SET,
-                        json!({"vpnAuthMode": if index % 2 == 0 { "always" } else { "noPrompt" }}),
-                    )
-                    .await
+                if index % 2 == 0 {
+                    client
+                        .call(
+                            index as u64 + 2,
+                            method::SETTINGS_SET,
+                            json!({"vpnAuthMode":"always"}),
+                        )
+                        .await
+                } else {
+                    client
+                        .call(
+                            index as u64 + 2,
+                            method::LOGGING_SET,
+                            json!({"verbosity":"debug"}),
+                        )
+                        .await
+                }
             }));
         }
         barrier.wait().await;
@@ -1777,11 +1898,28 @@ mod tests {
             let reply = task.await.unwrap();
             assert_eq!(reply["ok"], json!(true), "{reply}");
         }
-        assert_eq!(
-            SettingsStore::new(&path).load().vpn_auth_mode,
-            harness.ctx.vpn_auth_mode()
-        );
+        let saved = SettingsStore::new(&path).load();
+        let live = *harness.ctx.settings.lock().unwrap();
+        assert_eq!(saved, live);
+        assert_eq!(saved.vpn_auth_mode, VpnAuthMode::Always);
+        assert_eq!(saved.logging_verbosity, LoggingVerbosity::Debug);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_logging_save_preserves_live_settings() {
+        let harness = Harness::with(AuthDecision::Authorized, |ctx| {
+            ctx.settings_store = Some(Arc::new(SettingsStore::new("/dev/null/settings.json")));
+        });
+        let mut client = harness.hello(1000).await;
+        let reply = client
+            .call(2, method::LOGGING_SET, json!({"verbosity":"trace"}))
+            .await;
+        assert_eq!(reply["ok"], json!(false));
+        assert_eq!(
+            client.call(3, method::LOGGING_GET, Value::Null).await["result"]["verbosity"],
+            json!("normal")
+        );
     }
 
     #[tokio::test]

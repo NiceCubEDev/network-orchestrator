@@ -581,6 +581,7 @@ export interface AutoConnectResult {
 
 export type LogLevel = "info" | "warn" | "error";
 export type LogSource = "app" | "daemon";
+export type LoggingVerbosity = "normal" | "debug" | "trace";
 
 export interface LogEvent {
   tsUnix: number;

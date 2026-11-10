@@ -10,6 +10,11 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+### Added
+
+- Typed logging verbosity and additive daemon logging settings methods, shared by
+  Linux GUI and CLI without changing VPN authorization or restarting tunnels.
+
 ## [0.17.0] - 2026-11-09
 
 ### Added

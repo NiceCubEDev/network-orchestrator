@@ -27,8 +27,9 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::io;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc as async_mpsc;
 
 /// `RTPROT` stamped on every route the daemon installs; deletes filter on
@@ -1084,11 +1085,33 @@ impl Command {
     }
 }
 
+struct QueuedCommand {
+    command: Command,
+    id: u64,
+    queued: Instant,
+}
+
+impl QueuedCommand {
+    fn new(command: Command) -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        crate::diagnostic_logging::trace(format_args!(
+            "netlink enqueue id={id} operation={}",
+            command.operation()
+        ));
+        Self {
+            command,
+            id,
+            queued: Instant::now(),
+        }
+    }
+}
+
 /// Handle to the netlink actor thread. Cloneable; every call blocks the
 /// calling (non-async) thread until the kernel answers or times out.
 #[derive(Clone)]
 pub struct NetlinkExecutor {
-    tx: async_mpsc::UnboundedSender<Command>,
+    tx: async_mpsc::UnboundedSender<QueuedCommand>,
     reply_timeout: Duration,
 }
 
@@ -1138,7 +1161,9 @@ impl NetlinkExecutor {
         let (reply_tx, reply_rx) = mpsc::channel();
         let command = command(reply_tx);
         let operation = command.operation();
-        self.tx.send(command).map_err(|_| {
+        let queued = QueuedCommand::new(command);
+        let id = queued.id;
+        self.tx.send(queued).map_err(|_| {
             eprintln!(
                 "network-orchestrator-daemon: netlink actor unavailable operation={operation}"
             );
@@ -1150,11 +1175,15 @@ impl NetlinkExecutor {
             .recv_timeout(self.reply_timeout)
             .map_err(|err| {
                 eprintln!("network-orchestrator-daemon: netlink reply failed operation={operation} reason={err:?}");
+                if matches!(err, mpsc::RecvTimeoutError::Timeout) {
+                    crate::diagnostic_logging::snapshot_process(std::process::id(), "netlink_reply_timeout");
+                }
                 actor_gone()
             })?
             .inspect_err(|err| {
                 eprintln!("network-orchestrator-daemon: netlink operation failed operation={operation} kind={:?} os_code={:?}", err.kind(), err.raw_os_error());
             })
+            .inspect(|_| crate::diagnostic_logging::trace(format_args!("netlink reply id={id} operation={operation}")))
     }
 
     fn call_with<T>(
@@ -1164,7 +1193,9 @@ impl NetlinkExecutor {
         let (reply_tx, reply_rx) = mpsc::channel();
         let command = command(reply_tx);
         let operation = command.operation();
-        self.tx.send(command).map_err(|_| {
+        let queued = QueuedCommand::new(command);
+        let id = queued.id;
+        self.tx.send(queued).map_err(|_| {
             eprintln!(
                 "network-orchestrator-daemon: netlink actor unavailable operation={operation}"
             );
@@ -1174,11 +1205,15 @@ impl NetlinkExecutor {
             .recv_timeout(self.reply_timeout)
             .map_err(|err| {
                 eprintln!("network-orchestrator-daemon: netlink reply failed operation={operation} reason={err:?}");
+                if matches!(err, mpsc::RecvTimeoutError::Timeout) {
+                    crate::diagnostic_logging::snapshot_process(std::process::id(), "netlink_reply_timeout");
+                }
                 actor_gone()
             })?
             .inspect_err(|err| {
                 eprintln!("network-orchestrator-daemon: netlink operation failed operation={operation} kind={:?} os_code={:?}", err.kind(), err.raw_os_error());
             })
+            .inspect(|_| crate::diagnostic_logging::trace(format_args!("netlink reply id={id} operation={operation}")))
     }
 
     pub fn owned_routes_snapshot(&self) -> io::Result<Vec<AppliedRoute>> {
@@ -1355,9 +1390,22 @@ async fn get_rules(handle: &rtnetlink::Handle) -> io::Result<Vec<RuleMessage>> {
     Ok(rules)
 }
 
-async fn run_actor(handle: rtnetlink::Handle, mut rx: async_mpsc::UnboundedReceiver<Command>) {
-    while let Some(command) = rx.recv().await {
+async fn run_actor(
+    handle: rtnetlink::Handle,
+    mut rx: async_mpsc::UnboundedReceiver<QueuedCommand>,
+) {
+    while let Some(QueuedCommand {
+        command,
+        id,
+        queued,
+    }) = rx.recv().await
+    {
         let operation = command.operation();
+        let started = Instant::now();
+        crate::diagnostic_logging::trace(format_args!(
+            "netlink start id={id} operation={operation} queue_ms={}",
+            queued.elapsed().as_millis()
+        ));
         // A netlink request whose reply never arrives (e.g. the connection
         // task died) would otherwise pin the actor and every queued caller
         // forever; abort the stuck command — dropping the arm's `reply`
@@ -1726,7 +1774,16 @@ async fn run_actor(handle: rtnetlink::Handle, mut rx: async_mpsc::UnboundedRecei
             }
         })
         .await;
+        crate::diagnostic_logging::trace(format_args!(
+            "netlink finish id={id} operation={operation} duration_ms={} timeout={}",
+            started.elapsed().as_millis(),
+            executed.is_err()
+        ));
         if executed.is_err() {
+            crate::diagnostic_logging::snapshot_process(
+                std::process::id(),
+                "netlink_command_timeout",
+            );
             eprintln!(
                 "network-orchestrator-daemon: netlink command timed out operation={operation}"
             );
@@ -2669,7 +2726,7 @@ mod executor_tests {
     use std::time::{Duration, Instant};
     use tokio::sync::mpsc as async_mpsc;
 
-    fn executor(tx: async_mpsc::UnboundedSender<Command>) -> NetlinkExecutor {
+    fn executor(tx: async_mpsc::UnboundedSender<QueuedCommand>) -> NetlinkExecutor {
         NetlinkExecutor {
             tx,
             reply_timeout: Duration::from_millis(50),

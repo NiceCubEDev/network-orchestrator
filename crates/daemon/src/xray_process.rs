@@ -1278,6 +1278,8 @@ fn same_owned_cleanup_process(process: &VerifiedProcess) -> io::Result<bool> {
 
 #[cfg(target_os = "linux")]
 fn terminate_child(child: &mut Child) -> io::Result<()> {
+    let started = Instant::now();
+    crate::diagnostic_logging::debug(format_args!("xray stop begin pid={}", child.id()));
     if child
         .try_wait()
         .map_err(|_| io::Error::other("Xray child check failed"))?
@@ -1294,10 +1296,16 @@ fn terminate_child(child: &mut Child) -> io::Result<()> {
             .map_err(|_| io::Error::other("Xray child check failed"))?
             .is_some()
         {
+            crate::diagnostic_logging::debug(format_args!(
+                "xray stop end pid={} phase=SIGTERM duration_ms={}",
+                child.id(),
+                started.elapsed().as_millis()
+            ));
             return Ok(());
         }
         thread::sleep(Duration::from_millis(25));
     }
+    crate::diagnostic_logging::snapshot_process(child.id(), "xray_sigterm_timeout");
     eprintln!(
         "network-orchestrator-daemon: xray termination escalating pid={} signal=SIGKILL",
         child.id()
@@ -1312,9 +1320,15 @@ fn terminate_child(child: &mut Child) -> io::Result<()> {
             .map_err(|_| io::Error::other("Xray child wait failed"))?
             .is_some()
         {
+            crate::diagnostic_logging::debug(format_args!(
+                "xray stop end pid={} phase=SIGKILL duration_ms={}",
+                child.id(),
+                started.elapsed().as_millis()
+            ));
             return Ok(());
         }
         if Instant::now() >= deadline {
+            crate::diagnostic_logging::snapshot_process(child.id(), "xray_sigkill_timeout");
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "Xray child did not exit",
