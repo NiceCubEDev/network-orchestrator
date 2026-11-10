@@ -10,6 +10,10 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-11-10
+
+Core 0.18.0.
+
 ### Added
 
 - Live daemon diagnostic verbosity (`normal`, `debug`, `trace`) in Logs and
