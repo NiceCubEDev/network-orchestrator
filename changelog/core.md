@@ -10,6 +10,8 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-11-10
+
 ### Added
 
 - Typed logging verbosity and additive daemon logging settings methods, shared by
