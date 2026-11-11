@@ -2447,6 +2447,50 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
+    fn windows_xray_tun_owned_child_stays_running_after_interface_name_edits() {
+        let mut profile = xray_profile();
+        profile.xray_mode = crate::models::XrayMode::Tun;
+        profile.interface_name = "different policy target".into();
+        profile.xray_tun_interface = Some("synthetic-tun-first".into());
+        let child = Command::new("cmd")
+            .args(["/D", "/Q", "/C", "set /p NETORCH_FAKE_TUN_CHILD="])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let mut manager = TunnelManager::new();
+        manager.xray_children.insert(profile.id.clone(), child);
+
+        for name in [
+            "synthetic-tun-first",
+            "synthetic-tun-edited",
+            "synthetic-tun-again",
+        ] {
+            profile.xray_tun_interface = Some(name.into());
+            for _ in 0..3 {
+                assert_eq!(manager.status(&profile).state, TunnelState::Running);
+                assert_eq!(manager.xray_child_pid(&profile.id), Some(pid));
+            }
+            assert_eq!(
+                manager.ensure_not_running(&profile).unwrap_err().kind(),
+                io::ErrorKind::AlreadyExists
+            );
+            assert_eq!(manager.xray_child_pid(&profile.id), Some(pid));
+        }
+
+        assert_eq!(
+            manager.disconnect(&profile).unwrap().state,
+            TunnelState::Stopped
+        );
+        assert_eq!(manager.xray_child_pid(&profile.id), None);
+        assert_eq!(manager.status(&profile).state, TunnelState::Stopped);
+    }
+
+    #[test]
     fn xray_status_persists_failure_after_child_exit() {
         let dir = unique_dir("xray-persist-fail");
         let profile = xray_profile();

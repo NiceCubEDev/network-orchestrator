@@ -22,6 +22,8 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ### Fixed
 
+- Preserve automatic Xray TUN names when editing profiles, refresh connection
+  status when reopening the window and ignore outdated status responses.
 - Resolve NetworkManager VPN tunnel interfaces through their shared IPv4/IPv6
   configuration instead of the physical underlay, preventing duplicate OpenVPN
   entries under detected system tunnels.

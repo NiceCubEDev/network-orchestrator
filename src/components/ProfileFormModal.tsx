@@ -225,7 +225,7 @@ export function newFormState(
     // On Linux a SOCKS listener captures no system traffic, so TUN is the
     // mode that actually tunnels; the backend import defaults match this.
     xrayMode: os === "linux" ? "tun" : "socks",
-    xrayTunInterface: "xray-tun",
+    xrayTunInterface: "",
     xrayTunIp: "172.19.0.1/30",
     xrayGeoipUrl: "",
     xrayGeositeUrl: "",
@@ -266,7 +266,7 @@ export function editFormState(profile: Profile, revision: string): ProfileFormSt
     isNew: false,
     subscription: profile.subscription,
     xrayMode: profile.xrayMode ?? "socks",
-    xrayTunInterface: profile.xrayTunInterface ?? "xray-tun",
+    xrayTunInterface: profile.xrayTunInterface ?? "",
     xrayTunIp: profile.xrayTunIp ?? "172.19.0.1/30",
     xrayGeoipUrl: profile.xrayGeoipUrl ?? "",
     xrayGeositeUrl: profile.xrayGeositeUrl ?? "",

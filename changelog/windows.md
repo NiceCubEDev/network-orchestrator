@@ -32,6 +32,8 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ### Fixed
 
+- Preserve automatic Xray TUN names when editing profiles, refresh connection
+  status when reopening the window and ignore outdated status responses.
 - Resolve adapter names correctly when changing their administrative state and
   retain useful netsh errors.
 - Report subscription device requirements precisely and keep server delay probes

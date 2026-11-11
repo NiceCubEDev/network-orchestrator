@@ -190,6 +190,8 @@ export default function ProfileManager() {
   const [statuses, setStatuses] = useState<TunnelStatus[]>(
     listCache?.statuses ?? [],
   );
+  const statusRefresh = useRef(0);
+  const appliedStatusRefresh = useRef(0);
   const [alwaysOn, setAlwaysOn] = useState<AlwaysOnListResult | null>(
     listCache?.alwaysOn ?? null,
   );
@@ -494,8 +496,13 @@ export default function ProfileManager() {
   );
 
   const refreshStatuses = useCallback(async () => {
+    const request = ++statusRefresh.current;
     try {
-      setStatuses(await invoke<TunnelStatus[]>("get_tunnel_statuses"));
+      const data = await invoke<TunnelStatus[]>("get_tunnel_statuses");
+      if (request > appliedStatusRefresh.current) {
+        appliedStatusRefresh.current = request;
+        setStatuses(data);
+      }
     } catch {
       // keep last known statuses on poll failure
     }
@@ -507,6 +514,7 @@ export default function ProfileManager() {
   }, []);
 
   const refreshAll = useCallback(async () => {
+    const request = ++statusRefresh.current;
     try {
       setError(null);
       const [profileData, statusData, interfaceData] = await Promise.all([
@@ -515,7 +523,10 @@ export default function ProfileManager() {
         invoke<NetworkInterface[]>("get_interfaces"),
       ]);
       setProfiles(profileData);
-      setStatuses(statusData);
+      if (request > appliedStatusRefresh.current) {
+        appliedStatusRefresh.current = request;
+        setStatuses(statusData);
+      }
       setInterfaces(interfaceData);
       try {
         setAlwaysOn(await invoke<AlwaysOnListResult>("get_always_on_profiles"));
@@ -569,8 +580,19 @@ export default function ProfileManager() {
   }, [refreshAll]);
 
   useEffect(() => {
+    const onFocus = () => { void refreshStatuses(); };
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") void refreshStatuses();
+    };
+    window.addEventListener("focus", onFocus);
+    document.addEventListener("visibilitychange", onVisibilityChange);
     const interval = setInterval(refreshStatuses, 2000);
-    return () => clearInterval(interval);
+    return () => {
+      appliedStatusRefresh.current = ++statusRefresh.current;
+      window.removeEventListener("focus", onFocus);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      clearInterval(interval);
+    };
   }, [refreshStatuses]);
 
   const refreshTailscale = useCallback(async () => {
@@ -1393,6 +1415,7 @@ export default function ProfileManager() {
     ) {
       invoke<TunnelStatus>("reload_xray_profile", { id: editing.id })
         .then((status) => {
+          appliedStatusRefresh.current = ++statusRefresh.current;
           setStatuses((current) => [
             ...current.filter((entry) => entry.profileId !== status.profileId),
             status,

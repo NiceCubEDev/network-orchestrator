@@ -588,7 +588,7 @@
     "form.targetIface": "Target interface (required for policy routes)",
     "form.targetIfacePh": "Interface friendly name",
     "form.tunHelpLinux": "The network daemon assigns the TUN interface and IP. With no policy routes, IPv4 uses a default route and 1.1.1.1 DNS; explicit split routes do not set DNS automatically.",
-    "form.tunHelpWin": "TUN mode captures all IP traffic via a TUN interface. Domain policies still apply inside Xray. System proxy is not used.",
+    "form.tunHelpWin": "TUN mode captures all IP traffic via a TUN interface. Domain policies still apply inside Xray. System proxy is not used. Leave the interface name empty to choose an available name automatically.",
     "form.tunIface": "TUN interface name",
     "form.tunIp": "TUN interface IP",
     "form.tunLinux": "TUN (network daemon, generated links)",
